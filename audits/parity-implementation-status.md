@@ -48,8 +48,8 @@ GPUI demo to stay alive under Xvfb rather than merely compiling it.
   gestures around retained controls, consumer bodies now measure node size and port anchors,
   and the demo exercises editable numeric/color controls, dynamic inputs, and an adaptive
   flip/clamp/Escape-dismiss panel; right-edge resize, rollback, and reset also work;
-- richer persistent ungroup/nested-group semantics; rendered groups now support inline
-  label editing and Alt-drag membership updates with explicit core events;
+- richer nested-group semantics; rendered groups now support inline label editing,
+  Alt-drag membership, and controlled/uncontrolled Shift+Cmd/Ctrl+G ungroup transactions;
 - broader dynamic-port policy/UI polish; removal atomically keeps persisted graphs strict,
   renders transient red tombstones, and restores the original typed connection when a stable
   port ID reappears;

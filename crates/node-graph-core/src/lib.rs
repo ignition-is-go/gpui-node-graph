@@ -224,6 +224,7 @@ pub enum GraphMutation<N: Eq + Hash, P, C: Eq + Hash> {
     DeleteNodes { ids: Vec<N> },
     SetGroupMembership { group_id: String, node_ids: Vec<N> },
     SetGroupLabel { group_id: String, label: String },
+    RemoveGroups { group_ids: Vec<String> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -273,6 +274,9 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
     GroupLabelChanged {
         group_id: String,
         label: String,
+    },
+    GroupsRemoved {
+        group_ids: Vec<String>,
     },
     CreateNode {
         item_id: String,

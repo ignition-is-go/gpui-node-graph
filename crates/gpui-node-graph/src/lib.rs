@@ -1725,6 +1725,38 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    fn selected_group_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .groups
+            .iter()
+            .filter(|group| {
+                group
+                    .nodes
+                    .iter()
+                    .any(|id| self.graph.selected_nodes.contains(id))
+            })
+            .map(|group| group.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn ungroup_selection(&mut self, cx: &mut Context<Self>) {
+        let group_ids = self.selected_group_ids();
+        if group_ids.is_empty() {
+            return;
+        }
+        if self.config.mutation_mode == MutationMode::Controlled {
+            cx.emit(core::GraphEvent::MutationRequested {
+                mutations: vec![core::GraphMutation::RemoveGroups { group_ids }],
+            });
+        } else {
+            self.groups.retain(|group| !group_ids.contains(&group.id));
+            cx.emit(core::GraphEvent::GroupsRemoved { group_ids });
+        }
+        cx.notify();
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -1908,6 +1940,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             "z" if command => {
                 cx.emit(core::GraphEvent::Undo);
                 cx.stop_propagation();
+            }
+            "g" if command && shift => {
+                self.ungroup_selection(cx);
+                cx.stop_propagation();
+                window.prevent_default();
             }
             "g" if command => {
                 cx.emit(core::GraphEvent::GroupCreated {
@@ -3074,6 +3111,19 @@ mod tests {
         assert_eq!(editor.filtered_catalog_indices(), vec![0]);
         editor.catalog_menu.as_mut().unwrap().query = "source".into();
         assert!(editor.filtered_catalog_indices().is_empty());
+    }
+
+    #[test]
+    fn selected_groups_are_deterministic_for_ungroup_transactions() {
+        let mut editor = NodeGraph::new(interactive_graph()).with_groups(vec![GraphGroup {
+            id: "group".into(),
+            label: "Group".into(),
+            color: 0,
+            nodes: [String::from("a"), String::from("b")].into_iter().collect(),
+        }]);
+        assert!(editor.selected_group_ids().is_empty());
+        editor.graph.selected_nodes.insert("a".into());
+        assert_eq!(editor.selected_group_ids(), vec![String::from("group")]);
     }
 
     #[test]
