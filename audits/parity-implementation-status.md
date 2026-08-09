@@ -42,8 +42,8 @@ least three seconds, preventing both lifecycle and false-mount positives.
 
 - explicit controlled/uncontrolled mutation transactions rather than the current
   reference-like hybrid ownership;
-- consumer-defined rich node bodies, measured/dynamic port geometry, body-control
-  keyboard/wheel isolation, node resizing, and overlay/popover support;
+- measured/dynamic port geometry on top of the new consumer-defined `NodeBodyRenderer`
+  seam, body-control keyboard/wheel isolation, node resizing, and overlay/popover support;
 - groups and membership gestures;
 - dangling dynamic-port presentation without weakening strict persisted validation;
 - Bezier mode plus batching, lane separation, rounded corners and caching for the

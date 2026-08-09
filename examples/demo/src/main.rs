@@ -1,6 +1,8 @@
 use gpui::prelude::*;
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
-use gpui_node_graph::{CatalogPort, NodeCatalogItem, NodeGraph, core::*};
+use gpui_node_graph::{
+    CatalogPort, NodeBody, NodeBodyContext, NodeCatalogItem, NodeGraph, core::*,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Kind {
@@ -237,7 +239,38 @@ fn launch(cx: &mut App) {
                 }
                 insert_connection(&mut graph, "source.out".into(), "math.a".into());
                 insert_connection(&mut graph, "math.out".into(), "output.in".into());
-                NodeGraph::new_in(graph, cx).with_catalog(editor_catalog)
+                NodeGraph::new_in(graph, cx)
+                    .with_catalog(editor_catalog)
+                    .with_node_body_renderer(
+                        |context: NodeBodyContext<Kind, String, String, String>,
+                         _: &mut gpui::Window,
+                         _: &mut App| {
+                            let port_count = context.ports.len();
+                            NodeBody::new(
+                                gpui::div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(context.node.title)
+                                    .child(
+                                        gpui::div()
+                                            .rounded_sm()
+                                            .bg(gpui::rgb(0x18181b))
+                                            .px_2()
+                                            .py_1()
+                                            .text_size(gpui::px(10.0))
+                                            .child(format!("{port_count} typed ports"))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                |_, window, cx| {
+                                                    cx.stop_propagation();
+                                                    window.prevent_default();
+                                                },
+                                            ),
+                                    ),
+                            )
+                        },
+                    )
             });
             graph.update(cx, |_, cx| {
                 cx.subscribe(&graph, move |editor, _, event, cx| {

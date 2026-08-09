@@ -1,11 +1,11 @@
 mod windows;
 
 use gpui::{
-    Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, Window, canvas, div, point,
-    prelude::*, px, rgb,
+    AnyElement, App, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, WeakEntity,
+    Window, canvas, div, point, prelude::*, px, rgb,
 };
-use std::{cell::Cell, collections::HashSet, rc::Rc};
+use std::{cell::Cell, collections::HashSet, rc::Rc, sync::Arc};
 
 pub use node_graph_core as core;
 pub use node_graph_core::*;
@@ -13,6 +13,69 @@ pub use windows::*;
 
 /// The GPUI adapter and framework-free core now expose one event vocabulary.
 pub type EditorEvent<N = String, P = String, C = String> = core::GraphEvent<N, P, C>;
+
+pub struct NodeBody {
+    pub element: AnyElement,
+}
+
+impl NodeBody {
+    pub fn new(element: impl IntoElement) -> Self {
+        Self {
+            element: element.into_any_element(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeVisualState {
+    pub selected: bool,
+    pub zoom: f32,
+}
+
+pub struct NodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> {
+    pub node: Node<N>,
+    pub ports: Arc<[Port<N, P, T>]>,
+    pub state: NodeVisualState,
+    pub theme: Theme,
+    graph: WeakEntity<NodeGraph<T, N, P, C>>,
+}
+
+impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
+    NodeBodyContext<T, N, P, C>
+{
+    pub fn graph(&self) -> WeakEntity<NodeGraph<T, N, P, C>> {
+        self.graph.clone()
+    }
+}
+
+pub trait NodeBodyRenderer<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>:
+    'static
+{
+    fn render_node(
+        &mut self,
+        context: NodeBodyContext<T, N, P, C>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> NodeBody;
+}
+
+impl<T, N, P, C, F> NodeBodyRenderer<T, N, P, C> for F
+where
+    T: PortType,
+    N: core::NodeId,
+    P: core::PortId,
+    C: core::ConnectionId,
+    F: FnMut(NodeBodyContext<T, N, P, C>, &mut Window, &mut App) -> NodeBody + 'static,
+{
+    fn render_node(
+        &mut self,
+        context: NodeBodyContext<T, N, P, C>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> NodeBody {
+        self(context, window, cx)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RoutingMode {
@@ -168,6 +231,7 @@ pub struct NodeGraph<
     draft: Option<DraftConnection<P, C>>,
     catalog: Vec<NodeCatalogItem<T>>,
     catalog_menu: Option<CatalogMenu<P>>,
+    node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -206,6 +270,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             draft: None,
             catalog: Vec::new(),
             catalog_menu: None,
+            node_body_renderer: None,
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -224,6 +289,27 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     pub fn set_catalog(&mut self, catalog: Vec<NodeCatalogItem<T>>, cx: &mut Context<Self>) {
         self.catalog = catalog;
         self.catalog_menu = None;
+        cx.notify();
+    }
+
+    pub fn with_node_body_renderer<R>(mut self, renderer: R) -> Self
+    where
+        R: NodeBodyRenderer<T, N, P, C>,
+    {
+        self.node_body_renderer = Some(Box::new(renderer));
+        self
+    }
+
+    pub fn set_node_body_renderer<R>(&mut self, renderer: R, cx: &mut Context<Self>)
+    where
+        R: NodeBodyRenderer<T, N, P, C>,
+    {
+        self.node_body_renderer = Some(Box::new(renderer));
+        cx.notify();
+    }
+
+    pub fn clear_node_body_renderer(&mut self, cx: &mut Context<Self>) {
+        self.node_body_renderer = None;
         cx.notify();
     }
 
@@ -751,7 +837,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Render
     for NodeGraph<T, N, P, C>
 {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.focus_handle.is_none() {
             self.focus_handle = Some(cx.focus_handle());
         }
@@ -830,10 +916,38 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(wire_layer);
 
-        for node in self.graph.nodes.values() {
+        let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
+        nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
+        for node in nodes {
             let id = node.id.clone();
             let position = viewport.world_to_screen(node.position);
             let selected = self.graph.selected_nodes.contains(&id);
+            let body = if let Some(renderer) = self.node_body_renderer.as_mut() {
+                let mut ports: Vec<_> = self
+                    .graph
+                    .ports
+                    .values()
+                    .filter(|port| port.node == id)
+                    .cloned()
+                    .collect();
+                ports.sort_by_cached_key(|port| format!("{:?}", port.id));
+                renderer.render_node(
+                    NodeBodyContext {
+                        node: node.clone(),
+                        ports: ports.into(),
+                        state: NodeVisualState {
+                            selected,
+                            zoom: viewport.zoom,
+                        },
+                        theme: self.theme.clone(),
+                        graph: cx.weak_entity(),
+                    },
+                    window,
+                    cx,
+                )
+            } else {
+                NodeBody::new(div().child(node.title.clone()))
+            };
             let background = if selected {
                 self.theme.node_selected
             } else {
@@ -853,7 +967,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .text_color(rgb(self.theme.text))
                     .text_size(px(viewport.scale_length(14.0).clamp(8.0, 24.0)))
                     .p(px(viewport.scale_length(8.0)))
-                    .child(node.title.clone())
+                    .child(body.element)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
