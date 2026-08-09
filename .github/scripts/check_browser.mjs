@@ -61,15 +61,69 @@ while (Date.now() < deadline) {
     readySince ??= Date.now();
     // A dropped embedded Application briefly creates and then removes its canvas.
     // Require sustained readiness so the smoke test proves a live GPUI runtime.
-    if (Date.now() - readySince >= 3_000) {
-      console.log(JSON.stringify({ ...state, sustainedMs: Date.now() - readySince }));
-      socket.close();
-      process.exit(0);
-    }
+    if (Date.now() - readySince >= 3_000) break;
   } else {
     readySince = undefined;
   }
   await new Promise((resolve) => setTimeout(resolve, 500));
 }
+if (!(state?.started && state?.isolated && state?.canvas)) {
+  socket.close();
+  throw new Error(`GPUI browser readiness timed out: ${JSON.stringify(state)}`);
+}
+
+const canvasState = await command("Runtime.evaluate", {
+  expression: `(() => { const r = document.querySelector("canvas").getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
+  returnByValue: true,
+});
+const { x, y } = canvasState.result.value;
+const pause = (ms = 300) => new Promise((resolve) => setTimeout(resolve, ms));
+async function click(clickCount = 1) {
+  for (const type of ["mousePressed", "mouseReleased"])
+    await command("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount });
+}
+async function key(key, code = key, text) {
+  const params = { key, code, ...(text ? { text } : {}) };
+  await command("Input.dispatchKeyEvent", { type: "keyDown", ...params });
+  await command("Input.dispatchKeyEvent", { type: "keyUp", ...params });
+}
+async function shot() {
+  await pause();
+  return (await command("Page.captureScreenshot", {
+    format: "png", captureBeyondViewport: false,
+  })).data;
+}
+
+const baseline = await shot();
+await click();
+await key("Tab", "Tab");
+const menu = await shot();
+for (const character of "Math") await key(character, `Key${character.toUpperCase()}`, character);
+await key("Enter", "Enter");
+const created = await shot();
+await key("Escape", "Escape");
+const dismissed = await shot();
+await command("Input.dispatchMouseEvent", {
+  type: "mouseWheel", x, y, deltaX: 0, deltaY: -180,
+});
+const zoomed = await shot();
+
+const transitions = {
+  menuOpened: baseline !== menu,
+  nodeCreated: menu !== created,
+  overlayDismissed: created !== dismissed,
+  viewportChanged: dismissed !== zoomed,
+};
+if (Object.values(transitions).some((value) => !value)) {
+  socket.close();
+  throw new Error(`GPUI interaction trace did not repaint every state: ${JSON.stringify(transitions)}`);
+}
+const finalState = await command("Runtime.evaluate", {
+  expression: `(() => { const c = document.querySelector("canvas"); const r = c?.getBoundingClientRect();
+    return !!c && c.width > 1 && c.height > 1 && r.width > 0 && r.height > 0; })()`,
+  returnByValue: true,
+});
+if (!finalState.result.value) throw new Error("GPUI canvas was lost during interaction trace");
+console.log(JSON.stringify({ ...state, sustainedMs: Date.now() - readySince, transitions }));
 socket.close();
-throw new Error(`GPUI browser readiness timed out: ${JSON.stringify(state)}`);

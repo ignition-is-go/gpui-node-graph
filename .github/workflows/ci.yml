@@ -13,7 +13,7 @@ jobs:
           components: rustfmt, clippy, rust-src
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --all-targets
       - name: Verify Linux window backends
@@ -23,6 +23,16 @@ jobs:
           cargo tree -e features -i gpui_linux | grep -F 'gpui_linux feature "x11"'
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Sustain native GPUI demo under Xvfb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build -p gpui-node-graph-demo
+          set +e
+          timeout 6s xvfb-run -a target/debug/gpui-node-graph-demo
+          status=$?
+          set -e
+          test "$status" -eq 124
 
   wasm:
     runs-on: ubuntu-latest
