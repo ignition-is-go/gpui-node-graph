@@ -1,6 +1,6 @@
 # gpui-node-graph
 
-Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries/zed@08827f9208b4848d62f3faf86ffa15155966d63c`. This is the standalone replacement for the browser/Leptos graph used during the Rship desktop migration; it does not depend on Leptos, WASM, a DOM, or a browser runtime.
+Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries/zed@08827f9208b4848d62f3faf86ffa15155966d63c`. This is the standalone replacement for the Leptos graph used during the Rship migration. One shared GPUI view runs on desktop and WebAssembly without Leptos or DOM rendering.
 
 ## Status
 
@@ -16,7 +16,7 @@ cd examples/demo && trunk serve
 ## Architecture
 
 - `node-graph-core`: canonical serializable model and deterministic logic. Keep persisted Rship graph DTOs here; UI state must not leak into serialization.
-- `gpui-node-graph`: native retained-mode view and input adapter. Consumers own/reconcile domain data and can subscribe to `EditorEvent`.
+- `gpui-node-graph`: shared retained-mode view and input adapter. Consumers own/reconcile domain data and can subscribe to `EditorEvent`.
 - `examples/demo`: shared GPUI application with thin target-specific desktop/browser packaging. `gpui_platform::application()` selects the backend.
 
 All saved-model migrations belong in core and must have fixture round-trip tests. Leptos is a behavior/serialization reference during migration only, not a co-maintained target.
