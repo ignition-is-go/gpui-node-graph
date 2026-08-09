@@ -62,7 +62,7 @@ jobs:
             > /tmp/node-graph-chrome.log 2>&1 &
           chrome=$!
           trap 'kill "$chrome" "$server" 2>/dev/null || true' EXIT
-          if ! node .github/scripts/check_browser.mjs http://127.0.0.1:8181/; then
+          if ! timeout 75 node .github/scripts/check_browser.mjs http://127.0.0.1:8181/; then
             cat /tmp/node-graph-chrome.log
             exit 1
           fi
