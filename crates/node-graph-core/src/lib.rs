@@ -215,8 +215,22 @@ pub struct Connection<P, C> {
     pub source: P,
     pub target: P,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GraphMutation<N: Eq + Hash, P, C: Eq + Hash> {
+    MoveNodes { nodes: Vec<(N, Point)> },
+    ResizeNode { id: N, size: Size },
+    RequestConnection { source: P, target: P },
+    RemoveConnection { id: C },
+    DeleteNodes { ids: Vec<N> },
+    SetGroupMembership { group_id: String, node_ids: Vec<N> },
+    SetGroupLabel { group_id: String, label: String },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
+    MutationRequested {
+        mutations: Vec<GraphMutation<N, P, C>>,
+    },
     NodesMoved {
         nodes: Vec<(N, Point)>,
     },
@@ -819,6 +833,27 @@ mod tests {
         assert_eq!(g.ports["out"].position, Point::new(60., 45.));
         assert_eq!(g.ports["in"].position, Point::new(100., 25.));
     }
+    #[test]
+    fn controlled_mutation_batch_round_trips() {
+        let event: GraphEvent<String, String, String> = GraphEvent::MutationRequested {
+            mutations: vec![
+                GraphMutation::MoveNodes {
+                    nodes: vec![("node".into(), Point::new(10.0, 20.0))],
+                },
+                GraphMutation::RequestConnection {
+                    source: "out".into(),
+                    target: "in".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: GraphEvent<String, String, String> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            GraphEvent::MutationRequested { mutations } if mutations.len() == 2
+        ));
+    }
+
     #[test]
     fn snapshot_fixture_excludes_transient_state_and_round_trips() {
         let mut g = connected_graph();

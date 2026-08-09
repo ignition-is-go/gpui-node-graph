@@ -40,8 +40,8 @@ least three seconds, preventing both lifecycle and false-mount positives.
 
 ## Still required before full parity
 
-- explicit controlled/uncontrolled mutation transactions rather than the current
-  reference-like hybrid ownership;
+- further transaction ergonomics; explicit uncontrolled ownership now commits previews
+  locally, while controlled ownership rolls them back and emits atomic typed mutation batches;
 - broader specialized widgets; `NodeBodyContext::isolated_control` now blocks graph
   keyboard, wheel, and pointer gestures around retained body controls, and
   `NodeBodyRenderer` supports shell-interactive measured anchors, transient node-relative geometry/tombstones, and

@@ -310,6 +310,15 @@ impl Default for RoutingMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MutationMode {
+    /// Gesture previews become the editor's committed graph state.
+    #[default]
+    Uncontrolled,
+    /// Gesture previews roll back and emit one atomic `MutationRequested` transaction.
+    Controlled,
+}
+
 #[derive(Clone, Debug)]
 pub struct EditorConfig {
     pub min_zoom: f32,
@@ -330,6 +339,7 @@ pub struct EditorConfig {
     pub route_lane_spacing: f32,
     /// Screen-pixel radius used to round orthogonal route corners.
     pub route_corner_radius: f32,
+    pub mutation_mode: MutationMode,
 }
 impl Default for EditorConfig {
     fn default() -> Self {
@@ -348,6 +358,7 @@ impl Default for EditorConfig {
             visibility_margin: 160.0,
             route_lane_spacing: 8.0,
             route_corner_radius: 7.0,
+            mutation_mode: MutationMode::Uncontrolled,
         }
     }
 }
@@ -436,6 +447,11 @@ struct GroupEditor {
     id: String,
     query: String,
 }
+struct DragCompletion<N> {
+    nodes: Vec<(N, core::Point)>,
+    group_changes: Vec<(String, Vec<N>)>,
+}
+
 #[derive(Clone)]
 struct ResizeDrag<N, P> {
     id: N,
@@ -1093,12 +1109,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             self.draft = Some(draft);
             return false;
         };
-        if let Some(id) = draft.replaced_connection {
-            self.graph.connections.remove(&id);
-            self.graph.selected_connections.remove(&id);
-            cx.emit(core::GraphEvent::ConnectionRemoved { id });
+        if self.config.mutation_mode == MutationMode::Controlled {
+            let mut mutations = Vec::new();
+            if let Some(id) = draft.replaced_connection {
+                mutations.push(core::GraphMutation::RemoveConnection { id });
+            }
+            mutations.push(core::GraphMutation::RequestConnection { source, target });
+            cx.emit(core::GraphEvent::MutationRequested { mutations });
+        } else {
+            if let Some(id) = draft.replaced_connection {
+                self.graph.connections.remove(&id);
+                self.graph.selected_connections.remove(&id);
+                cx.emit(core::GraphEvent::ConnectionRemoved { id });
+            }
+            cx.emit(core::GraphEvent::ConnectionRequested { source, target });
         }
-        cx.emit(core::GraphEvent::ConnectionRequested { source, target });
         cx.notify();
         true
     }
@@ -1325,17 +1350,34 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        let connection_ids: Vec<_> = self.graph.selected_connections.iter().cloned().collect();
-        for id in connection_ids {
-            if self.graph.connections.remove(&id).is_some() {
-                cx.emit(core::GraphEvent::ConnectionRemoved { id });
+        let mut connection_ids: Vec<_> = self.graph.selected_connections.iter().cloned().collect();
+        connection_ids.sort_by_cached_key(|id| format!("{id:?}"));
+        let mut node_ids: Vec<_> = self.graph.selected_nodes.iter().cloned().collect();
+        node_ids.sort_by_cached_key(|id| format!("{id:?}"));
+        if self.config.mutation_mode == MutationMode::Controlled {
+            let mut mutations: Vec<_> = connection_ids
+                .into_iter()
+                .map(|id| core::GraphMutation::RemoveConnection { id })
+                .collect();
+            if !node_ids.is_empty() {
+                mutations.push(core::GraphMutation::DeleteNodes { ids: node_ids });
+            }
+            if !mutations.is_empty() {
+                cx.emit(core::GraphEvent::MutationRequested { mutations });
+            }
+        } else {
+            for id in connection_ids {
+                if self.graph.connections.remove(&id).is_some() {
+                    cx.emit(core::GraphEvent::ConnectionRemoved { id });
+                }
+            }
+            for event in self.graph.remove_nodes(&node_ids) {
+                cx.emit(event);
             }
         }
-        let node_ids: Vec<_> = self.graph.selected_nodes.iter().cloned().collect();
-        for event in self.graph.remove_nodes(&node_ids) {
-            cx.emit(event);
-        }
+        self.graph.selected_nodes.clear();
         self.graph.selected_connections.clear();
+        self.emit_selection(cx);
         cx.notify();
     }
 
@@ -1390,27 +1432,74 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         changes
     }
 
+    fn finalize_node_drag(&mut self, drag: &NodeDrag<N>) -> DragCompletion<N> {
+        let dragged: Vec<_> = drag.offsets.iter().map(|(id, _)| id.clone()).collect();
+        let nodes: Vec<_> = drag
+            .offsets
+            .iter()
+            .filter_map(|(id, _)| Some((id.clone(), self.graph.nodes.get(id)?.position)))
+            .collect();
+        let previous_groups = self.groups.clone();
+        let group_changes = if drag.alter_groups {
+            self.update_group_memberships(&dragged)
+        } else {
+            Vec::new()
+        };
+        if self.config.mutation_mode == MutationMode::Controlled {
+            let _ = self.graph.move_nodes(&drag.starts);
+            self.groups = previous_groups;
+        }
+        DragCompletion {
+            nodes,
+            group_changes,
+        }
+    }
+
     fn finish_left_gesture(&mut self, cx: &mut Context<Self>) {
         self.panning = None;
         if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
-            && let Some(node) = self.graph.nodes.get(&resize.id)
+            && let Some(size) = self.graph.nodes.get(&resize.id).map(|node| node.size)
         {
-            cx.emit(core::GraphEvent::NodeResized {
-                id: resize.id,
-                size: node.size,
-            });
+            if self.config.mutation_mode == MutationMode::Controlled {
+                if let Some(node) = self.graph.nodes.get_mut(&resize.id) {
+                    node.size = resize.start_size;
+                }
+                for (id, position) in resize.start_ports {
+                    if let Some(port) = self.graph.ports.get_mut(&id) {
+                        port.position = position;
+                    }
+                }
+                cx.emit(core::GraphEvent::MutationRequested {
+                    mutations: vec![core::GraphMutation::ResizeNode {
+                        id: resize.id,
+                        size,
+                    }],
+                });
+            } else {
+                cx.emit(core::GraphEvent::NodeResized {
+                    id: resize.id,
+                    size,
+                });
+            }
         }
         if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
-            let alter_groups = drag.alter_groups;
-            let dragged: Vec<_> = drag.offsets.iter().map(|(id, _)| id.clone()).collect();
-            let nodes = drag
-                .offsets
-                .into_iter()
-                .filter_map(|(id, _)| Some((id.clone(), self.graph.nodes.get(&id)?.position)))
-                .collect();
-            cx.emit(core::GraphEvent::NodesMoved { nodes });
-            if alter_groups {
-                for (group_id, node_ids) in self.update_group_memberships(&dragged) {
+            let completion = self.finalize_node_drag(&drag);
+            if self.config.mutation_mode == MutationMode::Controlled {
+                let mut mutations = vec![core::GraphMutation::MoveNodes {
+                    nodes: completion.nodes,
+                }];
+                mutations.extend(completion.group_changes.into_iter().map(
+                    |(group_id, node_ids)| core::GraphMutation::SetGroupMembership {
+                        group_id,
+                        node_ids,
+                    },
+                ));
+                cx.emit(core::GraphEvent::MutationRequested { mutations });
+            } else {
+                cx.emit(core::GraphEvent::NodesMoved {
+                    nodes: completion.nodes,
+                });
+                for (group_id, node_ids) in completion.group_changes {
                     cx.emit(core::GraphEvent::GroupMembershipChanged { group_id, node_ids });
                 }
             }
@@ -1497,14 +1586,24 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 "enter" => {
                     if let Some(editor) = self.group_editor.take()
                         && !editor.query.trim().is_empty()
-                        && let Some(group) =
-                            self.groups.iter_mut().find(|group| group.id == editor.id)
                     {
-                        group.label = editor.query.trim().to_string();
-                        cx.emit(core::GraphEvent::GroupLabelChanged {
-                            group_id: group.id.clone(),
-                            label: group.label.clone(),
-                        });
+                        let label = editor.query.trim().to_string();
+                        if self.config.mutation_mode == MutationMode::Controlled {
+                            cx.emit(core::GraphEvent::MutationRequested {
+                                mutations: vec![core::GraphMutation::SetGroupLabel {
+                                    group_id: editor.id,
+                                    label,
+                                }],
+                            });
+                        } else if let Some(group) =
+                            self.groups.iter_mut().find(|group| group.id == editor.id)
+                        {
+                            group.label = label;
+                            cx.emit(core::GraphEvent::GroupLabelChanged {
+                                group_id: group.id.clone(),
+                                label: group.label.clone(),
+                            });
+                        }
                     }
                 }
                 "backspace" => {
@@ -1962,13 +2061,29 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     .config
                                     .default_node_width
                                     .clamp(this.config.min_node_width, this.config.max_node_width);
+                                let previous_width =
+                                    this.graph.nodes.get(&resize_id).map(|node| node.size.width);
                                 if this.resize_node_width(&resize_id, width)
-                                    && let Some(node) = this.graph.nodes.get(&resize_id)
+                                    && let Some(size) =
+                                        this.graph.nodes.get(&resize_id).map(|node| node.size)
                                 {
-                                    cx.emit(core::GraphEvent::NodeResized {
-                                        id: resize_id.clone(),
-                                        size: node.size,
-                                    });
+                                    if this.config.mutation_mode == MutationMode::Controlled {
+                                        if let Some(previous_width) = previous_width {
+                                            let _ =
+                                                this.resize_node_width(&resize_id, previous_width);
+                                        }
+                                        cx.emit(core::GraphEvent::MutationRequested {
+                                            mutations: vec![core::GraphMutation::ResizeNode {
+                                                id: resize_id.clone(),
+                                                size,
+                                            }],
+                                        });
+                                    } else {
+                                        cx.emit(core::GraphEvent::NodeResized {
+                                            id: resize_id.clone(),
+                                            size,
+                                        });
+                                    }
                                     cx.notify();
                                 }
                                 return;
@@ -2653,6 +2768,30 @@ mod tests {
         assert!(!editor.resize_node_width(&"a".into(), f32::INFINITY));
         assert_eq!(editor.graph.nodes["a"], before_node);
         assert_eq!(editor.graph.ports, before_ports);
+    }
+
+    #[test]
+    fn controlled_drag_reports_final_positions_and_rolls_preview_back() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        editor.config.mutation_mode = MutationMode::Controlled;
+        editor
+            .graph
+            .move_node(&String::from("a"), core::Point::new(80.0, 0.0));
+        let completion = editor.finalize_node_drag(&NodeDrag {
+            offsets: vec![(String::from("a"), core::Point::new(0.0, 0.0))],
+            starts: vec![(String::from("a"), core::Point::new(0.0, 0.0))],
+            moved: true,
+            alter_groups: false,
+        });
+        assert_eq!(
+            completion.nodes,
+            vec![(String::from("a"), core::Point::new(80.0, 0.0))]
+        );
+        assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
+        assert_eq!(
+            editor.graph.ports["out"].position,
+            core::Point::new(50.0, 25.0)
+        );
     }
 
     #[test]
