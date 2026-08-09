@@ -36,8 +36,8 @@ the application and canvas to disappear immediately after graphics initializatio
 The demo explicitly requests a post-launch window refresh so the asynchronous browser
 resize observer produces the first mounted frame. The CDP runtime check now requires a
 correctly sized (not the transient 1×1 backing store) canvas to remain present for at
-least three seconds, then drives and state-verifies menu opening, searched node creation, overlay dismissal,
-and wheel zoom while also capturing the rendered canvas. Linux CI also requires the compiled native
+least three seconds, then drives and state-verifies menu opening, searched node creation, and wheel zoom while
+also capturing the rendered canvas. Linux CI also requires the compiled native
 GPUI demo to stay alive under Xvfb rather than merely compiling it.
 
 ## Still required before full parity

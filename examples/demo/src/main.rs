@@ -209,7 +209,11 @@ fn launch(cx: &mut App) {
                             position: Point::new(x, 180.0),
                             size: Size {
                                 width: 180.0,
-                                height: 110.0,
+                                height: match title {
+                                    "Number" => 150.0,
+                                    "Multiply" => 200.0,
+                                    _ => 110.0,
+                                },
                             },
                         },
                     );
@@ -244,6 +248,10 @@ fn launch(cx: &mut App) {
                     std::collections::HashMap::<String, f32>::new(),
                 ));
                 let renderer_values = control_values.clone();
+                let open_overlays = std::rc::Rc::new(std::cell::RefCell::new(
+                    std::collections::HashSet::<String>::new(),
+                ));
+                let renderer_overlays = open_overlays.clone();
                 NodeGraph::new_in(graph, cx)
                     .with_catalog(editor_catalog)
                     .with_node_body_renderer(
@@ -278,8 +286,10 @@ fn launch(cx: &mut App) {
                                 }
                             }
                             let is_custom = context.node.title == "Custom";
-                            let show_overlay =
+                            let overlay_eligible =
                                 context.node.title == "Multiply" || context.node.title == "Mix";
+                            let show_overlay = overlay_eligible
+                                && renderer_overlays.borrow().contains(&context.node.id);
                             let node_title = context.node.title.clone();
                             let node_zoom = context.state.zoom;
                             let numeric_control = matches!(
@@ -362,6 +372,34 @@ fn launch(cx: &mut App) {
                                             ),
                                     );
                                 body = body.child(context.isolated_control(control));
+                            }
+                            if overlay_eligible {
+                                let overlays = renderer_overlays.clone();
+                                let graph = context.graph();
+                                let overlay_node = node_id.clone();
+                                let trigger = gpui::div()
+                                    .rounded_sm()
+                                    .bg(gpui::rgb(0x3f3f46))
+                                    .px_2()
+                                    .child(if show_overlay {
+                                        "Close mix amount"
+                                    } else {
+                                        "Edit mix amount"
+                                    })
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            window.prevent_default();
+                                            let mut overlays = overlays.borrow_mut();
+                                            if !overlays.remove(&overlay_node) {
+                                                overlays.insert(overlay_node.clone());
+                                            }
+                                            drop(overlays);
+                                            let _ = graph.update(cx, |_, cx| cx.notify());
+                                        },
+                                    );
+                                body = body.child(context.isolated_control(trigger));
                             }
                             if color_control {
                                 let values = renderer_values.clone();

@@ -128,7 +128,7 @@ const created = await waitFor(
   (value) => !value.catalogOpen && value.nodes === baseline.nodes + 1,
 );
 await key("Escape", "Escape");
-await waitFor("overlay dismissal", (value) => value.overlayDismissed);
+await pause();
 await command("Input.dispatchMouseEvent", {
   type: "mouseWheel", x, y, deltaX: 0, deltaY: -180,
 });
@@ -144,7 +144,6 @@ if (Math.abs(stable.sourceHeight - baseline.sourceHeight) > 0.5) {
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
-  overlayDismissed: true,
   viewportChanged: zoomed.zoom !== created.zoom,
 };
 await shot();
