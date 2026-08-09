@@ -1366,7 +1366,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let viewport = self.graph.viewport.sanitized();
         for group in &self.groups {
             let mut members = group.nodes.iter().filter_map(|id| self.graph.nodes.get(id));
-            let first = members.next()?;
+            let Some(first) = members.next() else {
+                continue;
+            };
             let mut left = first.position.x;
             let mut top = first.position.y;
             for node in members {
