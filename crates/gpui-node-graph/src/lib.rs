@@ -1,10 +1,10 @@
 mod windows;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Element, ElementId, FocusHandle, GlobalElementId,
-    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, WeakEntity, Window, canvas, div,
-    point, prelude::*, px, rgb,
+    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, FocusHandle,
+    GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, WeakEntity,
+    Window, canvas, div, point, prelude::*, px, rgb,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -1455,6 +1455,78 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    fn handle_pointer_move(&mut self, local: core::Point, cx: &mut Context<Self>) {
+        if let Some(previous) = self.panning.as_mut() {
+            let old = *previous;
+            *previous = local;
+            if self.graph.viewport.pan_between(old, local) {
+                cx.emit(core::GraphEvent::ViewportChanged {
+                    viewport: self.graph.viewport,
+                });
+                cx.notify();
+            }
+        }
+
+        if let Some(resize) = self.resize.clone() {
+            let delta = (local.x - resize.start_screen_x) / self.graph.viewport.zoom;
+            let width = (resize.start_size.width + delta)
+                .clamp(self.config.min_node_width, self.config.max_node_width);
+            if self.resize_node_width(&resize.id, width) {
+                if let Some(active) = self.resize.as_mut() {
+                    active.moved |= (width - active.start_size.width).abs() > f32::EPSILON;
+                }
+                cx.notify();
+            }
+        }
+
+        if let Some(drag) = self.drag.clone() {
+            let cursor = self.graph.viewport.screen_to_world(local);
+            let updates: Vec<_> = drag
+                .offsets
+                .iter()
+                .map(|(id, offset)| {
+                    let mut position = cursor - *offset;
+                    if let Some(grid) = self.config.grid_size.filter(|grid| *grid > 0.0) {
+                        position.x = (position.x / grid).round() * grid;
+                        position.y = (position.y / grid).round() * grid;
+                    }
+                    (id.clone(), position)
+                })
+                .collect();
+            if self.graph.move_nodes(&updates).is_some() {
+                if let Some(active) = self.drag.as_mut() {
+                    active.moved = true;
+                }
+                cx.notify();
+            }
+        }
+
+        if let Some(selection) = self.box_selection.as_mut() {
+            selection.current = self.graph.viewport.screen_to_world(local);
+            let mut nodes = self.graph.nodes_in_rect(selection.rect());
+            nodes.extend(selection.baseline_nodes.iter().cloned());
+            let before = self.graph.selected_nodes.clone();
+            self.graph.selected_nodes = nodes;
+            self.graph.selected_connections = selection.baseline_connections.clone();
+            if before != self.graph.selected_nodes {
+                self.emit_selection(cx);
+            }
+            cx.notify();
+        }
+
+        if let Some(origin) = self.draft.as_ref().map(|draft| draft.origin.clone()) {
+            let snap_target = self.nearest_compatible_port(&origin, local);
+            if let Some(draft) = self.draft.as_mut() {
+                if draft.start_screen.distance(local) > 2.0 {
+                    draft.moved = true;
+                }
+                draft.current_screen = local;
+                draft.snap_target = snap_target;
+            }
+            cx.notify();
+        }
+    }
+
     fn finish_left_gesture(&mut self, cx: &mut Context<Self>) {
         self.panning = None;
         if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
@@ -1771,6 +1843,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let draft_color: gpui::Hsla = rgb(self.theme.wire_draft).into();
         let dangling_color: gpui::Hsla = rgb(0xef4444).into();
         let canvas_bounds = self.canvas_bounds.clone();
+        let captured_graph = cx.weak_entity();
         let corner_radius = if self.config.routing == RoutingMode::Bezier {
             0.0
         } else {
@@ -1781,6 +1854,42 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 canvas_bounds.set(bounds);
             },
             move |bounds, _, window, _| {
+                let graph = captured_graph.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    let graph = graph.clone();
+                    let _ = graph.update(cx, |editor, cx| {
+                        let local = editor.local_screen(event.position);
+                        let canvas = editor.canvas_bounds.get();
+                        let outside = local.x < 0.0
+                            || local.y < 0.0
+                            || local.x > f32::from(canvas.size.width)
+                            || local.y > f32::from(canvas.size.height);
+                        if outside {
+                            editor.handle_pointer_move(local, cx);
+                        }
+                    });
+                });
+                let graph = captured_graph.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
+                        return;
+                    }
+                    let graph = graph.clone();
+                    let _ = graph.update(cx, |editor, cx| {
+                        let local = editor.local_screen(event.position);
+                        let canvas = editor.canvas_bounds.get();
+                        let outside = local.x < 0.0
+                            || local.y < 0.0
+                            || local.x > f32::from(canvas.size.width)
+                            || local.y > f32::from(canvas.size.height);
+                        if outside {
+                            editor.finish_left_gesture(cx);
+                        }
+                    });
+                });
                 for (route, selected, dangling) in &wires {
                     paint_route(
                         window,
@@ -2392,75 +2501,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         )
         .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
             let local = this.local_screen(event.position);
-            if let Some(previous) = this.panning.as_mut() {
-                let old = *previous;
-                *previous = local;
-                if this.graph.viewport.pan_between(old, local) {
-                    cx.emit(core::GraphEvent::ViewportChanged {
-                        viewport: this.graph.viewport,
-                    });
-                    cx.notify();
-                }
-            }
-
-            if let Some(resize) = this.resize.clone() {
-                let delta = (local.x - resize.start_screen_x) / this.graph.viewport.zoom;
-                let width = (resize.start_size.width + delta)
-                    .clamp(this.config.min_node_width, this.config.max_node_width);
-                if this.resize_node_width(&resize.id, width) {
-                    if let Some(active) = this.resize.as_mut() {
-                        active.moved |= (width - active.start_size.width).abs() > f32::EPSILON;
-                    }
-                    cx.notify();
-                }
-            }
-
-            if let Some(drag) = this.drag.clone() {
-                let cursor = this.graph.viewport.screen_to_world(local);
-                let updates: Vec<_> = drag
-                    .offsets
-                    .iter()
-                    .map(|(id, offset)| {
-                        let mut position = cursor - *offset;
-                        if let Some(grid) = this.config.grid_size.filter(|grid| *grid > 0.0) {
-                            position.x = (position.x / grid).round() * grid;
-                            position.y = (position.y / grid).round() * grid;
-                        }
-                        (id.clone(), position)
-                    })
-                    .collect();
-                if this.graph.move_nodes(&updates).is_some() {
-                    if let Some(active) = this.drag.as_mut() {
-                        active.moved = true;
-                    }
-                    cx.notify();
-                }
-            }
-
-            if let Some(selection) = this.box_selection.as_mut() {
-                selection.current = this.graph.viewport.screen_to_world(local);
-                let mut nodes = this.graph.nodes_in_rect(selection.rect());
-                nodes.extend(selection.baseline_nodes.iter().cloned());
-                let before = this.graph.selected_nodes.clone();
-                this.graph.selected_nodes = nodes;
-                this.graph.selected_connections = selection.baseline_connections.clone();
-                if before != this.graph.selected_nodes {
-                    this.emit_selection(cx);
-                }
-                cx.notify();
-            }
-
-            if let Some(origin) = this.draft.as_ref().map(|draft| draft.origin.clone()) {
-                let snap_target = this.nearest_compatible_port(&origin, local);
-                if let Some(draft) = this.draft.as_mut() {
-                    if draft.start_screen.distance(local) > 2.0 {
-                        draft.moved = true;
-                    }
-                    draft.current_screen = local;
-                    draft.snap_target = snap_target;
-                }
-                cx.notify();
-            }
+            this.handle_pointer_move(local, cx);
         }))
         .on_mouse_up(
             MouseButton::Left,

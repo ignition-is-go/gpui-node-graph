@@ -25,8 +25,8 @@ Implemented:
 - blank deselection, Shift node/wire selection, box selection and batched multi-node drag;
 - optional grid snap, middle-button and Ctrl+left panning, pointer-centered wheel zoom,
   fit view, and finite viewport safeguards;
-- left-button gesture cleanup through `on_mouse_up_out` (continuous movement outside an
-  embedded editor still requires the planned captured/custom GPUI element).
+- window-level capture-phase continuation and completion for left gestures that leave an
+  embedded editor, plus root `on_mouse_up_out` cleanup.
 
 ## Validation improvements
 
@@ -55,5 +55,6 @@ least three seconds, preventing both lifecycle and false-mount positives.
 - deeper large-graph routing performance/visual tuning; deterministic subway routes now
   batch into stable per-source lanes, cache by graph/geometry/config fingerprint, paint rounded
   orthogonal corners, and switch at runtime to Bezier/simple modes;
-- captured dragging outside embedded bounds and broader scripted native/browser
-  interaction and visual tests (rich renderers now receive an opt-in visibility hook).
+- broader scripted native/browser interaction and visual tests; window-level capture now
+  continues and completes gestures outside embedded bounds, and rich renderers receive an
+  opt-in visibility hook.
