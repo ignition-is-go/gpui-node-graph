@@ -245,6 +245,9 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
     ConnectionRemoved {
         id: C,
     },
+    DanglingConnectionRestored {
+        id: C,
+    },
     SelectionChanged {
         nodes: HashSet<N>,
         connections: HashSet<C>,

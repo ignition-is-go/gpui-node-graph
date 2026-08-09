@@ -240,10 +240,14 @@ fn launch(cx: &mut App) {
                 }
                 insert_connection(&mut graph, "source.out".into(), "math.a".into());
                 insert_connection(&mut graph, "math.out".into(), "output.in".into());
+                let control_values = std::rc::Rc::new(std::cell::RefCell::new(
+                    std::collections::HashMap::<String, f32>::new(),
+                ));
+                let renderer_values = control_values.clone();
                 NodeGraph::new_in(graph, cx)
                     .with_catalog(editor_catalog)
                     .with_node_body_renderer(
-                        |context: NodeBodyContext<Kind, String, String, String>,
+                        move |context: NodeBodyContext<Kind, String, String, String>,
                          _: &mut gpui::Window,
                          _: &mut App| {
                             let port_count = context.ports.len();
@@ -274,8 +278,14 @@ fn launch(cx: &mut App) {
                                 }
                             }
                             let is_custom = context.node.title == "Custom";
-                            let show_overlay = context.node.title == "Multiply";
+                            let show_overlay =
+                                context.node.title == "Multiply" || context.node.title == "Mix";
                             let node_title = context.node.title.clone();
+                            let numeric_control = matches!(
+                                node_title.as_str(),
+                                "Number" | "Math" | "Multiply" | "Mix"
+                            );
+                            let color_control = node_title == "Color Source";
                             let overlay_x = context.node.size.width + 12.0;
                             let node_id = context.node.id.clone();
                             let add_graph = context.graph();
@@ -309,6 +319,85 @@ fn launch(cx: &mut App) {
                                         .child(gpui::div().flex().flex_col().children(input_rows))
                                         .child(gpui::div().flex().flex_col().children(output_rows)),
                                 );
+                            if numeric_control {
+                                let value = *renderer_values
+                                    .borrow()
+                                    .get(&node_id)
+                                    .unwrap_or(&0.5);
+                                let values = renderer_values.clone();
+                                let graph = context.graph();
+                                let value_node = node_id.clone();
+                                let control = gpui::div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .rounded_sm()
+                                    .bg(gpui::rgb(0x27272a))
+                                    .px_2()
+                                    .child(format!("Value {value:.2}"))
+                                    .child(
+                                        gpui::div()
+                                            .rounded_sm()
+                                            .bg(gpui::rgb(0x3f3f46))
+                                            .px_2()
+                                            .child("+")
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                move |_, window, cx| {
+                                                    cx.stop_propagation();
+                                                    window.prevent_default();
+                                                    let next = (values
+                                                        .borrow()
+                                                        .get(&value_node)
+                                                        .copied()
+                                                        .unwrap_or(0.5)
+                                                        + 0.1)
+                                                        .min(1.0);
+                                                    values
+                                                        .borrow_mut()
+                                                        .insert(value_node.clone(), next);
+                                                    let _ = graph.update(cx, |_, cx| cx.notify());
+                                                },
+                                            ),
+                                    );
+                                body = body.child(context.isolated_control(control));
+                            }
+                            if color_control {
+                                let values = renderer_values.clone();
+                                let graph = context.graph();
+                                let value_node = node_id.clone();
+                                let active = renderer_values
+                                    .borrow()
+                                    .get(&node_id)
+                                    .copied()
+                                    .unwrap_or_default()
+                                    > 0.5;
+                                let swatch = gpui::div()
+                                    .h(gpui::px(18.0))
+                                    .rounded_sm()
+                                    .bg(gpui::rgb(if active { 0xf472b6 } else { 0x38bdf8 }))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            window.prevent_default();
+                                            let next = if values
+                                                .borrow()
+                                                .get(&value_node)
+                                                .copied()
+                                                .unwrap_or_default()
+                                                > 0.5
+                                            {
+                                                0.0
+                                            } else {
+                                                1.0
+                                            };
+                                            values.borrow_mut().insert(value_node.clone(), next);
+                                            let _ = graph.update(cx, |_, cx| cx.notify());
+                                        },
+                                    );
+                                body = body.child(context.isolated_control(swatch));
+                            }
                             if is_custom {
                                 let add_node = node_id.clone();
                                 let remove_node = node_id;
@@ -364,7 +453,7 @@ fn launch(cx: &mut App) {
                                                             editor.graph.ports.insert(
                                                                 port_id.clone(),
                                                                 Port {
-                                                                    id: port_id,
+                                                                    id: port_id.clone(),
                                                                     node: add_node.clone(),
                                                                     label: format!(
                                                                         "Dynamic {}",
@@ -380,6 +469,7 @@ fn launch(cx: &mut App) {
                                                                     ),
                                                                 },
                                                             );
+                                                            editor.restore_tombstoned_connections(&port_id, cx);
                                                             if let Some(node) = editor
                                                                 .graph
                                                                 .nodes

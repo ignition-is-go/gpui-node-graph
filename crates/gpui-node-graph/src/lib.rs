@@ -39,18 +39,24 @@ pub struct DanglingConnection<P, C> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderGeometry<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> {
+    node_sizes: HashMap<N, core::Size>,
     port_offsets: HashMap<P, (N, core::Point)>,
 }
 
 impl<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> Default for RenderGeometry<N, P> {
     fn default() -> Self {
         Self {
+            node_sizes: HashMap::new(),
             port_offsets: HashMap::new(),
         }
     }
 }
 
 impl<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> RenderGeometry<N, P> {
+    pub fn node_size(&self, id: &N) -> Option<core::Size> {
+        self.node_sizes.get(id).copied()
+    }
+
     pub fn port_offset(&self, id: &P) -> Option<(&N, core::Point)> {
         self.port_offsets
             .get(id)
@@ -717,6 +723,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         &self.render_geometry
     }
 
+    pub fn resolved_node_size(&self, id: &N) -> Option<core::Size> {
+        self.render_geometry
+            .node_sizes
+            .get(id)
+            .copied()
+            .or_else(|| self.graph.nodes.get(id).map(|node| node.size))
+    }
+
     pub fn resolved_port_position(&self, id: &P) -> Option<core::Point> {
         if let Some((owner, offset)) = self.render_geometry.port_offsets.get(id)
             && let Some(node) = self.graph.nodes.get(owner)
@@ -785,6 +799,53 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.graph.ports.remove(id);
         self.render_geometry.port_offsets.remove(id);
         Some(removed_connections)
+    }
+
+    /// Restore strict connections whose previously missing dynamic port is available again.
+    pub fn restore_tombstoned_connections(&mut self, port_id: &P, cx: &mut Context<Self>) -> usize {
+        let restored = self.restore_tombstones_for_port(port_id);
+        for id in &restored {
+            cx.emit(core::GraphEvent::DanglingConnectionRestored { id: id.clone() });
+        }
+        if !restored.is_empty() {
+            cx.notify();
+        }
+        restored.len()
+    }
+
+    fn restore_tombstones_for_port(&mut self, port_id: &P) -> Vec<C> {
+        let mut restored = Vec::new();
+        self.dangling_connections.retain(|connection| {
+            if &connection.missing_port != port_id
+                || self.graph.connections.contains_key(&connection.id)
+            {
+                return true;
+            }
+            let Some(source) = self.graph.ports.get(&connection.source) else {
+                return true;
+            };
+            let Some(target) = self.graph.ports.get(&connection.target) else {
+                return true;
+            };
+            if source.direction != PortDirection::Output
+                || target.direction != PortDirection::Input
+                || source.node == target.node
+                || !T::compatible(&source.kind, &target.kind)
+            {
+                return true;
+            }
+            self.graph.connections.insert(
+                connection.id.clone(),
+                Connection {
+                    id: connection.id.clone(),
+                    source: connection.source.clone(),
+                    target: connection.target.clone(),
+                },
+            );
+            restored.push(connection.id.clone());
+            false
+        });
+        restored
     }
 
     pub fn clear_dangling_connections(&mut self, cx: &mut Context<Self>) {
@@ -907,6 +968,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         graph.canonicalize_ids();
         graph.validate()?;
         self.graph = graph;
+        self.render_geometry
+            .node_sizes
+            .retain(|node, _| self.graph.nodes.contains_key(node));
         self.render_geometry.port_offsets.retain(|port, (node, _)| {
             self.graph.ports.contains_key(port) && self.graph.nodes.contains_key(node)
         });
@@ -938,6 +1002,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
         self.drag = None;
         self.box_selection = None;
+        self.render_geometry
+            .node_sizes
+            .retain(|node, _| self.graph.nodes.contains_key(node));
         self.render_geometry.port_offsets.retain(|port, (node, _)| {
             self.graph.ports.contains_key(port) && self.graph.nodes.contains_key(node)
         });
@@ -1183,7 +1250,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                     .iter()
                     .map(|node| core::Rect {
                         origin: node.position,
-                        size: node.size,
+                        size: self.resolved_node_size(&node.id).unwrap_or(node.size),
                     })
                     .collect();
                 let start_obstacle = nodes.iter().position(|node| node.id == source.node);
@@ -1207,12 +1274,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn connection_routes(&self) -> HashMap<C, Vec<core::Point>> {
         let fingerprint = format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.config.routing,
             self.config.route_lane_spacing,
             self.graph.nodes,
             self.graph.ports,
             self.graph.connections,
+            self.render_geometry.node_sizes,
             self.render_geometry.port_offsets,
         );
         if self.route_cache.borrow().fingerprint == fingerprint {
@@ -1310,8 +1378,50 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         None
     }
 
+    fn render_bounds(&self) -> Option<core::Rect> {
+        let node_sizes = &self.render_geometry.node_sizes;
+        let mut nodes = self.graph.nodes.values();
+        let first = nodes.next()?;
+        let first_size = node_sizes.get(&first.id).copied().unwrap_or(first.size);
+        let (mut left, mut top, mut right, mut bottom) = (
+            first.position.x,
+            first.position.y,
+            first.position.x + first_size.width,
+            first.position.y + first_size.height,
+        );
+        for node in nodes {
+            let size = node_sizes.get(&node.id).copied().unwrap_or(node.size);
+            left = left.min(node.position.x);
+            top = top.min(node.position.y);
+            right = right.max(node.position.x + size.width);
+            bottom = bottom.max(node.position.y + size.height);
+        }
+        Some(core::Rect {
+            origin: core::Point::new(left, top),
+            size: core::Size {
+                width: right - left,
+                height: bottom - top,
+            },
+        })
+    }
+
+    fn nodes_in_render_rect(&self, rect: core::Rect) -> HashSet<N> {
+        self.graph
+            .nodes
+            .values()
+            .filter(|node| {
+                core::Rect {
+                    origin: node.position,
+                    size: self.resolved_node_size(&node.id).unwrap_or(node.size),
+                }
+                .intersects(&rect)
+            })
+            .map(|node| node.id.clone())
+            .collect()
+    }
+
     fn fit_view(&mut self) -> bool {
-        let Some(bounds) = self.graph.bounds() else {
+        let Some(bounds) = self.render_bounds() else {
             return false;
         };
         let canvas = self.canvas_bounds.get();
@@ -1384,6 +1494,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     fn update_group_memberships(&mut self, dragged: &[N]) -> Vec<(String, Vec<N>)> {
         let dragged_set: HashSet<_> = dragged.iter().cloned().collect();
         let mut changes = Vec::new();
+        let node_sizes = &self.render_geometry.node_sizes;
         for group in &mut self.groups {
             let mut members = group
                 .nodes
@@ -1395,13 +1506,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             };
             let mut left = first.position.x;
             let mut top = first.position.y;
-            let mut right = first.position.x + first.size.width;
-            let mut bottom = first.position.y + first.size.height;
+            let first_size = node_sizes.get(&first.id).copied().unwrap_or(first.size);
+            let mut right = first.position.x + first_size.width;
+            let mut bottom = first.position.y + first_size.height;
             for node in members {
+                let size = node_sizes.get(&node.id).copied().unwrap_or(node.size);
                 left = left.min(node.position.x);
                 top = top.min(node.position.y);
-                right = right.max(node.position.x + node.size.width);
-                bottom = bottom.max(node.position.y + node.size.height);
+                right = right.max(node.position.x + size.width);
+                bottom = bottom.max(node.position.y + size.height);
             }
             let padding = 24.0;
             let mut changed = false;
@@ -1501,13 +1614,20 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             }
         }
 
-        if let Some(selection) = self.box_selection.as_mut() {
+        let selection_state = self.box_selection.as_mut().map(|selection| {
             selection.current = self.graph.viewport.screen_to_world(local);
-            let mut nodes = self.graph.nodes_in_rect(selection.rect());
-            nodes.extend(selection.baseline_nodes.iter().cloned());
+            (
+                selection.rect(),
+                selection.baseline_nodes.clone(),
+                selection.baseline_connections.clone(),
+            )
+        });
+        if let Some((rect, baseline_nodes, baseline_connections)) = selection_state {
+            let mut nodes = self.nodes_in_render_rect(rect);
+            nodes.extend(baseline_nodes);
             let before = self.graph.selected_nodes.clone();
             self.graph.selected_nodes = nodes;
-            self.graph.selected_connections = selection.baseline_connections.clone();
+            self.graph.selected_connections = baseline_connections;
             if before != self.graph.selected_nodes {
                 self.emit_selection(cx);
             }
@@ -1946,13 +2066,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             };
             let mut left = first.position.x;
             let mut top = first.position.y;
-            let mut right = first.position.x + first.size.width;
-            let mut bottom = first.position.y + first.size.height;
+            let first_size = self.resolved_node_size(&first.id).unwrap_or(first.size);
+            let mut right = first.position.x + first_size.width;
+            let mut bottom = first.position.y + first_size.height;
             for node in members {
+                let size = self.resolved_node_size(&node.id).unwrap_or(node.size);
                 left = left.min(node.position.x);
                 top = top.min(node.position.y);
-                right = right.max(node.position.x + node.size.width);
-                bottom = bottom.max(node.position.y + node.size.height);
+                right = right.max(node.position.x + size.width);
+                bottom = bottom.max(node.position.y + size.height);
             }
             let padding = 24.0;
             let origin = viewport.world_to_screen(core::Point::new(left - padding, top - padding));
@@ -2005,12 +2127,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let mut body_anchored_nodes = HashSet::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
-        for node in nodes {
+        for mut node in nodes {
             let id = node.id.clone();
+            let model_size = node.size;
+            if let Some(size) = self.resolved_node_size(&id) {
+                node.size = size;
+            }
             let position = viewport.world_to_screen(node.position);
             let selected = self.graph.selected_nodes.contains(&id);
             let visible = self.node_is_visible(&node);
             let resize_id = id.clone();
+            let has_custom_body = self.node_body_renderer.is_some();
             let mut body = if let Some(renderer) = self.node_body_renderer.as_mut() {
                 let mut ports: Vec<_> = self
                     .graph
@@ -2067,6 +2194,44 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 }
                 node_overlays.push((overlay_position, overlay.element));
             }
+            let graph = cx.weak_entity();
+            let measured_node = id.clone();
+            let raw_body_element = body.element;
+            let body_element = if has_custom_body {
+                MeasuredElement::new(raw_body_element, move |bounds, cx| {
+                    let measured = core::Size {
+                        width: f32::from(bounds.size.width) / viewport.zoom + 16.0,
+                        height: f32::from(bounds.size.height) / viewport.zoom + 16.0,
+                    };
+                    if !measured.width.is_finite()
+                        || !measured.height.is_finite()
+                        || measured.width <= 0.0
+                        || measured.height <= 0.0
+                    {
+                        return;
+                    }
+                    let graph = graph.clone();
+                    let node_id = measured_node.clone();
+                    cx.defer(move |cx| {
+                        let _ = graph.update(cx, |editor, cx| {
+                            let changed =
+                                editor.render_geometry.node_sizes.get(&node_id).is_none_or(
+                                    |current| {
+                                        (current.width - measured.width).abs() > 0.1
+                                            || (current.height - measured.height).abs() > 0.1
+                                    },
+                                );
+                            if changed {
+                                editor.render_geometry.node_sizes.insert(node_id, measured);
+                                cx.notify();
+                            }
+                        });
+                    });
+                })
+                .into_any_element()
+            } else {
+                raw_body_element
+            };
             let background = if selected {
                 self.theme.node_selected
             } else {
@@ -2078,7 +2243,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .left(px(position.x))
                     .top(px(position.y))
                     .w(px(viewport.scale_length(node.size.width)))
-                    .h(px(viewport.scale_length(node.size.height)))
+                    .when(has_custom_body, |element| {
+                        element.min_h(px(viewport.scale_length(model_size.height)))
+                    })
+                    .when(!has_custom_body, |element| {
+                        element.h(px(viewport.scale_length(node.size.height)))
+                    })
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(0x52525b))
@@ -2086,7 +2256,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .text_color(rgb(self.theme.text))
                     .text_size(px(viewport.scale_length(14.0).clamp(8.0, 24.0)))
                     .p(px(viewport.scale_length(8.0)))
-                    .child(body.element)
+                    .child(body_element)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -3056,6 +3226,55 @@ mod tests {
         assert_eq!(
             editor.dangling_connections[0].source_position,
             core::Point::new(50.0, 25.0)
+        );
+        editor.graph.ports.insert(
+            "out".into(),
+            Port {
+                id: "out".into(),
+                node: "a".into(),
+                label: "Out".into(),
+                direction: PortDirection::Output,
+                kind: Kind,
+                position: core::Point::new(50.0, 25.0),
+            },
+        );
+        assert_eq!(
+            editor.restore_tombstones_for_port(&"out".into()),
+            vec![String::from("wire")]
+        );
+        assert!(editor.dangling_connections.is_empty());
+        assert!(editor.graph.connections.contains_key("wire"));
+        editor.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn measured_node_sizes_drive_bounds_and_box_selection() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        editor.render_geometry.node_sizes.insert(
+            "a".into(),
+            core::Size {
+                width: 80.0,
+                height: 90.0,
+            },
+        );
+        assert_eq!(
+            editor.resolved_node_size(&"a".into()),
+            Some(core::Size {
+                width: 80.0,
+                height: 90.0,
+            })
+        );
+        assert_eq!(editor.render_bounds().unwrap().size.height, 90.0);
+        assert!(
+            editor
+                .nodes_in_render_rect(core::Rect {
+                    origin: core::Point::new(10.0, 70.0),
+                    size: core::Size {
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                })
+                .contains("a")
         );
     }
 

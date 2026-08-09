@@ -44,16 +44,15 @@ GPUI demo to stay alive under Xvfb rather than merely compiling it.
 
 - further transaction ergonomics; explicit uncontrolled ownership now commits previews
   locally, while controlled ownership rolls them back and emits atomic typed mutation batches;
-- broader specialized widgets; `NodeBodyContext::isolated_control` now blocks graph
-  keyboard, wheel, and pointer gestures around retained body controls, and
-  `NodeBodyRenderer` supports shell-interactive measured anchors, transient node-relative geometry/tombstones, and
-  unscaled overlays with adaptive flip/clamp/Escape-dismiss behavior; the demo proves an
-  interactive panel, while right-edge resize,
-  rollback and reset also work;
+- further specialized-widget polish; `NodeBodyContext::isolated_control` blocks graph
+  gestures around retained controls, consumer bodies now measure node size and port anchors,
+  and the demo exercises editable numeric/color controls, dynamic inputs, and an adaptive
+  flip/clamp/Escape-dismiss panel; right-edge resize, rollback, and reset also work;
 - richer persistent ungroup/nested-group semantics; rendered groups now support inline
   label editing and Alt-drag membership updates with explicit core events;
-- broader dynamic-port policy/UI polish; removal now atomically keeps the persisted graph
-  strict while rendering removed connections as transient red tombstones;
+- broader dynamic-port policy/UI polish; removal atomically keeps persisted graphs strict,
+  renders transient red tombstones, and restores the original typed connection when a stable
+  port ID reappears;
 - deeper large-graph routing performance/visual tuning; deterministic subway routes now
   batch into stable per-source lanes, cache by graph/geometry/config fingerprint, paint rounded
   orthogonal corners, and switch at runtime to Bezier/simple modes;
