@@ -4,19 +4,21 @@ Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries
 
 ## Status
 
-The initial production foundation includes a serde-compatible framework-free model, typed port compatibility, geometry/viewport and selection queries, deterministic orthogonal routes, a native GPUI view, painted connections, positioned nodes, selection, node dragging with events, and middle-button panning. The same view code runs on Windows, macOS, Linux, and WebAssembly.
+The production foundation includes a serde-compatible framework-free domain snapshot, separately managed transient editor state, generic typed IDs, validated/canonical graph references, directional port compatibility, safe viewport transforms, geometry and selection queries, deterministic orthogonal routes, and a shared GPUI view. Dragging translates a node and its world-space ports atomically; selection, viewport, reconciliation, and completed node drags all emit editor events. The same view code runs on Windows, macOS, Linux, and WebAssembly.
 
 ```sh
 cargo run -p gpui-node-graph-demo
 cargo test --workspace
 # Browser host (requires Trunk)
 cd examples/demo && trunk serve
+# verify the required cross-origin-isolation headers
+curl -sSI http://127.0.0.1:8181/ | grep -Ei 'cross-origin-(opener|embedder)-policy'
 ```
 
 ## Architecture
 
-- `node-graph-core`: canonical serializable model and deterministic logic. Keep persisted Rship graph DTOs here; UI state must not leak into serialization.
-- `gpui-node-graph`: shared retained-mode view and input adapter. Consumers own/reconcile domain data and can subscribe to `EditorEvent`.
+- `node-graph-core`: canonical serializable model and deterministic logic. Persist `GraphSnapshot`; `GraphUiState` (selection and viewport) is session-only. `GraphState` still accepts the former top-level domain JSON shape, but deliberately skips transient fields when serialized. Call `validate`, `canonicalize_ids`, or `GraphState::from_snapshot` at trust boundaries.
+- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` retained-mode view and input adapter. Consumers own/reconcile domain data and can subscribe to `EditorEvent` for node movement, selection, viewport, and snapshot reconciliation. Node content geometry (including text and padding) scales uniformly with viewport zoom.
 - `examples/demo`: shared GPUI application with thin target-specific desktop/browser packaging. `gpui_platform::application()` selects the backend.
 
 All saved-model migrations belong in core and must have fixture round-trip tests. Leptos is a behavior/serialization reference during migration only, not a co-maintained target.
@@ -37,6 +39,6 @@ All saved-model migrations belong in core and must have fixture round-trip tests
 
 ## Platform support
 
-First-class Windows, macOS, Linux, and `wasm32-unknown-unknown` builds are checked in CI. The browser has exactly **one document-owned GPUI window**; Mullion composes every pane and workspace inside that root. `PlatformWindowService` is the only optional detached-window gateway: native builds may open an OS window, while wasm returns `DetachedWindowError::UnavailableInBrowser` without changing shared view code. Browser launch/HTML/COOP+COEP packaging is isolated in the demo host.
+First-class Windows, macOS, Linux, and `wasm32-unknown-unknown` builds are checked in CI. The browser has exactly **one document-owned GPUI window**; Mullion composes every pane and workspace inside that root. `PlatformWindowService` is the only optional detached-window gateway: native builds may open an OS window, while wasm returns `DetachedWindowError::UnavailableInBrowser` without changing shared view code. Browser launch/HTML/COOP+COEP packaging is isolated in the demo host. Web GPUI uses shared memory, so production hosting **must** return `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on the document and assets. `Trunk.toml` supplies these locally and `_headers` is copied for Netlify/Cloudflare Pages; for other hosts configure the equivalent response headers (HTML `<meta>` tags are not sufficient). CI starts the real Trunk server, asserts both headers, and fetches the generated Wasm asset as a deployment smoke test.
 
 Licensed under Apache-2.0.

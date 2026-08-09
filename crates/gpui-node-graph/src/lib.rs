@@ -8,8 +8,19 @@ pub use node_graph_core::*;
 pub use windows::*;
 
 #[derive(Clone, Debug)]
-pub enum EditorEvent {
-    NodeMoved { id: String, position: core::Point },
+pub enum EditorEvent<N: Eq + std::hash::Hash = String, C: Eq + std::hash::Hash = String> {
+    NodeMoved {
+        id: N,
+        position: core::Point,
+    },
+    SelectionChanged {
+        nodes: std::collections::HashSet<N>,
+        connections: std::collections::HashSet<C>,
+    },
+    ViewportChanged {
+        viewport: Viewport,
+    },
+    GraphReconciled,
 }
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -30,16 +41,26 @@ impl Default for Theme {
         }
     }
 }
-/// Native retained-mode GPUI node editor. Domain state stays framework-free in `node_graph_core`.
-pub struct NodeGraph<T: PortType> {
-    pub graph: GraphState<String, String, String, T>,
+/// Shared native/WebAssembly retained-mode GPUI node editor. Domain state stays framework-free in `node_graph_core`.
+pub struct NodeGraph<
+    T: PortType,
+    N: core::NodeId = String,
+    P: core::PortId = String,
+    C: core::ConnectionId = String,
+> {
+    pub graph: GraphState<N, P, C, T>,
     pub theme: Theme,
-    drag: Option<(String, core::Point)>,
+    drag: Option<(N, core::Point)>,
     panning: Option<core::Point>,
 }
-impl<T: PortType> gpui::EventEmitter<EditorEvent> for NodeGraph<T> {}
-impl<T: PortType> NodeGraph<T> {
-    pub fn new(graph: GraphState<String, String, String, T>) -> Self {
+impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
+    gpui::EventEmitter<EditorEvent<N, C>> for NodeGraph<T, N, P, C>
+{
+}
+impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeGraph<T, N, P, C> {
+    pub fn new(mut graph: GraphState<N, P, C, T>) -> Self {
+        graph.canonicalize_ids();
+        graph.viewport = graph.viewport.sanitized();
         Self {
             graph,
             theme: Theme::default(),
@@ -47,18 +68,44 @@ impl<T: PortType> NodeGraph<T> {
             panning: None,
         }
     }
+    /// Replace domain and transient state after canonicalization and validation.
     pub fn set_graph(
         &mut self,
-        graph: GraphState<String, String, String, T>,
+        mut graph: GraphState<N, P, C, T>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), GraphValidationError> {
+        graph.canonicalize_ids();
+        graph.viewport = graph.viewport.sanitized();
+        graph.validate()?;
         self.graph = graph;
+        cx.emit(EditorEvent::GraphReconciled);
+        cx.emit(EditorEvent::SelectionChanged {
+            nodes: self.graph.selected_nodes.clone(),
+            connections: self.graph.selected_connections.clone(),
+        });
+        cx.emit(EditorEvent::ViewportChanged {
+            viewport: self.graph.viewport,
+        });
         cx.notify();
+        Ok(())
+    }
+    /// Reconcile persisted domain data while preserving valid selection and viewport.
+    pub fn reconcile(
+        &mut self,
+        snapshot: GraphSnapshot<N, P, C, T>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), GraphValidationError> {
+        self.graph.reconcile(snapshot)?;
+        cx.emit(EditorEvent::GraphReconciled);
+        cx.notify();
+        Ok(())
     }
 }
-impl<T: PortType> Render for NodeGraph<T> {
+impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Render
+    for NodeGraph<T, N, P, C>
+{
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let vp = self.graph.viewport;
+        let vp = self.graph.viewport.sanitized();
         let wires: Vec<_> = self
             .graph
             .connections
@@ -118,7 +165,8 @@ impl<T: PortType> Render for NodeGraph<T> {
                     .border_color(rgb(0x52525b))
                     .bg(rgb(bg))
                     .text_color(rgb(self.theme.text))
-                    .p_2()
+                    .text_size(px(14. * vp.zoom))
+                    .p(px(8. * vp.zoom))
                     .child(n.title.clone())
                     .on_mouse_down(
                         MouseButton::Left,
@@ -129,6 +177,10 @@ impl<T: PortType> Render for NodeGraph<T> {
                                 this.drag = Some((id.clone(), world - node.position));
                                 this.graph.selected_nodes.clear();
                                 this.graph.selected_nodes.insert(id.clone());
+                                cx.emit(EditorEvent::SelectionChanged {
+                                    nodes: this.graph.selected_nodes.clone(),
+                                    connections: this.graph.selected_connections.clone(),
+                                });
                                 cx.notify();
                             }
                         }),
@@ -146,12 +198,14 @@ impl<T: PortType> Render for NodeGraph<T> {
             if let Some(last) = this.panning.as_mut() {
                 this.graph.viewport.pan = this.graph.viewport.pan + (s - *last);
                 *last = s;
+                cx.emit(EditorEvent::ViewportChanged {
+                    viewport: this.graph.viewport,
+                });
                 cx.notify();
             }
             if let Some((id, off)) = this.drag.clone() {
                 let p = this.graph.viewport.screen_to_world(s) - off;
-                if let Some(n) = this.graph.nodes.get_mut(&id) {
-                    n.position = p;
+                if this.graph.move_node(&id, p).is_some() {
                     cx.notify();
                 }
             }
