@@ -14,7 +14,9 @@ use std::{
 };
 
 pub use node_graph_core as core;
+pub mod style;
 pub use node_graph_core::*;
+pub use style::GraphStyle;
 pub use windows::*;
 
 /// The GPUI adapter and framework-free core now expose one event vocabulary.
@@ -269,7 +271,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
                 self.theme.port_output
             }
         });
-        let diameter = self.viewport.scale_length(14.0);
+        let diameter = self.viewport.scale_length(8.0);
         self.port_anchor(
             id,
             div()
@@ -433,18 +435,18 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             background: 0x18181b,
-            node: 0x27272a,
-            node_selected: 0x3f3f46,
+            node: 0x111111,
+            node_selected: 0x111111,
             wire: 0x71717a,
-            wire_selected: 0xef4444,
+            wire_selected: 0xdddddd,
             wire_draft: 0x22d3ee,
-            text: 0xe4e4e7,
-            port_input: 0x60a5fa,
-            port_output: 0xf59e0b,
+            text: 0xd4d4d8,
+            port_input: 0x71717a,
+            port_output: 0x71717a,
             port_connected: 0xa1a1aa,
             port_compatible: 0x22d3ee,
-            selection_border: 0x60a5fa,
-            selection_fill: 0x1e3a5f,
+            selection_border: 0xffffff,
+            selection_fill: 0xffffff,
         }
     }
 }
@@ -684,6 +686,9 @@ pub struct NodeGraph<
 > {
     pub graph: GraphState<N, P, C, T>,
     pub theme: Theme,
+    /// Complete visual configuration. `theme` remains as a compatibility color facade while
+    /// rendering migrates to the strongly typed Leptos-parity style vocabulary.
+    pub style: GraphStyle,
     pub config: EditorConfig,
     drag: Option<NodeDrag<N>>,
     resize: Option<ResizeDrag<N, P>>,
@@ -731,6 +736,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         Ok(Self {
             graph,
             theme: Theme::default(),
+            style: GraphStyle::default(),
             config: EditorConfig::default(),
             drag: None,
             resize: None,
@@ -754,6 +760,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     pub fn focus_handle(&self) -> Option<&FocusHandle> {
         self.focus_handle.as_ref()
+    }
+
+    pub fn with_style(mut self, style: GraphStyle) -> Self {
+        self.style = style;
+        self
     }
 
     pub fn with_catalog(mut self, catalog: Vec<NodeCatalogItem<T>>) -> Self {
@@ -2203,19 +2214,29 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 right = right.max(node.position.x + size.width);
                 bottom = bottom.max(node.position.y + size.height);
             }
-            let padding = 24.0;
-            let origin = viewport.world_to_screen(core::Point::new(left - padding, top - padding));
+            let horizontal_padding = 16.0;
+            let top_padding = 40.0;
+            let bottom_padding = 16.0;
+            let origin = viewport.world_to_screen(core::Point::new(
+                left - horizontal_padding,
+                top - top_padding,
+            ));
             root = root.child(
                 div()
                     .absolute()
                     .left(px(origin.x))
                     .top(px(origin.y))
-                    .w(px(viewport.scale_length(right - left + padding * 2.0)))
-                    .h(px(viewport.scale_length(bottom - top + padding * 2.0)))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(group.color).opacity(0.75))
-                    .bg(rgb(group.color).opacity(0.08)),
+                    .w(px(
+                        viewport.scale_length(right - left + horizontal_padding * 2.0)
+                    ))
+                    .h(px(
+                        viewport.scale_length(bottom - top + top_padding + bottom_padding)
+                    ))
+                    .rounded(px(viewport.scale_length(8.0)))
+                    .border(px(viewport.scale_length(1.0)))
+                    .border_dashed()
+                    .border_color(rgb(group.color).opacity(0.5))
+                    .bg(rgb(group.color).opacity(0.1)),
             );
             group_labels.push((origin, group.id.clone(), group_label, group.color));
         }
@@ -2224,11 +2245,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             root = root.child(
                 div()
                     .absolute()
-                    .left(px(origin.x + 4.0))
-                    .top(px(origin.y + 2.0))
+                    .left(px(origin.x + viewport.scale_length(10.0)))
+                    .top(px(origin.y + viewport.scale_length(6.0)))
                     .text_color(rgb(color))
-                    .text_size(px(11.0))
-                    .child(label)
+                    .text_size(px(viewport.scale_length(10.0)))
+                    .child(label.to_uppercase())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -2374,13 +2395,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .top(px(position.y))
                     .w(px(viewport.scale_length(node.size.width)))
                     .h(px(viewport.scale_length(model_size.height)))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x52525b))
+                    .rounded(px(viewport.scale_length(2.0)))
+                    .overflow_hidden()
+                    .when(selected, |element| {
+                        element.border_1().border_color(rgb(0xff0000))
+                    })
                     .bg(rgb(background))
                     .text_color(rgb(self.theme.text))
-                    .text_size(px(viewport.scale_length(14.0)))
-                    .p(px(viewport.scale_length(8.0)))
+                    .text_size(px(viewport.scale_length(13.0)))
                     .child(body_element)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2627,8 +2649,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .w(px(viewport.scale_length(rect.size.width)))
                     .h(px(viewport.scale_length(rect.size.height)))
                     .border_1()
-                    .border_color(rgb(self.theme.selection_border))
-                    .bg(rgb(self.theme.selection_fill)),
+                    .border_color(rgb(self.theme.selection_border).opacity(0.1))
+                    .bg(rgb(self.theme.selection_fill).opacity(0.025)),
             );
         }
 
