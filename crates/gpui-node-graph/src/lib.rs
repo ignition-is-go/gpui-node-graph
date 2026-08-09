@@ -222,6 +222,30 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
         .into_any_element()
     }
 
+    /// Wrap a body control so graph shortcuts, zoom and drag gestures do not leak through it.
+    pub fn isolated_control(&self, child: impl IntoElement) -> AnyElement {
+        div()
+            .child(child)
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                cx.stop_propagation();
+                window.prevent_default();
+            })
+            .on_mouse_down(MouseButton::Middle, |_, window, cx| {
+                cx.stop_propagation();
+                window.prevent_default();
+            })
+            .on_mouse_down(MouseButton::Right, |_, window, cx| {
+                cx.stop_propagation();
+                window.prevent_default();
+            })
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_key_down(|_, _, cx| cx.stop_propagation())
+            .into_any_element()
+    }
+
     pub fn default_port_anchor(&self, id: P) -> AnyElement {
         let port = self.ports.iter().find(|port| port.id == id);
         let color = port.map_or(self.theme.port_connected, |port| {

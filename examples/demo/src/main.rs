@@ -275,6 +275,7 @@ fn launch(cx: &mut App) {
                             }
                             let is_custom = context.node.title == "Custom";
                             let show_overlay = context.node.title == "Multiply";
+                            let node_title = context.node.title.clone();
                             let overlay_x = context.node.size.width + 12.0;
                             let node_id = context.node.id.clone();
                             let add_graph = context.graph();
@@ -284,7 +285,7 @@ fn launch(cx: &mut App) {
                                 .flex()
                                 .flex_col()
                                 .gap_2()
-                                .child(context.node.title)
+                                .child(node_title)
                                 .child(
                                     gpui::div()
                                         .rounded_sm()
@@ -442,8 +443,9 @@ fn launch(cx: &mut App) {
                             if show_overlay {
                                 body.with_overlay(NodeOverlay::new(
                                     Point::new(overlay_x, 20.0),
-                                    gpui::div()
-                                        .w(gpui::px(112.0))
+                                    context.isolated_control(
+                                        gpui::div()
+                                            .w(gpui::px(112.0))
                                         .rounded_md()
                                         .border_1()
                                         .border_color(gpui::rgb(0x52525b))
@@ -459,6 +461,7 @@ fn launch(cx: &mut App) {
                                                 window.prevent_default();
                                             },
                                         ),
+                                    ),
                                 )
                                 .adaptive("blend-controls", Size { width: 112.0, height: 54.0 }))
                             } else {

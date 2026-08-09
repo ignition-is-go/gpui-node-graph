@@ -42,7 +42,8 @@ least three seconds, preventing both lifecycle and false-mount positives.
 
 - explicit controlled/uncontrolled mutation transactions rather than the current
   reference-like hybrid ownership;
-- richer body-control keyboard/wheel isolation; `NodeBodyRenderer` now supports
+- broader specialized widgets; `NodeBodyContext::isolated_control` now blocks graph
+  keyboard, wheel, and pointer gestures around retained body controls, and `NodeBodyRenderer` supports
   shell-interactive measured anchors, transient node-relative geometry/tombstones, and
   unscaled overlays with adaptive flip/clamp/Escape-dismiss behavior; the demo proves an
   interactive panel, while right-edge resize,
