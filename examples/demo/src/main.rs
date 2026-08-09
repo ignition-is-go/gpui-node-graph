@@ -2,7 +2,7 @@ use gpui::prelude::*;
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_node_graph::{
     CatalogPort, GraphGroup, NodeBody, NodeBodyContext, NodeCatalogItem, NodeGraph, NodeOverlay,
-    core::*,
+    PortPresentation, core::*,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -247,6 +247,32 @@ fn launch(cx: &mut App) {
                          _: &mut gpui::Window,
                          _: &mut App| {
                             let port_count = context.ports.len();
+                            let mut input_rows = Vec::new();
+                            let mut output_rows = Vec::new();
+                            for port in context.ports.iter() {
+                                let anchor = context.default_port_anchor(port.id.clone());
+                                let row = if port.direction == PortDirection::Input {
+                                    gpui::div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(anchor)
+                                        .child(port.label.clone())
+                                } else {
+                                    gpui::div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .gap_1()
+                                        .child(port.label.clone())
+                                        .child(anchor)
+                                };
+                                if port.direction == PortDirection::Input {
+                                    input_rows.push(row);
+                                } else {
+                                    output_rows.push(row);
+                                }
+                            }
                             let is_custom = context.node.title == "Custom";
                             let show_overlay = context.node.title == "Multiply";
                             let overlay_x = context.node.size.width + 12.0;
@@ -254,6 +280,7 @@ fn launch(cx: &mut App) {
                             let add_graph = context.graph();
                             let remove_graph = context.graph();
                             let mut body = gpui::div()
+                                .w_full()
                                 .flex()
                                 .flex_col()
                                 .gap_2()
@@ -273,6 +300,13 @@ fn launch(cx: &mut App) {
                                                 window.prevent_default();
                                             },
                                         ),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .flex()
+                                        .justify_between()
+                                        .child(gpui::div().flex().flex_col().children(input_rows))
+                                        .child(gpui::div().flex().flex_col().children(output_rows)),
                                 );
                             if is_custom {
                                 let add_node = node_id.clone();
@@ -415,7 +449,7 @@ fn launch(cx: &mut App) {
                                         ),
                                 );
                             }
-                            let body = NodeBody::new(body);
+                            let body = NodeBody::new(body).with_ports(PortPresentation::BodyAnchors);
                             if show_overlay {
                                 body.with_overlay(NodeOverlay::new(
                                     Point::new(overlay_x, 20.0),

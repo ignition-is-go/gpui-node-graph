@@ -42,10 +42,10 @@ least three seconds, preventing both lifecycle and false-mount positives.
 
 - explicit controlled/uncontrolled mutation transactions rather than the current
   reference-like hybrid ownership;
-- measured/dynamic port geometry on top of the new consumer-defined `NodeBodyRenderer`
-  seam and body-control keyboard/wheel isolation; the renderer now also supplies
-  unscaled node-relative overlay elements and the demo proves an interactive panel, while
-  flip/clamp/dismiss positioning remains (right-edge resize/rollback/reset also works);
+- richer body-control keyboard/wheel isolation and full overlay flip/clamp/dismiss;
+  `NodeBodyRenderer` now supports shell-interactive measured anchors, transient node-relative
+  geometry/tombstones, unscaled overlays, and an interactive demo panel; right-edge resize,
+  rollback and reset also work;
 - group inline editing plus Alt-drag membership gestures (consumer-supplied group
   bounds/rendering and create-group handling are now present);
 - dangling dynamic-port presentation without weakening strict persisted validation (the demo

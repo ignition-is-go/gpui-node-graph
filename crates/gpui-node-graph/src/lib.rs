@@ -1,11 +1,17 @@
 mod windows;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, WeakEntity,
-    Window, canvas, div, point, prelude::*, px, rgb,
+    AnyElement, App, Bounds, Context, Element, ElementId, FocusHandle, GlobalElementId,
+    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, WeakEntity, Window, canvas, div,
+    point, prelude::*, px, rgb,
 };
-use std::{cell::Cell, collections::HashSet, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::Arc,
+};
 
 pub use node_graph_core as core;
 pub use node_graph_core::*;
@@ -13,6 +19,40 @@ pub use windows::*;
 
 /// The GPUI adapter and framework-free core now expose one event vocabulary.
 pub type EditorEvent<N = String, P = String, C = String> = core::GraphEvent<N, P, C>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortPresentation {
+    #[default]
+    DefaultOverlay,
+    BodyAnchors,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderGeometry<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> {
+    port_offsets: HashMap<P, (N, core::Point)>,
+}
+
+impl<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> Default for RenderGeometry<N, P> {
+    fn default() -> Self {
+        Self {
+            port_offsets: HashMap::new(),
+        }
+    }
+}
+
+impl<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> RenderGeometry<N, P> {
+    pub fn port_offset(&self, id: &P) -> Option<(&N, core::Point)> {
+        self.port_offsets
+            .get(id)
+            .map(|(node, offset)| (node, *offset))
+    }
+
+    pub fn ports(&self) -> impl Iterator<Item = (&P, &N, core::Point)> {
+        self.port_offsets
+            .iter()
+            .map(|(id, (node, offset))| (id, node, *offset))
+    }
+}
 
 pub struct NodeOverlay {
     /// Screen-pixel offset from the rendered node origin. Overlay content is not
@@ -33,6 +73,7 @@ impl NodeOverlay {
 pub struct NodeBody {
     pub element: AnyElement,
     pub overlays: Vec<NodeOverlay>,
+    pub ports: PortPresentation,
 }
 
 impl NodeBody {
@@ -40,11 +81,17 @@ impl NodeBody {
         Self {
             element: element.into_any_element(),
             overlays: Vec::new(),
+            ports: PortPresentation::DefaultOverlay,
         }
     }
 
     pub fn with_overlay(mut self, overlay: NodeOverlay) -> Self {
         self.overlays.push(overlay);
+        self
+    }
+
+    pub fn with_ports(mut self, ports: PortPresentation) -> Self {
+        self.ports = ports;
         self
     }
 }
@@ -64,6 +111,8 @@ pub struct NodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId, C: cor
     pub state: NodeVisualState,
     pub theme: Theme,
     graph: WeakEntity<NodeGraph<T, N, P, C>>,
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
+    viewport: Viewport,
 }
 
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
@@ -71,6 +120,90 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
 {
     pub fn graph(&self) -> WeakEntity<NodeGraph<T, N, P, C>> {
         self.graph.clone()
+    }
+
+    pub fn port_anchor(&self, id: P, child: impl IntoElement) -> AnyElement {
+        let graph_down = self.graph.clone();
+        let graph_up = self.graph.clone();
+        let down_id = id.clone();
+        let up_id = id.clone();
+        let interactive = div()
+            .child(child)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                window.prevent_default();
+                let _ = graph_down.update(cx, |editor, cx| editor.start_draft(&down_id, cx));
+            })
+            .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                let _ = graph_up.update(cx, |editor, cx| {
+                    if editor
+                        .draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.origin != up_id)
+                    {
+                        editor.finish_draft(&up_id, cx);
+                    }
+                    editor.finish_left_gesture(cx);
+                });
+            });
+        let graph = self.graph.clone();
+        let canvas_bounds = self.canvas_bounds.clone();
+        let viewport = self.viewport;
+        let node_id = self.node.id.clone();
+        let node_position = self.node.position;
+        MeasuredElement::new(interactive, move |bounds, cx| {
+            let canvas = canvas_bounds.get();
+            let center = core::Point::new(
+                f32::from(bounds.origin.x - canvas.origin.x + bounds.size.width * 0.5),
+                f32::from(bounds.origin.y - canvas.origin.y + bounds.size.height * 0.5),
+            );
+            let world = viewport.screen_to_world(center);
+            let offset = world - node_position;
+            let port_id = id.clone();
+            let owner = node_id.clone();
+            let graph = graph.clone();
+            cx.defer(move |cx| {
+                let _ = graph.update(cx, |editor, cx| {
+                    let changed = editor
+                        .render_geometry
+                        .port_offsets
+                        .get(&port_id)
+                        .is_none_or(|(current_owner, current)| {
+                            current_owner != &owner || current.distance(offset) > 0.01
+                        });
+                    if changed {
+                        editor
+                            .render_geometry
+                            .port_offsets
+                            .insert(port_id, (owner, offset));
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .into_any_element()
+    }
+
+    pub fn default_port_anchor(&self, id: P) -> AnyElement {
+        let port = self.ports.iter().find(|port| port.id == id);
+        let color = port.map_or(self.theme.port_connected, |port| {
+            if port.direction == PortDirection::Input {
+                self.theme.port_input
+            } else {
+                self.theme.port_output
+            }
+        });
+        self.port_anchor(
+            id,
+            div()
+                .w(px(14.0))
+                .h(px(14.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(self.theme.text))
+                .bg(rgb(color)),
+        )
     }
 }
 
@@ -254,6 +387,84 @@ struct BoxSelection<N, C> {
     baseline_nodes: HashSet<N>,
     baseline_connections: HashSet<C>,
 }
+type BoundsCallback = Box<dyn FnMut(Bounds<Pixels>, &mut App)>;
+
+struct MeasuredElement {
+    child: Option<AnyElement>,
+    on_bounds: BoundsCallback,
+}
+
+impl MeasuredElement {
+    fn new(
+        child: impl IntoElement,
+        on_bounds: impl FnMut(Bounds<Pixels>, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            child: Some(child.into_any_element()),
+            on_bounds: Box::new(on_bounds),
+        }
+    }
+}
+
+impl Element for MeasuredElement {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut child = self.child.take().expect("measured element laid out once");
+        let layout_id = child.request_layout(window, cx);
+        (layout_id, child)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        child.prepaint(window, cx);
+        (self.on_bounds)(bounds, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        child.paint(window, cx);
+    }
+}
+
+impl IntoElement for MeasuredElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 impl<N, C> BoxSelection<N, C> {
     fn rect(&self) -> core::Rect {
         let x = self.start.x.min(self.current.x);
@@ -287,6 +498,7 @@ pub struct NodeGraph<
     catalog_menu: Option<CatalogMenu<P>>,
     node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
     groups: Vec<GraphGroup<N>>,
+    render_geometry: RenderGeometry<N, P>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -328,6 +540,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             catalog_menu: None,
             node_body_renderer: None,
             groups: Vec::new(),
+            render_geometry: RenderGeometry::default(),
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -382,6 +595,24 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     pub fn groups(&self) -> &[GraphGroup<N>] {
         &self.groups
+    }
+
+    pub fn render_geometry(&self) -> &RenderGeometry<N, P> {
+        &self.render_geometry
+    }
+
+    pub fn resolved_port_position(&self, id: &P) -> Option<core::Point> {
+        if let Some((owner, offset)) = self.render_geometry.port_offsets.get(id)
+            && let Some(node) = self.graph.nodes.get(owner)
+        {
+            return Some(node.position + *offset);
+        }
+        self.graph.ports.get(id).map(|port| port.position)
+    }
+
+    pub fn invalidate_render_geometry(&mut self, cx: &mut Context<Self>) {
+        self.render_geometry = RenderGeometry::default();
+        cx.notify();
     }
 
     pub fn upsert_group(&mut self, group: GraphGroup<N>, cx: &mut Context<Self>) {
@@ -485,6 +716,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         graph.canonicalize_ids();
         graph.validate()?;
         self.graph = graph;
+        self.render_geometry.port_offsets.retain(|port, (node, _)| {
+            self.graph.ports.contains_key(port) && self.graph.nodes.contains_key(node)
+        });
         self.cancel_gestures();
         cx.emit(core::GraphEvent::GraphReconciled);
         self.emit_selection(cx);
@@ -511,6 +745,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
         self.drag = None;
         self.box_selection = None;
+        self.render_geometry.port_offsets.retain(|port, (node, _)| {
+            self.graph.ports.contains_key(port) && self.graph.nodes.contains_key(node)
+        });
         for event in events {
             cx.emit(event);
         }
@@ -621,7 +858,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             let screen = self
                 .graph
                 .viewport
-                .world_to_screen(self.graph.ports[id].position);
+                .world_to_screen(self.resolved_port_position(id)?);
             let distance = screen.distance(cursor);
             if distance <= self.config.snap_distance
                 && nearest.as_ref().is_none_or(|(_, best)| distance < *best)
@@ -654,10 +891,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             replaced_connection = Some(connection_id);
             origin = source;
         }
-        let current_screen = self
-            .graph
-            .viewport
-            .world_to_screen(self.graph.ports[&origin].position);
+        let current_screen = self.graph.viewport.world_to_screen(
+            self.resolved_port_position(&origin)
+                .unwrap_or(self.graph.ports[&origin].position),
+        );
         self.draft = Some(DraftConnection {
             origin,
             start_screen: current_screen,
@@ -708,13 +945,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     fn connection_route(&self, connection: &Connection<P, C>) -> Option<Vec<core::Point>> {
         let source = self.graph.ports.get(&connection.source)?;
         let target = self.graph.ports.get(&connection.target)?;
+        let start = self.resolved_port_position(&connection.source)?;
+        let end = self.resolved_port_position(&connection.target)?;
         match self.config.routing {
-            RoutingMode::SimpleOrthogonal => {
-                Some(core::orthogonal_route(source.position, target.position))
-            }
+            RoutingMode::SimpleOrthogonal => Some(core::orthogonal_route(start, end)),
             RoutingMode::Bezier => {
-                let start = source.position;
-                let end = target.position;
                 let control_distance = ((end.x - start.x).abs() * 0.5).max(40.0);
                 let control_a = core::Point::new(start.x + control_distance, start.y);
                 let control_b = core::Point::new(end.x - control_distance, end.y);
@@ -753,8 +988,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                     core::subway::compute_subway_route(
                         &obstacles,
                         core::subway::SubwayConnection {
-                            start: source.position,
-                            end: target.position,
+                            start,
+                            end,
                             start_obstacle,
                             end_obstacle,
                         },
@@ -1055,7 +1290,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             })
             .collect();
         let draft = self.draft.as_ref().and_then(|draft| {
-            let source = self.graph.ports.get(&draft.origin)?.position;
+            let source = self.resolved_port_position(&draft.origin)?;
             let end = draft
                 .snap_target
                 .as_ref()
@@ -1147,6 +1382,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         root = root.child(wire_layer);
 
         let mut node_overlays = Vec::new();
+        let mut body_anchored_nodes = HashSet::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
         for node in nodes {
@@ -1175,6 +1411,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         },
                         theme: self.theme.clone(),
                         graph: cx.weak_entity(),
+                        canvas_bounds: self.canvas_bounds.clone(),
+                        viewport,
                     },
                     window,
                     cx,
@@ -1182,6 +1420,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             } else {
                 NodeBody::new(div().child(node.title.clone()))
             };
+            if body.ports == PortPresentation::BodyAnchors {
+                body_anchored_nodes.insert(id.clone());
+            }
             node_overlays.extend(body.overlays.drain(..).map(|overlay| {
                 (
                     core::Point::new(position.x + overlay.offset.x, position.y + overlay.offset.y),
@@ -1326,8 +1567,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
 
         for port in self.graph.ports.values() {
+            if body_anchored_nodes.contains(&port.node) {
+                continue;
+            }
             let id = port.id.clone();
-            let position = viewport.world_to_screen(port.position);
+            let position = viewport.world_to_screen(
+                self.resolved_port_position(&port.id)
+                    .unwrap_or(port.position),
+            );
             let connected = self
                 .graph
                 .connections
@@ -1992,6 +2239,26 @@ mod tests {
         assert_eq!(
             editor.connection_at(core::Point::new(125.0, -16.0), 4.0),
             Some("wire".into())
+        );
+    }
+
+    #[test]
+    fn measured_port_offsets_follow_node_movement() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        editor
+            .render_geometry
+            .port_offsets
+            .insert("out".into(), ("a".into(), core::Point::new(45.0, 18.0)));
+        assert_eq!(
+            editor.resolved_port_position(&"out".into()),
+            Some(core::Point::new(45.0, 18.0))
+        );
+        editor
+            .graph
+            .move_node(&"a".into(), core::Point::new(20.0, 10.0));
+        assert_eq!(
+            editor.resolved_port_position(&"out".into()),
+            Some(core::Point::new(65.0, 28.0))
         );
     }
 
