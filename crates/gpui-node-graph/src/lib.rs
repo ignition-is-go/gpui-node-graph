@@ -14,6 +14,18 @@ pub use windows::*;
 /// The GPUI adapter and framework-free core now expose one event vocabulary.
 pub type EditorEvent<N = String, P = String, C = String> = core::GraphEvent<N, P, C>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RoutingMode {
+    SimpleOrthogonal,
+    Subway(core::subway::SubwayOptions),
+}
+
+impl Default for RoutingMode {
+    fn default() -> Self {
+        Self::Subway(core::subway::SubwayOptions::default())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EditorConfig {
     pub min_zoom: f32,
@@ -24,6 +36,7 @@ pub struct EditorConfig {
     pub snap_distance: f32,
     pub fit_padding: f32,
     pub fit_max_zoom: f32,
+    pub routing: RoutingMode,
 }
 impl Default for EditorConfig {
     fn default() -> Self {
@@ -35,6 +48,7 @@ impl Default for EditorConfig {
             snap_distance: 22.0,
             fit_padding: 48.0,
             fit_max_zoom: 1.0,
+            routing: RoutingMode::default(),
         }
     }
 }
@@ -455,25 +469,61 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
+    fn connection_route(&self, connection: &Connection<P, C>) -> Option<Vec<core::Point>> {
+        let source = self.graph.ports.get(&connection.source)?;
+        let target = self.graph.ports.get(&connection.target)?;
+        match self.config.routing {
+            RoutingMode::SimpleOrthogonal => {
+                Some(core::orthogonal_route(source.position, target.position))
+            }
+            RoutingMode::Subway(options) => {
+                let mut nodes: Vec<_> = self.graph.nodes.values().collect();
+                nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
+                let obstacles: Vec<_> = nodes
+                    .iter()
+                    .map(|node| core::Rect {
+                        origin: node.position,
+                        size: node.size,
+                    })
+                    .collect();
+                let start_obstacle = nodes.iter().position(|node| node.id == source.node);
+                let end_obstacle = nodes.iter().position(|node| node.id == target.node);
+                Some(
+                    core::subway::compute_subway_route(
+                        &obstacles,
+                        core::subway::SubwayConnection {
+                            start: source.position,
+                            end: target.position,
+                            start_obstacle,
+                            end_obstacle,
+                        },
+                        options,
+                    )
+                    .points,
+                )
+            }
+        }
+    }
+
     fn connection_at(&self, cursor: core::Point, radius: f32) -> Option<C> {
         let viewport = self.graph.viewport.sanitized();
         let mut connections: Vec<_> = self.graph.connections.iter().collect();
         connections.sort_by_cached_key(|(id, _)| format!("{id:?}"));
         let mut nearest: Option<(C, f32)> = None;
         for (id, connection) in connections {
-            let (Some(source), Some(target)) = (
-                self.graph.ports.get(&connection.source),
-                self.graph.ports.get(&connection.target),
-            ) else {
+            let Some(route) = self.connection_route(connection) else {
                 continue;
             };
-            let a = viewport.world_to_screen(source.position);
-            let b = viewport.world_to_screen(target.position);
-            let mid = core::Point::new(a.x * 0.5 + b.x * 0.5, a.y);
-            let mid2 = core::Point::new(mid.x, b.y);
-            let distance = distance_to_segment(cursor, a, mid)
-                .min(distance_to_segment(cursor, mid, mid2))
-                .min(distance_to_segment(cursor, mid2, b));
+            let distance = route
+                .windows(2)
+                .map(|segment| {
+                    distance_to_segment(
+                        cursor,
+                        viewport.world_to_screen(segment[0]),
+                        viewport.world_to_screen(segment[1]),
+                    )
+                })
+                .fold(f32::INFINITY, f32::min);
             if distance <= radius && nearest.as_ref().is_none_or(|(_, best)| distance < *best) {
                 nearest = Some((id.clone(), distance));
             }
@@ -718,8 +768,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .values()
             .filter_map(|connection| {
                 Some((
-                    self.graph.ports.get(&connection.source)?.position,
-                    self.graph.ports.get(&connection.target)?.position,
+                    self.connection_route(connection)?,
                     self.graph.selected_connections.contains(&connection.id),
                 ))
             })
@@ -743,14 +792,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 canvas_bounds.set(bounds);
             },
             move |bounds, _, window, _| {
-                for (source, target, selected) in &wires {
-                    let a = viewport.world_to_screen(*source);
-                    let b = viewport.world_to_screen(*target);
-                    paint_elbow(
+                for (route, selected) in &wires {
+                    paint_route(
                         window,
                         bounds,
-                        a,
-                        b,
+                        route.iter().map(|point| viewport.world_to_screen(*point)),
                         if *selected {
                             selected_wire_color
                         } else {
@@ -1244,6 +1290,33 @@ fn distance_to_segment(point: core::Point, start: core::Point, end: core::Point)
     ))
 }
 
+fn paint_route(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    points: impl IntoIterator<Item = core::Point>,
+    color: gpui::Hsla,
+    width: f32,
+) {
+    let mut points = points.into_iter();
+    let Some(first) = points.next() else {
+        return;
+    };
+    let mut path = PathBuilder::stroke(px(width));
+    path.move_to(point(
+        bounds.origin.x + px(first.x),
+        bounds.origin.y + px(first.y),
+    ));
+    for point_value in points {
+        path.line_to(point(
+            bounds.origin.x + px(point_value.x),
+            bounds.origin.y + px(point_value.y),
+        ));
+    }
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
 fn paint_elbow(
     window: &mut Window,
     bounds: Bounds<Pixels>,
@@ -1421,6 +1494,39 @@ mod tests {
         assert_eq!(editor.filtered_catalog_indices(), vec![0]);
         editor.catalog_menu.as_mut().unwrap().query = "source".into();
         assert!(editor.filtered_catalog_indices().is_empty());
+    }
+
+    #[test]
+    fn subway_connection_route_avoids_node_obstacles() {
+        let mut graph = interactive_graph();
+        graph.nodes.get_mut("b").unwrap().position = core::Point::new(300.0, 0.0);
+        graph.ports.get_mut("in").unwrap().position = core::Point::new(300.0, 25.0);
+        graph.nodes.insert(
+            "blocker".into(),
+            Node {
+                id: "blocker".into(),
+                title: "blocker".into(),
+                position: core::Point::new(150.0, 0.0),
+                size: core::Size {
+                    width: 50.0,
+                    height: 50.0,
+                },
+            },
+        );
+        let editor = NodeGraph::new(graph);
+        let route = editor
+            .connection_route(&editor.graph.connections["wire"])
+            .unwrap();
+        assert!(
+            route
+                .iter()
+                .any(|point| point.y <= -16.0 || point.y >= 66.0),
+            "{route:?}"
+        );
+        assert_eq!(
+            editor.connection_at(core::Point::new(125.0, -16.0), 4.0),
+            Some("wire".into())
+        );
     }
 
     #[test]

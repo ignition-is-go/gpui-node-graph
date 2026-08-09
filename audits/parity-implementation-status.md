@@ -46,6 +46,7 @@ least three seconds, preventing both lifecycle and false-mount positives.
   keyboard/wheel isolation, node resizing, and overlay/popover support;
 - groups and membership gestures;
 - dangling dynamic-port presentation without weakening strict persisted validation;
-- Bezier mode and obstacle-aware/cached subway routing;
+- Bezier mode plus batching, lane separation, rounded corners and caching for the
+  now-integrated deterministic obstacle-aware subway router;
 - visibility/culling hooks, captured dragging outside embedded bounds, and broader
   scripted native/browser interaction and visual tests.
