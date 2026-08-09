@@ -2130,7 +2130,9 @@ dependencies = [
  "gpui",
  "gpui-node-graph",
  "gpui_platform",
+ "js-sys",
  "node-graph-core",
+ "wasm-bindgen",
 ]
 
 [[package]]

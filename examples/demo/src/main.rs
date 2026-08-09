@@ -607,6 +607,8 @@ fn launch(cx: &mut App) {
                 })
                 .detach();
             });
+            #[cfg(target_family = "wasm")]
+            TEST_GRAPH.with(|slot| *slot.borrow_mut() = Some(graph.clone()));
             graph
         },
     )
@@ -625,6 +627,46 @@ thread_local! {
     static APPLICATION: std::cell::RefCell<Option<gpui::ApplicationHandle>> = const {
         std::cell::RefCell::new(None)
     };
+    static TEST_GRAPH: std::cell::RefCell<Option<gpui::Entity<NodeGraph<Kind>>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(target_family = "wasm")]
+fn browser_test_state() -> String {
+    APPLICATION.with(|application| {
+        let application = application.borrow();
+        let application = application
+            .as_ref()
+            .expect("embedded application is retained");
+        TEST_GRAPH.with(|graph| {
+            let graph = graph.borrow();
+            let graph = graph.as_ref().expect("node graph entity is retained");
+            application.update(|cx| {
+                let graph = graph.read(cx);
+                format!(
+                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{}}}"#,
+                    graph.graph.nodes.len(),
+                    graph.catalog_is_open(),
+                    graph.is_overlay_dismissed("blend-controls"),
+                    graph.graph.viewport.zoom,
+                )
+            })
+        })
+    })
+}
+
+#[cfg(target_family = "wasm")]
+fn install_browser_test_bridge() {
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+    let snapshot = Closure::<dyn Fn() -> String>::new(browser_test_state);
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &JsValue::from_str("__nodeGraphTestState"),
+        snapshot.as_ref().unchecked_ref(),
+    )
+    .expect("globalThis accepts the browser test bridge");
+    snapshot.forget();
 }
 
 #[cfg(target_family = "wasm")]
@@ -632,4 +674,5 @@ fn main() {
     gpui_platform::web_init();
     let application = gpui_platform::application().run_embedded(launch);
     APPLICATION.with(|slot| *slot.borrow_mut() = Some(application));
+    install_browser_test_bridge();
 }

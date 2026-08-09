@@ -861,6 +861,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    pub fn is_overlay_dismissed(&self, id: &str) -> bool {
+        self.dismissed_overlays.contains(id)
+    }
+
+    pub fn catalog_is_open(&self) -> bool {
+        self.catalog_menu.is_some()
+    }
+
     pub fn reopen_overlay(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.dismissed_overlays.remove(id) {
             cx.notify();

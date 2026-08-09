@@ -9,3 +9,7 @@ gpui-node-graph.workspace=true
 node-graph-core.workspace=true
 
 gpui_platform.workspace=true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"

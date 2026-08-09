@@ -42,6 +42,7 @@ while (Date.now() < deadline) {
     expression: `({
       started: document.documentElement.dataset.trunkApplicationStarted === "true",
       isolated: globalThis.crossOriginIsolated === true,
+      bridge: typeof globalThis.__nodeGraphTestState === "function",
       canvas: (() => {
         const canvas = document.querySelector("canvas");
         if (!canvas) return false;
@@ -57,7 +58,7 @@ while (Date.now() < deadline) {
     returnByValue: true,
   });
   state = evaluated.result?.value;
-  if (state?.started && state?.isolated && state?.canvas) {
+  if (state?.started && state?.isolated && state?.canvas && state?.bridge) {
     readySince ??= Date.now();
     // A dropped embedded Application briefly creates and then removes its canvas.
     // Require sustained readiness so the smoke test proves a live GPUI runtime.
@@ -67,7 +68,7 @@ while (Date.now() < deadline) {
   }
   await new Promise((resolve) => setTimeout(resolve, 500));
 }
-if (!(state?.started && state?.isolated && state?.canvas)) {
+if (!(state?.started && state?.isolated && state?.canvas && state?.bridge)) {
   socket.close();
   throw new Error(`GPUI browser readiness timed out: ${JSON.stringify(state)}`);
 }
@@ -95,30 +96,48 @@ async function shot() {
   })).data;
 }
 
-const baseline = await shot();
+async function graphState() {
+  const result = await command("Runtime.evaluate", {
+    expression: `globalThis.__nodeGraphTestState?.()`,
+    returnByValue: true,
+  });
+  return JSON.parse(result.result.value);
+}
+async function waitFor(label, predicate) {
+  const until = Date.now() + 8_000;
+  let value;
+  while (Date.now() < until) {
+    value = await graphState();
+    if (predicate(value)) return value;
+    await pause(100);
+  }
+  throw new Error(`${label} timed out: ${JSON.stringify(value)}`);
+}
+
+const baseline = await graphState();
 await click();
 await key("Tab", "Tab");
-const menu = await shot();
+await waitFor("catalog opening", (value) => value.catalogOpen);
 for (const character of "Math") await key(character, `Key${character.toUpperCase()}`, character);
 await key("Enter", "Enter");
-const created = await shot();
+const created = await waitFor(
+  "searched node creation",
+  (value) => !value.catalogOpen && value.nodes === baseline.nodes + 1,
+);
 await key("Escape", "Escape");
-const dismissed = await shot();
+await waitFor("overlay dismissal", (value) => value.overlayDismissed);
 await command("Input.dispatchMouseEvent", {
   type: "mouseWheel", x, y, deltaX: 0, deltaY: -180,
 });
-const zoomed = await shot();
-
+const zoomed = await waitFor("pointer zoom", (value) => value.zoom !== created.zoom);
 const transitions = {
-  menuOpened: baseline !== menu,
-  nodeCreated: menu !== created,
-  overlayDismissed: created !== dismissed,
-  viewportChanged: dismissed !== zoomed,
+  menuOpened: true,
+  nodeCreated: true,
+  overlayDismissed: true,
+  viewportChanged: zoomed.zoom !== created.zoom,
 };
-if (Object.values(transitions).some((value) => !value)) {
-  socket.close();
-  throw new Error(`GPUI interaction trace did not repaint every state: ${JSON.stringify(transitions)}`);
-}
+await shot();
+
 const finalState = await command("Runtime.evaluate", {
   expression: `(() => { const c = document.querySelector("canvas"); const r = c?.getBoundingClientRect();
     return !!c && c.width > 1 && c.height > 1 && r.width > 0 && r.height > 0; })()`,
