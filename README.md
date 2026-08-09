@@ -8,6 +8,8 @@ The production foundation includes a serde-compatible framework-free domain snap
 
 ```sh
 cargo run -p gpui-node-graph-demo
+# Force Wayland when both Wayland and X11 session variables are present
+# env -u DISPLAY cargo run -p gpui-node-graph-demo
 cargo test --workspace
 # Browser host (requires Trunk)
 cd examples/demo && trunk serve
