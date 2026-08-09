@@ -57,10 +57,12 @@ jobs:
           "${{ steps.setup-chrome.outputs.chrome-path }}" \
             --headless=new --no-sandbox --disable-gpu \
             --enable-unsafe-swiftshader --disable-dev-shm-usage \
-            --virtual-time-budget=15000 --dump-dom \
-            http://127.0.0.1:8181/ > /tmp/dom.html
-          cat /tmp/dom.html
-          grep -q 'data-trunk-application-started="true"' /tmp/dom.html
-          grep -q 'data-cross-origin-isolated="true"' /tmp/dom.html
-          grep -q 'data-gpui-canvas="true"' /tmp/dom.html
-          grep -q '<canvas' /tmp/dom.html
+            --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+            --user-data-dir=/tmp/node-graph-chrome http://127.0.0.1:8181/ \
+            > /tmp/node-graph-chrome.log 2>&1 &
+          chrome=$!
+          trap 'kill "$chrome" "$server" 2>/dev/null || true' EXIT
+          if ! node .github/scripts/check_browser.mjs http://127.0.0.1:8181/; then
+            cat /tmp/node-graph-chrome.log
+            exit 1
+          fi

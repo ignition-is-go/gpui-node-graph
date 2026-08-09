@@ -2,10 +2,5 @@
 window.addEventListener("TrunkApplicationStarted", () => {
   document.documentElement.dataset.trunkApplicationStarted = "true";
   document.documentElement.dataset.crossOriginIsolated = String(crossOriginIsolated);
-  const recordCanvas = () => {
-    document.documentElement.dataset.gpuiCanvas = String(Boolean(document.querySelector("canvas")));
-  };
-  recordCanvas();
-  new MutationObserver(recordCanvas).observe(document.body, {childList: true, subtree: true});
 });
 </script></head><body></body></html>
