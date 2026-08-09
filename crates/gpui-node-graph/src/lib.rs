@@ -103,6 +103,7 @@ where
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RoutingMode {
     SimpleOrthogonal,
+    Bezier,
     Subway(core::subway::SubwayOptions),
 }
 
@@ -687,6 +688,31 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             RoutingMode::SimpleOrthogonal => {
                 Some(core::orthogonal_route(source.position, target.position))
             }
+            RoutingMode::Bezier => {
+                let start = source.position;
+                let end = target.position;
+                let control_distance = ((end.x - start.x).abs() * 0.5).max(40.0);
+                let control_a = core::Point::new(start.x + control_distance, start.y);
+                let control_b = core::Point::new(end.x - control_distance, end.y);
+                Some(
+                    (0..=24)
+                        .map(|step| {
+                            let t = step as f32 / 24.0;
+                            let inverse = 1.0 - t;
+                            core::Point::new(
+                                inverse.powi(3) * start.x
+                                    + 3.0 * inverse.powi(2) * t * control_a.x
+                                    + 3.0 * inverse * t.powi(2) * control_b.x
+                                    + t.powi(3) * end.x,
+                                inverse.powi(3) * start.y
+                                    + 3.0 * inverse.powi(2) * t * control_a.y
+                                    + 3.0 * inverse * t.powi(2) * control_b.y
+                                    + t.powi(3) * end.y,
+                            )
+                        })
+                        .collect(),
+                )
+            }
             RoutingMode::Subway(options) => {
                 let mut nodes: Vec<_> = self.graph.nodes.values().collect();
                 nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
@@ -913,6 +939,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 self.graph.selected_nodes = self.graph.nodes.keys().cloned().collect();
                 self.graph.selected_connections.clear();
                 self.emit_selection(cx);
+                cx.notify();
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+            "r" if !command => {
+                self.config.routing = match self.config.routing {
+                    RoutingMode::Subway(_) => RoutingMode::Bezier,
+                    RoutingMode::Bezier => RoutingMode::SimpleOrthogonal,
+                    RoutingMode::SimpleOrthogonal => {
+                        RoutingMode::Subway(core::subway::SubwayOptions::default())
+                    }
+                };
                 cx.notify();
                 cx.stop_propagation();
                 window.prevent_default();
@@ -1878,6 +1916,24 @@ mod tests {
         assert_eq!(editor.filtered_catalog_indices(), vec![0]);
         editor.catalog_menu.as_mut().unwrap().query = "source".into();
         assert!(editor.filtered_catalog_indices().is_empty());
+    }
+
+    #[test]
+    fn bezier_route_is_stable_and_keeps_endpoints() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        editor.config.routing = RoutingMode::Bezier;
+        let route = editor
+            .connection_route(&editor.graph.connections["wire"])
+            .unwrap();
+        assert_eq!(route.len(), 25);
+        assert_eq!(route.first(), Some(&core::Point::new(50.0, 25.0)));
+        assert_eq!(route.last(), Some(&core::Point::new(100.0, 25.0)));
+        assert_eq!(
+            route,
+            editor
+                .connection_route(&editor.graph.connections["wire"])
+                .unwrap()
+        );
     }
 
     #[test]

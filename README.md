@@ -17,7 +17,7 @@ cargo test --workspace
 # double-click blank space or press Tab to search/create; click wires and press Delete;
 # drag a node's right edge to resize (double-click resets); wheel zoom;
 # middle-drag or Ctrl-drag to pan; Ctrl/Cmd+G groups a multi-selection;
-# F fits; Escape rolls back/cancels/clears.
+# R cycles subway/Bezier/simple routing; F fits; Escape rolls back/cancels/clears.
 
 # Browser host (requires Trunk)
 cd examples/demo && trunk serve
