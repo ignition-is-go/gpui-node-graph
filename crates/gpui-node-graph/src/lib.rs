@@ -100,6 +100,9 @@ pub struct EditorConfig {
     pub fit_padding: f32,
     pub fit_max_zoom: f32,
     pub routing: RoutingMode,
+    pub min_node_width: f32,
+    pub max_node_width: f32,
+    pub default_node_width: f32,
 }
 impl Default for EditorConfig {
     fn default() -> Self {
@@ -112,6 +115,9 @@ impl Default for EditorConfig {
             fit_padding: 48.0,
             fit_max_zoom: 1.0,
             routing: RoutingMode::default(),
+            min_node_width: 96.0,
+            max_node_width: 800.0,
+            default_node_width: 180.0,
         }
     }
 }
@@ -186,6 +192,15 @@ struct NodeDrag<N> {
     moved: bool,
 }
 #[derive(Clone)]
+struct ResizeDrag<N, P> {
+    id: N,
+    start_screen_x: f32,
+    start_size: core::Size,
+    start_ports: Vec<(P, core::Point)>,
+    moved: bool,
+}
+
+#[derive(Clone)]
 struct DraftConnection<P, C> {
     origin: P,
     start_screen: core::Point,
@@ -227,6 +242,7 @@ pub struct NodeGraph<
     pub theme: Theme,
     pub config: EditorConfig,
     drag: Option<NodeDrag<N>>,
+    resize: Option<ResizeDrag<N, P>>,
     panning: Option<core::Point>,
     draft: Option<DraftConnection<P, C>>,
     catalog: Vec<NodeCatalogItem<T>>,
@@ -266,6 +282,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             theme: Theme::default(),
             config: EditorConfig::default(),
             drag: None,
+            resize: None,
             panning: None,
             draft: None,
             catalog: Vec::new(),
@@ -434,9 +451,57 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         Ok(())
     }
 
+    fn resize_node_width(&mut self, id: &N, width: f32) -> bool {
+        if !width.is_finite() || width <= 0.0 {
+            return false;
+        }
+        let Some(node) = self.graph.nodes.get(id) else {
+            return false;
+        };
+        let delta = width as f64 - node.size.width as f64;
+        let translated: Option<Vec<_>> = self
+            .graph
+            .ports
+            .iter()
+            .filter(|(_, port)| port.node == *id && port.direction == PortDirection::Output)
+            .map(|(port_id, port)| {
+                let x = port.position.x as f64 + delta;
+                (port.position.x.is_finite() && x.abs() <= f32::MAX as f64)
+                    .then(|| (port_id.clone(), core::Point::new(x as f32, port.position.y)))
+            })
+            .collect();
+        let Some(translated) = translated else {
+            return false;
+        };
+        self.graph
+            .nodes
+            .get_mut(id)
+            .expect("node remained present during resize")
+            .size
+            .width = width;
+        for (port_id, position) in translated {
+            self.graph
+                .ports
+                .get_mut(&port_id)
+                .expect("port remained present during resize")
+                .position = position;
+        }
+        true
+    }
+
     fn cancel_gestures(&mut self) {
         if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
             let _ = self.graph.move_nodes(&drag.starts);
+        }
+        if let Some(resize) = self.resize.take().filter(|resize| resize.moved) {
+            if let Some(node) = self.graph.nodes.get_mut(&resize.id) {
+                node.size = resize.start_size;
+            }
+            for (id, position) in resize.start_ports {
+                if let Some(port) = self.graph.ports.get_mut(&id) {
+                    port.position = position;
+                }
+            }
         }
         self.panning = None;
         self.draft = None;
@@ -673,6 +738,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn finish_left_gesture(&mut self, cx: &mut Context<Self>) {
         self.panning = None;
+        if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
+            && let Some(node) = self.graph.nodes.get(&resize.id)
+        {
+            cx.emit(core::GraphEvent::NodeResized {
+                id: resize.id,
+                size: node.size,
+            });
+        }
         if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
             let nodes = drag
                 .offsets
@@ -922,6 +995,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let id = node.id.clone();
             let position = viewport.world_to_screen(node.position);
             let selected = self.graph.selected_nodes.contains(&id);
+            let resize_id = id.clone();
             let body = if let Some(renderer) = self.node_body_renderer.as_mut() {
                 let mut ports: Vec<_> = self
                     .graph
@@ -1028,6 +1102,58 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 });
                             }
                             cx.notify();
+                        }),
+                    ),
+            );
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(position.x + viewport.scale_length(node.size.width) - 4.0))
+                    .top(px(position.y))
+                    .w(px(8.0))
+                    .h(px(viewport.scale_length(node.size.height)))
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            this.focus(window, cx);
+                            if event.click_count >= 2 {
+                                let width = this
+                                    .config
+                                    .default_node_width
+                                    .clamp(this.config.min_node_width, this.config.max_node_width);
+                                if this.resize_node_width(&resize_id, width)
+                                    && let Some(node) = this.graph.nodes.get(&resize_id)
+                                {
+                                    cx.emit(core::GraphEvent::NodeResized {
+                                        id: resize_id.clone(),
+                                        size: node.size,
+                                    });
+                                    cx.notify();
+                                }
+                                return;
+                            }
+                            let Some(node) = this.graph.nodes.get(&resize_id) else {
+                                return;
+                            };
+                            let start_size = node.size;
+                            let start_ports = this
+                                .graph
+                                .ports
+                                .iter()
+                                .filter(|(_, port)| port.node == resize_id)
+                                .map(|(id, port)| (id.clone(), port.position))
+                                .collect();
+                            this.drag = None;
+                            this.resize = Some(ResizeDrag {
+                                id: resize_id.clone(),
+                                start_screen_x: this.local_screen(event.position).x,
+                                start_size,
+                                start_ports,
+                                moved: false,
+                            });
                         }),
                     ),
             );
@@ -1299,6 +1425,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 }
             }
 
+            if let Some(resize) = this.resize.clone() {
+                let delta = (local.x - resize.start_screen_x) / this.graph.viewport.zoom;
+                let width = (resize.start_size.width + delta)
+                    .clamp(this.config.min_node_width, this.config.max_node_width);
+                if this.resize_node_width(&resize.id, width) {
+                    if let Some(active) = this.resize.as_mut() {
+                        active.moved |= (width - active.start_size.width).abs() > f32::EPSILON;
+                    }
+                    cx.notify();
+                }
+            }
+
             if let Some(drag) = this.drag.clone() {
                 let cursor = this.graph.viewport.screen_to_world(local);
                 let updates: Vec<_> = drag
@@ -1546,6 +1684,26 @@ mod tests {
             editor.nearest_compatible_port(&"out".into(), core::Point::new(200.0, 25.0)),
             None
         );
+    }
+
+    #[test]
+    fn node_width_resize_moves_output_ports_atomically() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        assert!(editor.resize_node_width(&"a".into(), 80.0));
+        assert_eq!(editor.graph.nodes["a"].size.width, 80.0);
+        assert_eq!(
+            editor.graph.ports["out"].position,
+            core::Point::new(80.0, 25.0)
+        );
+        assert_eq!(
+            editor.graph.ports["in"].position,
+            core::Point::new(100.0, 25.0)
+        );
+        let before_node = editor.graph.nodes["a"].clone();
+        let before_ports = editor.graph.ports.clone();
+        assert!(!editor.resize_node_width(&"a".into(), f32::INFINITY));
+        assert_eq!(editor.graph.nodes["a"], before_node);
+        assert_eq!(editor.graph.ports, before_ports);
     }
 
     #[test]
