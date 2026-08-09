@@ -43,15 +43,15 @@ least three seconds, preventing both lifecycle and false-mount positives.
 - explicit controlled/uncontrolled mutation transactions rather than the current
   reference-like hybrid ownership;
 - broader specialized widgets; `NodeBodyContext::isolated_control` now blocks graph
-  keyboard, wheel, and pointer gestures around retained body controls, and `NodeBodyRenderer` supports
-  shell-interactive measured anchors, transient node-relative geometry/tombstones, and
+  keyboard, wheel, and pointer gestures around retained body controls, and
+  `NodeBodyRenderer` supports shell-interactive measured anchors, transient node-relative geometry/tombstones, and
   unscaled overlays with adaptive flip/clamp/Escape-dismiss behavior; the demo proves an
   interactive panel, while right-edge resize,
   rollback and reset also work;
-- group inline editing plus Alt-drag membership gestures (consumer-supplied group
-  bounds/rendering and create-group handling are now present);
-- dangling dynamic-port presentation without weakening strict persisted validation (the demo
-  now adds/removes stable dynamic inputs, but refuses removal while referenced);
+- richer persistent ungroup/nested-group semantics; rendered groups now support inline
+  label editing and Alt-drag membership updates with explicit core events;
+- broader dynamic-port policy/UI polish; removal now atomically keeps the persisted graph
+  strict while rendering removed connections as transient red tombstones;
 - deeper large-graph routing performance/visual tuning; deterministic subway routes now
   batch into stable per-source lanes, cache by graph/geometry/config fingerprint, paint rounded
   orthogonal corners, and switch at runtime to Bezier/simple modes;
