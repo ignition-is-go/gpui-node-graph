@@ -271,6 +271,7 @@ fn launch(cx: &mut App) {
     )
     .unwrap();
     cx.activate(true);
+    cx.refresh_windows();
 }
 
 #[cfg(not(target_family = "wasm"))]

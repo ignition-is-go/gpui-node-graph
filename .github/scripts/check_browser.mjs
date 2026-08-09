@@ -44,7 +44,13 @@ while (Date.now() < deadline) {
       isolated: globalThis.crossOriginIsolated === true,
       canvas: (() => {
         const canvas = document.querySelector("canvas");
-        return Boolean(canvas && canvas.width > 0 && canvas.height > 0);
+        if (!canvas) return false;
+        const rect = canvas.getBoundingClientRect();
+        const expectedWidth = Math.floor(rect.width * devicePixelRatio);
+        const expectedHeight = Math.floor(rect.height * devicePixelRatio);
+        return rect.width > 0 && rect.height > 0
+          && canvas.width >= Math.max(2, expectedWidth * 0.9)
+          && canvas.height >= Math.max(2, expectedHeight * 0.9);
       })(),
       href: location.href
     })`,

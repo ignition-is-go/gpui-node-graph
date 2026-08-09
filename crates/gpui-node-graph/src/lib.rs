@@ -105,13 +105,16 @@ impl Default for Theme {
 #[derive(Clone)]
 struct NodeDrag<N> {
     offsets: Vec<(N, core::Point)>,
+    starts: Vec<(N, core::Point)>,
     moved: bool,
 }
 #[derive(Clone)]
-struct DraftConnection<P> {
+struct DraftConnection<P, C> {
     origin: P,
+    start_screen: core::Point,
     current_screen: core::Point,
     snap_target: Option<P>,
+    replaced_connection: Option<C>,
     moved: bool,
 }
 #[derive(Clone)]
@@ -148,7 +151,7 @@ pub struct NodeGraph<
     pub config: EditorConfig,
     drag: Option<NodeDrag<N>>,
     panning: Option<core::Point>,
-    draft: Option<DraftConnection<P>>,
+    draft: Option<DraftConnection<P, C>>,
     catalog: Vec<NodeCatalogItem<T>>,
     catalog_menu: Option<CatalogMenu<P>>,
     box_selection: Option<BoxSelection<N, C>>,
@@ -332,7 +335,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn cancel_gestures(&mut self) {
-        self.drag = None;
+        if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
+            let _ = self.graph.move_nodes(&drag.starts);
+        }
         self.panning = None;
         self.draft = None;
         self.box_selection = None;
@@ -400,8 +405,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             return;
         };
         let mut origin = id.clone();
-        // Dragging an occupied input reroutes its existing source, matching the
-        // reference editor's replace-input gesture.
+        let mut replaced_connection = None;
+        // Dragging an occupied input previews a reroute from its existing source.
+        // Defer removal until a compatible replacement is actually completed so
+        // Escape or a click-only draft leaves the original edge intact.
         if port.direction == PortDirection::Input
             && let Some((connection_id, source)) = self
                 .graph
@@ -412,9 +419,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                     (connection_id.clone(), connection.source.clone())
                 })
         {
-            self.graph.connections.remove(&connection_id);
-            self.graph.selected_connections.remove(&connection_id);
-            cx.emit(core::GraphEvent::ConnectionRemoved { id: connection_id });
+            replaced_connection = Some(connection_id);
             origin = source;
         }
         let current_screen = self
@@ -423,8 +428,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .world_to_screen(self.graph.ports[&origin].position);
         self.draft = Some(DraftConnection {
             origin,
+            start_screen: current_screen,
             current_screen,
             snap_target: None,
+            replaced_connection,
             moved: false,
         });
         cx.notify();
@@ -438,6 +445,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             self.draft = Some(draft);
             return false;
         };
+        if let Some(id) = draft.replaced_connection {
+            self.graph.connections.remove(&id);
+            self.graph.selected_connections.remove(&id);
+            cx.emit(core::GraphEvent::ConnectionRemoved { id });
+        }
         cx.emit(core::GraphEvent::ConnectionRequested { source, target });
         cx.notify();
         true
@@ -564,7 +576,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         let shift = event.keystroke.modifiers.shift;
         if self.catalog_menu.is_some() {
-            let before = self.filtered_catalog_indices();
+            let mut before = self.filtered_catalog_indices();
+            before.truncate(8);
             match key {
                 "escape" => self.catalog_menu = None,
                 "enter" => {
@@ -599,7 +612,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 }
                 _ => {}
             }
-            let result_len = self.filtered_catalog_indices().len();
+            let result_len = self.filtered_catalog_indices().len().min(8);
             if let Some(menu) = self.catalog_menu.as_mut() {
                 menu.selected = menu.selected.min(result_len.saturating_sub(1));
             }
@@ -829,17 +842,28 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 this.emit_selection(cx);
                             }
                             if this.graph.selected_nodes.contains(&id) {
-                                let offsets = this
+                                let selected: Vec<_> = this
                                     .graph
                                     .selected_nodes
                                     .iter()
                                     .filter_map(|selected_id| {
                                         let node = this.graph.nodes.get(selected_id)?;
-                                        Some((selected_id.clone(), cursor - node.position))
+                                        Some((
+                                            selected_id.clone(),
+                                            cursor - node.position,
+                                            node.position,
+                                        ))
                                     })
                                     .collect();
                                 this.drag = Some(NodeDrag {
-                                    offsets,
+                                    offsets: selected
+                                        .iter()
+                                        .map(|(id, offset, _)| (id.clone(), *offset))
+                                        .collect(),
+                                    starts: selected
+                                        .into_iter()
+                                        .map(|(id, _, position)| (id, position))
+                                        .collect(),
                                     moved: false,
                                 });
                             }
@@ -935,6 +959,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 if this.draft.as_ref().is_some_and(|draft| draft.origin != id) {
                                     this.finish_draft(&id, cx);
                                 }
+                                // The port stops bubbling, so it must also terminate any
+                                // node, box, pan, or draft gesture owned by the root.
+                                this.finish_left_gesture(cx);
                             }),
                         ),
                 );
@@ -1150,7 +1177,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             if let Some(origin) = this.draft.as_ref().map(|draft| draft.origin.clone()) {
                 let snap_target = this.nearest_compatible_port(&origin, local);
                 if let Some(draft) = this.draft.as_mut() {
-                    if draft.current_screen.distance(local) > 2.0 {
+                    if draft.start_screen.distance(local) > 2.0 {
                         draft.moved = true;
                     }
                     draft.current_screen = local;
@@ -1171,9 +1198,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             MouseButton::Middle,
             cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
         )
+        .on_mouse_up_out(
+            MouseButton::Middle,
+            cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
+        )
         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
             let delta = event.delta.pixel_delta(window.line_height());
-            let factor = if f32::from(delta.y) < 0.0 {
+            let delta_y = f32::from(delta.y);
+            if delta_y.abs() <= f32::EPSILON {
+                return;
+            }
+            let factor = if delta_y < 0.0 {
                 this.config.zoom_step.exp()
             } else {
                 (-this.config.zoom_step).exp()
@@ -1323,6 +1358,27 @@ mod tests {
         assert_eq!(
             editor.nearest_compatible_port(&"out".into(), core::Point::new(200.0, 25.0)),
             None
+        );
+    }
+
+    #[test]
+    fn cancelling_a_drag_restores_nodes_and_ports() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        let starts = vec![("a".to_string(), editor.graph.nodes["a"].position)];
+        editor
+            .graph
+            .move_nodes(&[("a".into(), core::Point::new(40.0, 20.0))])
+            .unwrap();
+        editor.drag = Some(NodeDrag {
+            offsets: Vec::new(),
+            starts,
+            moved: true,
+        });
+        editor.cancel_gestures();
+        assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
+        assert_eq!(
+            editor.graph.ports["out"].position,
+            core::Point::new(50.0, 25.0)
         );
     }
 

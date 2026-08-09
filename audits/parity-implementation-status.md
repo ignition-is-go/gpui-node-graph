@@ -33,8 +33,10 @@ Implemented:
 The browser demo now retains `ApplicationHandle` from `Application::run_embedded` on
 WASM. `Application::run` returned before the browser event loop and previously allowed
 the application and canvas to disappear immediately after graphics initialization.
-The CDP runtime check now requires a non-zero canvas to remain present for at least
-three seconds, preventing that transient false positive.
+The demo explicitly requests a post-launch window refresh so the asynchronous browser
+resize observer produces the first mounted frame. The CDP runtime check now requires a
+correctly sized (not the transient 1×1 backing store) canvas to remain present for at
+least three seconds, preventing both lifecycle and false-mount positives.
 
 ## Still required before full parity
 
