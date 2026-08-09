@@ -97,16 +97,25 @@ impl Default for Viewport {
     }
 }
 impl Viewport {
+    fn finite_f32(value: f64) -> f32 {
+        value.clamp(-(f32::MAX as f64), f32::MAX as f64) as f32
+    }
+    fn finite_coordinate(value: f32) -> f32 {
+        if value.is_finite() { value } else { 0.0 }
+    }
     pub fn world_to_screen(self, p: Point) -> Point {
-        Point::new(p.x * self.zoom + self.pan.x, p.y * self.zoom + self.pan.y)
+        let viewport = self.sanitized();
+        let x = Self::finite_coordinate(p.x) as f64 * viewport.zoom as f64 + viewport.pan.x as f64;
+        let y = Self::finite_coordinate(p.y) as f64 * viewport.zoom as f64 + viewport.pan.y as f64;
+        Point::new(Self::finite_f32(x), Self::finite_f32(y))
     }
     pub fn screen_to_world(self, p: Point) -> Point {
-        let zoom = if self.zoom.is_finite() && self.zoom > 0.0 {
-            self.zoom
-        } else {
-            1.0
-        };
-        Point::new((p.x - self.pan.x) / zoom, (p.y - self.pan.y) / zoom)
+        let viewport = self.sanitized();
+        let x =
+            (Self::finite_coordinate(p.x) as f64 - viewport.pan.x as f64) / viewport.zoom as f64;
+        let y =
+            (Self::finite_coordinate(p.y) as f64 - viewport.pan.y as f64) / viewport.zoom as f64;
+        Point::new(Self::finite_f32(x), Self::finite_f32(y))
     }
     /// Zoom while preserving the world point beneath `screen`.
     /// Invalid/non-positive factors and bounds are ignored rather than allowing
@@ -123,15 +132,19 @@ impl Viewport {
         {
             return;
         }
-        if !self.zoom.is_finite() || self.zoom <= 0.0 {
-            self.zoom = 1.0_f32.clamp(min, max);
-        }
-        if !self.pan.x.is_finite() || !self.pan.y.is_finite() {
-            self.pan = Point::default();
-        }
-        let world = self.screen_to_world(screen);
-        self.zoom = (self.zoom * factor).clamp(min, max);
-        self.pan = screen - Point::new(world.x * self.zoom, world.y * self.zoom)
+        let current = self.sanitized();
+        let old_zoom = current.zoom as f64;
+        let new_zoom = (old_zoom * factor as f64).clamp(min as f64, max as f64);
+        let world_x = (screen.x as f64 - current.pan.x as f64) / old_zoom;
+        let world_y = (screen.y as f64 - current.pan.y as f64) / old_zoom;
+        let pan_x = screen.x as f64 - world_x * new_zoom;
+        let pan_y = screen.y as f64 - world_y * new_zoom;
+
+        // Calculate in f64 and saturate only at the public f32 boundary. This
+        // keeps every field finite even when otherwise-valid f32 operands would
+        // overflow an intermediate multiplication or subtraction.
+        self.zoom = new_zoom as f32;
+        self.pan = Point::new(Self::finite_f32(pan_x), Self::finite_f32(pan_y));
     }
     pub fn is_valid(self) -> bool {
         self.zoom.is_finite() && self.zoom > 0.0 && self.pan.x.is_finite() && self.pan.y.is_finite()
@@ -315,7 +328,7 @@ impl<
     pub fn reconcile(
         &mut self,
         mut snapshot: GraphSnapshot<N, P, C, T>,
-    ) -> Result<GraphEvent<N, P, C>, GraphValidationError> {
+    ) -> Result<Vec<GraphEvent<N, P, C>>, GraphValidationError> {
         Self::canonicalize_snapshot(&mut snapshot);
         let candidate = Self {
             nodes: snapshot.nodes,
@@ -324,13 +337,29 @@ impl<
             ..Default::default()
         };
         candidate.validate()?;
+        let old_selection = (
+            self.selected_nodes.clone(),
+            self.selected_connections.clone(),
+        );
         self.nodes = candidate.nodes;
         self.ports = candidate.ports;
         self.connections = candidate.connections;
         self.selected_nodes.retain(|id| self.nodes.contains_key(id));
         self.selected_connections
             .retain(|id| self.connections.contains_key(id));
-        Ok(GraphEvent::GraphReconciled)
+        let mut events = vec![GraphEvent::GraphReconciled];
+        if old_selection
+            != (
+                self.selected_nodes.clone(),
+                self.selected_connections.clone(),
+            )
+        {
+            events.push(GraphEvent::SelectionChanged {
+                nodes: self.selected_nodes.clone(),
+                connections: self.selected_connections.clone(),
+            });
+        }
+        Ok(events)
     }
     pub fn canonicalize_ids(&mut self) {
         for (id, node) in &mut self.nodes {
@@ -429,15 +458,47 @@ impl<
         }
     }
     /// Move a node and every world-space port owned by it by exactly the same delta.
+    /// The update is atomic: if any translated port would leave the finite f32
+    /// coordinate range, neither the node nor any port is changed.
     pub fn move_node(&mut self, id: &N, position: Point) -> Option<GraphEvent<N, P, C>> {
         if !position.x.is_finite() || !position.y.is_finite() {
             return None;
         }
-        let node = self.nodes.get_mut(id)?;
-        let delta = position - node.position;
-        node.position = position;
-        for port in self.ports.values_mut().filter(|port| &port.node == id) {
-            port.position = port.position + delta;
+        let old = self.nodes.get(id)?.position;
+        if !old.x.is_finite() || !old.y.is_finite() {
+            return None;
+        }
+        let dx = position.x as f64 - old.x as f64;
+        let dy = position.y as f64 - old.y as f64;
+        let translated: Option<Vec<(P, Point)>> = self
+            .ports
+            .iter()
+            .filter(|(_, port)| &port.node == id)
+            .map(|(port_id, port)| {
+                let x = port.position.x as f64 + dx;
+                let y = port.position.y as f64 + dy;
+                if port.position.x.is_finite()
+                    && port.position.y.is_finite()
+                    && x.abs() <= f32::MAX as f64
+                    && y.abs() <= f32::MAX as f64
+                {
+                    Some((port_id.clone(), Point::new(x as f32, y as f32)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let translated = translated?;
+
+        self.nodes
+            .get_mut(id)
+            .expect("node was present during move validation")
+            .position = position;
+        for (port_id, port_position) in translated {
+            self.ports
+                .get_mut(&port_id)
+                .expect("port was present during move validation")
+                .position = port_position;
         }
         Some(GraphEvent::NodesMoved {
             nodes: vec![(id.clone(), position)],
@@ -445,6 +506,10 @@ impl<
     }
     /// Delete nodes and reconcile all dependent ports, connections and selection.
     pub fn remove_nodes(&mut self, ids: &[N]) -> Vec<GraphEvent<N, P, C>> {
+        let old_selection = (
+            self.selected_nodes.clone(),
+            self.selected_connections.clone(),
+        );
         let removed: HashSet<N> = ids
             .iter()
             .filter(|id| self.nodes.remove(*id).is_some())
@@ -476,6 +541,17 @@ impl<
         if !removed.is_empty() {
             events.push(GraphEvent::NodesDeleted {
                 ids: removed.into_iter().collect(),
+            });
+        }
+        if old_selection
+            != (
+                self.selected_nodes.clone(),
+                self.selected_connections.clone(),
+            )
+        {
+            events.push(GraphEvent::SelectionChanged {
+                nodes: self.selected_nodes.clone(),
+                connections: self.selected_connections.clone(),
             });
         }
         events
@@ -733,6 +809,72 @@ mod tests {
         assert_eq!(v.screen_to_world(Point::new(4., 2.)), Point::new(4., 2.));
         v.zoom_at(Point::new(4., 2.), 2., 0.1, 4.);
         assert!(v.is_valid());
+    }
+    #[test]
+    fn move_node_is_atomic_and_uses_wide_intermediates() {
+        let mut g = connected_graph();
+        g.nodes.get_mut("a").unwrap().position = Point::new(-f32::MAX, 0.0);
+        g.ports.get_mut("out").unwrap().position = Point::new(-f32::MAX, 25.0);
+        assert!(
+            g.move_node(&"a".into(), Point::new(f32::MAX, 10.0))
+                .is_some()
+        );
+        assert_eq!(g.nodes["a"].position, Point::new(f32::MAX, 10.0));
+        assert_eq!(g.ports["out"].position, Point::new(f32::MAX, 35.0));
+
+        let before_node = g.nodes["a"].position;
+        g.ports.get_mut("out").unwrap().position = Point::new(-f32::MAX, 35.0);
+        let before_port = g.ports["out"].position;
+        assert!(
+            g.move_node(&"a".into(), Point::new(-f32::MAX, 20.0))
+                .is_none()
+        );
+        assert_eq!(g.nodes["a"].position, before_node);
+        assert_eq!(g.ports["out"].position, before_port);
+    }
+    #[test]
+    fn viewport_operations_stay_finite_at_f32_extremes() {
+        let mut v = Viewport {
+            pan: Point::new(f32::MAX, -f32::MAX),
+            zoom: f32::MAX,
+        };
+        let screen = v.world_to_screen(Point::new(f32::MAX, -f32::MAX));
+        assert!(screen.x.is_finite() && screen.y.is_finite());
+        let world = v.screen_to_world(Point::new(-f32::MAX, f32::MAX));
+        assert!(world.x.is_finite() && world.y.is_finite());
+        v.zoom_at(
+            Point::new(f32::MAX, -f32::MAX),
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+        );
+        assert!(v.is_valid());
+    }
+    #[test]
+    fn reconciliation_and_removal_report_pruned_selection() {
+        let mut g = connected_graph();
+        g.selected_nodes.insert("a".into());
+        g.selected_connections.insert("wire".into());
+        let mut snapshot = g.snapshot();
+        snapshot.nodes.remove("a");
+        snapshot.ports.remove("out");
+        snapshot.connections.remove("wire");
+        let events = g.reconcile(snapshot).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GraphEvent::SelectionChanged { nodes, connections }
+                if nodes.is_empty() && connections.is_empty()
+        )));
+
+        let mut g = connected_graph();
+        g.selected_nodes.insert("a".into());
+        g.selected_connections.insert("wire".into());
+        let events = g.remove_nodes(&["a".into()]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GraphEvent::SelectionChanged { nodes, connections }
+                if nodes.is_empty() && connections.is_empty()
+        )));
     }
     #[test]
     fn id_wrapper_serializes_and_implements_all_roles() {

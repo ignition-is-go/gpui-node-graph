@@ -58,15 +58,22 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
 {
 }
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeGraph<T, N, P, C> {
-    pub fn new(mut graph: GraphState<N, P, C, T>) -> Self {
+    /// Construct an editor, panicking with the validation error for invalid state.
+    /// Prefer [`Self::try_new`] when invalid application data is recoverable.
+    pub fn new(graph: GraphState<N, P, C, T>) -> Self {
+        Self::try_new(graph).unwrap_or_else(|error| panic!("{error}"))
+    }
+    /// Construct an editor only after canonicalizing map-owned IDs and validating
+    /// all graph references, geometry, port compatibility, and viewport state.
+    pub fn try_new(mut graph: GraphState<N, P, C, T>) -> Result<Self, GraphValidationError> {
         graph.canonicalize_ids();
-        graph.viewport = graph.viewport.sanitized();
-        Self {
+        graph.validate()?;
+        Ok(Self {
             graph,
             theme: Theme::default(),
             drag: None,
             panning: None,
-        }
+        })
     }
     /// Replace domain and transient state after canonicalization and validation.
     pub fn set_graph(
@@ -75,7 +82,6 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx: &mut Context<Self>,
     ) -> Result<(), GraphValidationError> {
         graph.canonicalize_ids();
-        graph.viewport = graph.viewport.sanitized();
         graph.validate()?;
         self.graph = graph;
         cx.emit(EditorEvent::GraphReconciled);
@@ -95,8 +101,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         snapshot: GraphSnapshot<N, P, C, T>,
         cx: &mut Context<Self>,
     ) -> Result<(), GraphValidationError> {
-        self.graph.reconcile(snapshot)?;
+        let events = self.graph.reconcile(snapshot)?;
         cx.emit(EditorEvent::GraphReconciled);
+        if events
+            .iter()
+            .any(|event| matches!(event, GraphEvent::SelectionChanged { .. }))
+        {
+            cx.emit(EditorEvent::SelectionChanged {
+                nodes: self.graph.selected_nodes.clone(),
+                connections: self.graph.selected_connections.clone(),
+            });
+        }
         cx.notify();
         Ok(())
     }
@@ -204,28 +219,46 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 cx.notify();
             }
             if let Some((id, off)) = this.drag.clone() {
-                let p = this.graph.viewport.screen_to_world(s) - off;
-                if this.graph.move_node(&id, p).is_some() {
+                let position = this.graph.viewport.screen_to_world(s) - off;
+                if let Some(GraphEvent::NodesMoved { nodes }) = this.graph.move_node(&id, position)
+                {
+                    for (id, position) in nodes {
+                        cx.emit(EditorEvent::NodeMoved { id, position });
+                    }
                     cx.notify();
                 }
             }
         }))
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                if let Some((id, _)) = this.drag.take()
-                    && let Some(n) = this.graph.nodes.get(&id)
-                {
-                    cx.emit(EditorEvent::NodeMoved {
-                        id,
-                        position: n.position,
-                    });
-                }
+            cx.listener(|this, _, _, _| {
+                this.drag = None;
             }),
         )
         .on_mouse_up(
             MouseButton::Middle,
             cx.listener(|this, _, _, _| this.panning = None),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Kind;
+    impl PortType for Kind {
+        fn compatible(_: &Self, _: &Self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn try_new_rejects_invalid_state_and_new_does_not_hide_it() {
+        let mut graph: GraphState<String, String, String, Kind> = GraphState::default();
+        graph.viewport.zoom = 0.0;
+        assert!(NodeGraph::try_new(graph.clone()).is_err());
+        assert!(std::panic::catch_unwind(|| NodeGraph::new(graph)).is_err());
     }
 }

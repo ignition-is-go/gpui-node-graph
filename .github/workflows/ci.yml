@@ -30,19 +30,36 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: trunk
+      - name: Install Google Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
       - run: cargo check --workspace --target wasm32-unknown-unknown
       - run: cd examples/demo && env -u NO_COLOR trunk build --release
-      - name: Smoke-test browser host and isolation headers
-        working-directory: examples/demo
+      - name: Execute built WASM in headless Google Chrome
         shell: bash
         run: |
-          setsid env -u NO_COLOR trunk serve > /tmp/node-graph-trunk.log 2>&1 < /dev/null &
+          python3 .github/scripts/serve_dist.py examples/demo/dist > /tmp/node-graph-server.log 2>&1 &
           server=$!
-          trap 'kill $server' EXIT
-          curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -D /tmp/headers http://127.0.0.1:8181/ -o /tmp/index.html
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 90); do
+            if curl -fsS -D /tmp/headers http://127.0.0.1:8181/ -o /tmp/index.html; then
+              break
+            fi
+            if ! kill -0 "$server" 2>/dev/null; then
+              cat /tmp/node-graph-server.log
+              exit 1
+            fi
+            sleep 1
+          done
+          test -s /tmp/index.html || { cat /tmp/node-graph-server.log; exit 1; }
           grep -qi '^cross-origin-opener-policy: same-origin' /tmp/headers
           grep -qi '^cross-origin-embedder-policy: require-corp' /tmp/headers
-          grep -q 'gpui-node-graph-demo' /tmp/index.html
-          asset=$(grep -oE 'gpui-node-graph-demo-[^" ]+_bg\.wasm' /tmp/index.html | head -1)
-          test -n "$asset"
-          curl -fsS "http://127.0.0.1:8181/$asset" -o /dev/null
+          "${{ steps.setup-chrome.outputs.chrome-path }}" \
+            --headless=new --no-sandbox --disable-gpu \
+            --virtual-time-budget=15000 --dump-dom \
+            http://127.0.0.1:8181/ > /tmp/dom.html
+          cat /tmp/dom.html
+          grep -q 'data-trunk-application-started="true"' /tmp/dom.html
+          grep -q 'data-cross-origin-isolated="true"' /tmp/dom.html
+          grep -q 'data-gpui-canvas="true"' /tmp/dom.html
+          grep -q '<canvas' /tmp/dom.html
