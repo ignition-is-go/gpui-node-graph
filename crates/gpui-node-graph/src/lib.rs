@@ -52,6 +52,9 @@ impl NodeBody {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeVisualState {
     pub selected: bool,
+    /// Whether the node intersects the current canvas plus the configured margin.
+    /// Renderers may use this to skip expensive body content; the shell remains mounted.
+    pub visible: bool,
     pub zoom: f32,
 }
 
@@ -127,6 +130,8 @@ pub struct EditorConfig {
     pub min_node_width: f32,
     pub max_node_width: f32,
     pub default_node_width: f32,
+    /// Screen-pixel margin used by [`NodeVisualState::visible`].
+    pub visibility_margin: f32,
 }
 impl Default for EditorConfig {
     fn default() -> Self {
@@ -142,6 +147,7 @@ impl Default for EditorConfig {
             min_node_width: 96.0,
             max_node_width: 800.0,
             default_node_width: 180.0,
+            visibility_margin: 160.0,
         }
     }
 }
@@ -681,6 +687,24 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
+    fn node_is_visible(&self, node: &Node<N>) -> bool {
+        let canvas = self.canvas_bounds.get();
+        let width = f32::from(canvas.size.width);
+        let height = f32::from(canvas.size.height);
+        if width <= 0.0 || height <= 0.0 {
+            return true;
+        }
+        let viewport = self.graph.viewport.sanitized();
+        let origin = viewport.world_to_screen(node.position);
+        let node_width = viewport.scale_length(node.size.width);
+        let node_height = viewport.scale_length(node.size.height);
+        let margin = self.config.visibility_margin.max(0.0);
+        origin.x + node_width >= -margin
+            && origin.y + node_height >= -margin
+            && origin.x <= width + margin
+            && origin.y <= height + margin
+    }
+
     fn connection_route(&self, connection: &Connection<P, C>) -> Option<Vec<core::Point>> {
         let source = self.graph.ports.get(&connection.source)?;
         let target = self.graph.ports.get(&connection.target)?;
@@ -1129,6 +1153,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let id = node.id.clone();
             let position = viewport.world_to_screen(node.position);
             let selected = self.graph.selected_nodes.contains(&id);
+            let visible = self.node_is_visible(&node);
             let resize_id = id.clone();
             let mut body = if let Some(renderer) = self.node_body_renderer.as_mut() {
                 let mut ports: Vec<_> = self
@@ -1145,6 +1170,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         ports: ports.into(),
                         state: NodeVisualState {
                             selected,
+                            visible,
                             zoom: viewport.zoom,
                         },
                         theme: self.theme.clone(),
@@ -1967,6 +1993,19 @@ mod tests {
             editor.connection_at(core::Point::new(125.0, -16.0), 4.0),
             Some("wire".into())
         );
+    }
+
+    #[test]
+    fn visibility_hook_uses_canvas_and_screen_margin() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        editor.config.visibility_margin = 0.0;
+        editor.canvas_bounds.set(Bounds {
+            origin: point(px(20.0), px(30.0)),
+            size: gpui::size(px(100.0), px(100.0)),
+        });
+        assert!(editor.node_is_visible(&editor.graph.nodes["a"]));
+        editor.graph.nodes.get_mut("a").unwrap().position = core::Point::new(500.0, 500.0);
+        assert!(!editor.node_is_visible(&editor.graph.nodes["a"]));
     }
 
     #[test]

@@ -52,5 +52,5 @@ least three seconds, preventing both lifecycle and false-mount positives.
   now adds/removes stable dynamic inputs, but refuses removal while referenced);
 - batching, lane separation, rounded corners and caching for the integrated
   deterministic obstacle-aware subway router (Bezier/simple runtime switching now works);
-- visibility/culling hooks, captured dragging outside embedded bounds, and broader
-  scripted native/browser interaction and visual tests.
+- captured dragging outside embedded bounds and broader scripted native/browser
+  interaction and visual tests (rich renderers now receive an opt-in visibility hook).
