@@ -36,21 +36,32 @@ function command(method, params = {}) {
 await command("Page.enable");
 await command("Runtime.enable");
 let state;
+let readySince;
 while (Date.now() < deadline) {
   const evaluated = await command("Runtime.evaluate", {
     expression: `({
       started: document.documentElement.dataset.trunkApplicationStarted === "true",
       isolated: globalThis.crossOriginIsolated === true,
-      canvas: Boolean(document.querySelector("canvas")),
+      canvas: (() => {
+        const canvas = document.querySelector("canvas");
+        return Boolean(canvas && canvas.width > 0 && canvas.height > 0);
+      })(),
       href: location.href
     })`,
     returnByValue: true,
   });
   state = evaluated.result?.value;
   if (state?.started && state?.isolated && state?.canvas) {
-    console.log(JSON.stringify(state));
-    socket.close();
-    process.exit(0);
+    readySince ??= Date.now();
+    // A dropped embedded Application briefly creates and then removes its canvas.
+    // Require sustained readiness so the smoke test proves a live GPUI runtime.
+    if (Date.now() - readySince >= 3_000) {
+      console.log(JSON.stringify({ ...state, sustainedMs: Date.now() - readySince }));
+      socket.close();
+      process.exit(0);
+    }
+  } else {
+    readySince = undefined;
   }
   await new Promise((resolve) => setTimeout(resolve, 500));
 }

@@ -218,6 +218,10 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
     NodesMoved {
         nodes: Vec<(N, Point)>,
     },
+    NodeResized {
+        id: N,
+        size: Size,
+    },
     ConnectionRequested {
         source: P,
         target: P,
@@ -232,12 +236,28 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
     NodesDeleted {
         ids: Vec<N>,
     },
+    NodesCopied {
+        ids: Vec<N>,
+    },
+    NodesPasted {
+        offset: Point,
+    },
     Undo,
+    Redo,
+    GroupCreated {
+        node_ids: Vec<N>,
+    },
+    CreateNode {
+        item_id: String,
+        position: Point,
+        connect_from: Option<P>,
+        connect_to: Option<String>,
+        connect_direction: Option<PortDirection>,
+    },
     ViewportChanged {
         viewport: Viewport,
     },
     GraphReconciled,
-    Redo,
 }
 /// Persisted, framework-free graph domain data. Selection and viewport are UI
 /// session state and intentionally do not appear in this snapshot.
@@ -481,53 +501,83 @@ impl<
             Err(GraphValidationError { problems })
         }
     }
-    /// Move a node and every world-space port owned by it by exactly the same delta.
-    /// The update is atomic: if any translated port would leave the finite f32
-    /// coordinate range, neither the node nor any port is changed.
-    pub fn move_node(&mut self, id: &N, position: Point) -> Option<GraphEvent<N, P, C>> {
-        if !position.x.is_finite() || !position.y.is_finite() {
+    /// Move nodes and every world-space port they own by the same per-node delta.
+    /// The update is atomic: a missing node, non-finite coordinate, or translated
+    /// port outside the finite `f32` range rejects the
+    /// entire gesture without changing any node or port.
+    pub fn move_nodes(&mut self, updates: &[(N, Point)]) -> Option<GraphEvent<N, P, C>> {
+        if updates.is_empty() {
             return None;
         }
-        let old = self.nodes.get(id)?.position;
-        if !old.x.is_finite() || !old.y.is_finite() {
-            return None;
+
+        // Preserve caller order while making duplicate IDs last-write-wins.
+        let mut canonical: Vec<(N, Point)> = Vec::with_capacity(updates.len());
+        for (id, position) in updates {
+            if !position.x.is_finite() || !position.y.is_finite() {
+                return None;
+            }
+            if let Some((_, existing)) = canonical.iter_mut().find(|(current, _)| current == id) {
+                *existing = *position;
+            } else {
+                canonical.push((id.clone(), *position));
+            }
         }
-        let dx = position.x as f64 - old.x as f64;
-        let dy = position.y as f64 - old.y as f64;
+
+        let desired: HashMap<N, Point> = canonical.iter().cloned().collect();
+        let mut deltas = HashMap::with_capacity(desired.len());
+        for (id, position) in &canonical {
+            let old = self.nodes.get(id)?.position;
+            if !old.x.is_finite() || !old.y.is_finite() {
+                return None;
+            }
+            deltas.insert(
+                id.clone(),
+                (
+                    position.x as f64 - old.x as f64,
+                    position.y as f64 - old.y as f64,
+                ),
+            );
+        }
+
         let translated: Option<Vec<(P, Point)>> = self
             .ports
             .iter()
-            .filter(|(_, port)| &port.node == id)
-            .map(|(port_id, port)| {
+            .filter_map(|(port_id, port)| {
+                let &(dx, dy) = deltas.get(&port.node)?;
                 let x = port.position.x as f64 + dx;
                 let y = port.position.y as f64 + dy;
-                if port.position.x.is_finite()
-                    && port.position.y.is_finite()
-                    && x.abs() <= f32::MAX as f64
-                    && y.abs() <= f32::MAX as f64
-                {
-                    Some((port_id.clone(), Point::new(x as f32, y as f32)))
-                } else {
-                    None
-                }
+                Some(
+                    (port.position.x.is_finite()
+                        && port.position.y.is_finite()
+                        && x.abs() <= f32::MAX as f64
+                        && y.abs() <= f32::MAX as f64)
+                        .then(|| (port_id.clone(), Point::new(x as f32, y as f32))),
+                )
             })
             .collect();
         let translated = translated?;
 
-        self.nodes
-            .get_mut(id)
-            .expect("node was present during move validation")
-            .position = position;
+        for (id, position) in &canonical {
+            self.nodes
+                .get_mut(id)
+                .expect("node was present during movement validation")
+                .position = *position;
+        }
         for (port_id, port_position) in translated {
             self.ports
                 .get_mut(&port_id)
-                .expect("port was present during move validation")
+                .expect("port was present during movement validation")
                 .position = port_position;
         }
-        Some(GraphEvent::NodesMoved {
-            nodes: vec![(id.clone(), position)],
-        })
+        Some(GraphEvent::NodesMoved { nodes: canonical })
     }
+
+    /// Move one node atomically. This is the single-node convenience wrapper for
+    /// [`Self::move_nodes`].
+    pub fn move_node(&mut self, id: &N, position: Point) -> Option<GraphEvent<N, P, C>> {
+        self.move_nodes(&[(id.clone(), position)])
+    }
+
     /// Delete nodes and reconcile all dependent ports, connections and selection.
     pub fn remove_nodes(&mut self, ids: &[N]) -> Vec<GraphEvent<N, P, C>> {
         let old_selection = (
@@ -856,6 +906,43 @@ mod tests {
         assert_eq!(g.nodes["a"].position, before_node);
         assert_eq!(g.ports["out"].position, before_port);
     }
+    #[test]
+    fn multi_node_move_is_atomic_and_preserves_caller_order() {
+        let mut graph = connected_graph();
+        let event = graph
+            .move_nodes(&[
+                ("b".to_string(), Point::new(120.0, 10.0)),
+                ("a".to_string(), Point::new(20.0, 5.0)),
+            ])
+            .expect("both finite nodes should move");
+        let GraphEvent::NodesMoved { nodes } = event else {
+            panic!("movement must report one batched event");
+        };
+        assert_eq!(
+            nodes,
+            vec![
+                ("b".to_string(), Point::new(120.0, 10.0)),
+                ("a".to_string(), Point::new(20.0, 5.0)),
+            ]
+        );
+        assert_eq!(graph.ports["in"].position, Point::new(120.0, 35.0));
+        assert_eq!(graph.ports["out"].position, Point::new(70.0, 30.0));
+
+        graph.ports.get_mut("in").unwrap().position = Point::new(f32::MAX, 35.0);
+        let before_a = graph.nodes["a"].position;
+        let before_b = graph.nodes["b"].position;
+        assert!(
+            graph
+                .move_nodes(&[
+                    ("a".to_string(), Point::new(30.0, 5.0)),
+                    ("b".to_string(), Point::new(f32::MAX, 10.0)),
+                ])
+                .is_none()
+        );
+        assert_eq!(graph.nodes["a"].position, before_a);
+        assert_eq!(graph.nodes["b"].position, before_b);
+    }
+
     #[test]
     fn viewport_operations_stay_finite_at_f32_extremes() {
         let mut v = Viewport {

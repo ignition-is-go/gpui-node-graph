@@ -4,13 +4,19 @@ Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries
 
 ## Status
 
-The production foundation includes a serde-compatible framework-free domain snapshot, separately managed transient editor state, generic typed IDs, validated/canonical graph references, directional port compatibility, safe viewport transforms, geometry and selection queries, deterministic orthogonal routes, and a shared GPUI view. Dragging translates a node and its world-space ports atomically; selection, viewport, reconciliation, and accepted node-drag mutations all emit editor events. The same view code runs on Windows, macOS, Linux, and WebAssembly.
+The production foundation includes a serde-compatible framework-free domain snapshot, separately managed transient editor state, generic typed IDs, validated/canonical graph references, directional port compatibility, safe viewport transforms, geometry and selection queries, deterministic orthogonal routes, and a shared GPUI view. The shared editor now renders typed ports and supports draft/snap/complete/reroute gestures, wire and box selection, modifier multi-selection and batched multi-node drag, pointer-centered wheel zoom, grid snap, fit view, keyboard editing hooks, and middle/Ctrl-drag panning. The same view code runs on Windows, macOS, Linux, and WebAssembly.
 
 ```sh
 cargo run -p gpui-node-graph-demo
 # Force Wayland when both Wayland and X11 session variables are present
 # env -u DISPLAY cargo run -p gpui-node-graph-demo
 cargo test --workspace
+
+# Demo controls: drag nodes; Shift-click or drag the canvas to multi-select;
+# drag/click between ports to connect; drag a wire to blank space to create-and-connect;
+# double-click blank space or press Tab to search/create; click wires and press Delete;
+# wheel zoom; middle-drag or Ctrl-drag to pan; F fits; Escape cancels/clears.
+
 # Browser host (requires Trunk)
 cd examples/demo && trunk serve
 # verify the required cross-origin-isolation headers
@@ -20,7 +26,7 @@ curl -sSI http://127.0.0.1:8181/ | grep -Ei 'cross-origin-(opener|embedder)-poli
 ## Architecture
 
 - `node-graph-core`: canonical serializable model and deterministic logic. Persist `GraphSnapshot`; `GraphUiState` (selection and viewport) is session-only. `GraphState` still accepts the former top-level domain JSON shape, but deliberately skips transient fields when serialized. Call `validate`, `canonicalize_ids`, or `GraphState::from_snapshot` at trust boundaries. `NodeGraph::try_new` rejects invalid editor state; `NodeGraph::new` is the convenience constructor for already-trusted state and panics with the validation error rather than silently rendering a corrupt graph.
-- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` retained-mode view and input adapter. Consumers own/reconcile domain data and can subscribe to `EditorEvent` for node movement, selection, viewport, and snapshot reconciliation. Node content geometry (including text and padding) scales uniformly with viewport zoom.
+- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` retained-mode view and input adapter. The adapter and core share one `GraphEvent` vocabulary (`EditorEvent` is a compatibility alias). Consumers may reconcile domain data and handle connection/create/history hooks while the view owns transient gestures. Node content geometry (including text and padding) scales uniformly with viewport zoom.
 - `examples/demo`: shared GPUI application with thin target-specific desktop/browser packaging. `gpui_platform::application()` selects the backend.
 
 All saved-model migrations belong in core and must have fixture round-trip tests. Leptos is a behavior/serialization reference during migration only, not a co-maintained target.
@@ -33,8 +39,8 @@ The evidence-backed Leptos parity audit and phased acceptance plan are in
 - [x] portable typed model, viewport transforms, selection geometry
 - [x] native nodes and connection painting
 - [x] node drag event and middle-button pan
-- [ ] wheel zoom around cursor, grid snap, box/connection selection, fit view
-- [ ] typed draft connections, snapping and remove/create events
+- [x] wheel zoom around cursor, grid snap, box/connection selection, fit view
+- [x] typed draft connections, snapping and remove/create events
 - [ ] obstacle-aware subway router and incremental cache migration
 - [ ] dynamic port/node catalog, searchable creation menu
 - [ ] groups, resizing, overlays, culling and keyboard actions

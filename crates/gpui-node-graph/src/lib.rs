@@ -1,34 +1,86 @@
 mod windows;
+
 use gpui::{
-    Context, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Render, Window, canvas, div,
-    point, prelude::*, px, rgb,
+    Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, Window, canvas, div, point,
+    prelude::*, px, rgb,
 };
+use std::{cell::Cell, collections::HashSet, rc::Rc};
+
 pub use node_graph_core as core;
 pub use node_graph_core::*;
 pub use windows::*;
 
+/// The GPUI adapter and framework-free core now expose one event vocabulary.
+pub type EditorEvent<N = String, P = String, C = String> = core::GraphEvent<N, P, C>;
+
 #[derive(Clone, Debug)]
-pub enum EditorEvent<N: Eq + std::hash::Hash = String, C: Eq + std::hash::Hash = String> {
-    NodeMoved {
-        id: N,
-        position: core::Point,
-    },
-    SelectionChanged {
-        nodes: std::collections::HashSet<N>,
-        connections: std::collections::HashSet<C>,
-    },
-    ViewportChanged {
-        viewport: Viewport,
-    },
-    GraphReconciled,
+pub struct EditorConfig {
+    pub min_zoom: f32,
+    pub max_zoom: f32,
+    pub zoom_step: f32,
+    pub grid_size: Option<f32>,
+    /// Port snap radius in screen pixels.
+    pub snap_distance: f32,
+    pub fit_padding: f32,
+    pub fit_max_zoom: f32,
 }
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            min_zoom: 0.1,
+            max_zoom: 5.0,
+            zoom_step: 0.3,
+            grid_size: None,
+            snap_distance: 22.0,
+            fit_padding: 48.0,
+            fit_max_zoom: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogPort<T> {
+    /// Stable, consumer-defined port key used by `GraphEvent::CreateNode`.
+    pub id: String,
+    pub label: String,
+    pub direction: PortDirection,
+    pub kind: T,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeCatalogItem<T> {
+    pub id: String,
+    pub label: String,
+    pub category: String,
+    pub description: String,
+    pub keywords: Vec<String>,
+    pub ports: Vec<CatalogPort<T>>,
+}
+
+#[derive(Clone)]
+struct CatalogMenu<P> {
+    anchor_world: core::Point,
+    query: String,
+    selected: usize,
+    connect_from: Option<P>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub background: u32,
     pub node: u32,
     pub node_selected: u32,
     pub wire: u32,
+    pub wire_selected: u32,
+    pub wire_draft: u32,
     pub text: u32,
+    pub port_input: u32,
+    pub port_output: u32,
+    pub port_connected: u32,
+    pub port_compatible: u32,
+    pub selection_border: u32,
+    pub selection_fill: u32,
 }
 impl Default for Theme {
     fn default() -> Self {
@@ -37,11 +89,54 @@ impl Default for Theme {
             node: 0x27272a,
             node_selected: 0x3f3f46,
             wire: 0x71717a,
+            wire_selected: 0xef4444,
+            wire_draft: 0x22d3ee,
             text: 0xe4e4e7,
+            port_input: 0x60a5fa,
+            port_output: 0xf59e0b,
+            port_connected: 0xa1a1aa,
+            port_compatible: 0x22d3ee,
+            selection_border: 0x60a5fa,
+            selection_fill: 0x1e3a5f,
         }
     }
 }
-/// Shared native/WebAssembly retained-mode GPUI node editor. Domain state stays framework-free in `node_graph_core`.
+
+#[derive(Clone)]
+struct NodeDrag<N> {
+    offsets: Vec<(N, core::Point)>,
+    moved: bool,
+}
+#[derive(Clone)]
+struct DraftConnection<P> {
+    origin: P,
+    current_screen: core::Point,
+    snap_target: Option<P>,
+    moved: bool,
+}
+#[derive(Clone)]
+struct BoxSelection<N, C> {
+    start: core::Point,
+    current: core::Point,
+    baseline_nodes: HashSet<N>,
+    baseline_connections: HashSet<C>,
+}
+impl<N, C> BoxSelection<N, C> {
+    fn rect(&self) -> core::Rect {
+        let x = self.start.x.min(self.current.x);
+        let y = self.start.y.min(self.current.y);
+        core::Rect {
+            origin: core::Point::new(x, y),
+            size: core::Size {
+                width: (self.current.x - self.start.x).abs(),
+                height: (self.current.y - self.start.y).abs(),
+            },
+        }
+    }
+}
+
+/// Shared native/WebAssembly retained-mode GPUI node editor. Domain state stays
+/// framework-free in `node_graph_core`.
 pub struct NodeGraph<
     T: PortType,
     N: core::NodeId = String,
@@ -50,19 +145,36 @@ pub struct NodeGraph<
 > {
     pub graph: GraphState<N, P, C, T>,
     pub theme: Theme,
-    drag: Option<(N, core::Point)>,
+    pub config: EditorConfig,
+    drag: Option<NodeDrag<N>>,
     panning: Option<core::Point>,
+    draft: Option<DraftConnection<P>>,
+    catalog: Vec<NodeCatalogItem<T>>,
+    catalog_menu: Option<CatalogMenu<P>>,
+    box_selection: Option<BoxSelection<N, C>>,
+    focus_handle: Option<FocusHandle>,
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
 }
+
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
-    gpui::EventEmitter<EditorEvent<N, C>> for NodeGraph<T, N, P, C>
+    gpui::EventEmitter<core::GraphEvent<N, P, C>> for NodeGraph<T, N, P, C>
 {
 }
+
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeGraph<T, N, P, C> {
     /// Construct an editor, panicking with the validation error for invalid state.
     /// Prefer [`Self::try_new`] when invalid application data is recoverable.
     pub fn new(graph: GraphState<N, P, C, T>) -> Self {
         Self::try_new(graph).unwrap_or_else(|error| panic!("{error}"))
     }
+
+    /// Construct an editor with a focus handle available before its first render.
+    pub fn new_in(graph: GraphState<N, P, C, T>, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::new(graph);
+        editor.focus_handle = Some(cx.focus_handle());
+        editor
+    }
+
     /// Construct an editor only after canonicalizing map-owned IDs and validating
     /// all graph references, geometry, port compatibility, and viewport state.
     pub fn try_new(mut graph: GraphState<N, P, C, T>) -> Result<Self, GraphValidationError> {
@@ -71,10 +183,112 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         Ok(Self {
             graph,
             theme: Theme::default(),
+            config: EditorConfig::default(),
             drag: None,
             panning: None,
+            draft: None,
+            catalog: Vec::new(),
+            catalog_menu: None,
+            box_selection: None,
+            focus_handle: None,
+            canvas_bounds: Rc::new(Cell::new(Bounds::default())),
         })
     }
+
+    pub fn focus_handle(&self) -> Option<&FocusHandle> {
+        self.focus_handle.as_ref()
+    }
+
+    pub fn with_catalog(mut self, catalog: Vec<NodeCatalogItem<T>>) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    pub fn set_catalog(&mut self, catalog: Vec<NodeCatalogItem<T>>, cx: &mut Context<Self>) {
+        self.catalog = catalog;
+        self.catalog_menu = None;
+        cx.notify();
+    }
+
+    fn compatible_catalog_port(&self, item_index: usize, origin: &P) -> Option<&CatalogPort<T>> {
+        let origin = self.graph.ports.get(origin)?;
+        self.catalog
+            .get(item_index)?
+            .ports
+            .iter()
+            .find(|candidate| match (origin.direction, candidate.direction) {
+                (PortDirection::Output, PortDirection::Input) => {
+                    T::compatible(&origin.kind, &candidate.kind)
+                }
+                (PortDirection::Input, PortDirection::Output) => {
+                    T::compatible(&candidate.kind, &origin.kind)
+                }
+                _ => false,
+            })
+    }
+
+    fn filtered_catalog_indices(&self) -> Vec<usize> {
+        let Some(menu) = self.catalog_menu.as_ref() else {
+            return Vec::new();
+        };
+        let query = menu.query.to_lowercase();
+        self.catalog
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                menu.connect_from
+                    .as_ref()
+                    .is_none_or(|origin| self.compatible_catalog_port(*index, origin).is_some())
+                    && (query.is_empty()
+                        || item.label.to_lowercase().contains(&query)
+                        || item.category.to_lowercase().contains(&query)
+                        || item.description.to_lowercase().contains(&query)
+                        || item
+                            .keywords
+                            .iter()
+                            .any(|keyword| keyword.to_lowercase().contains(&query)))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn open_catalog(&mut self, at_screen: core::Point, connect_from: Option<P>) {
+        if self.catalog.is_empty() {
+            self.catalog_menu = None;
+            self.draft = None;
+            return;
+        }
+        self.draft = None;
+        self.catalog_menu = Some(CatalogMenu {
+            anchor_world: self.graph.viewport.screen_to_world(at_screen),
+            query: String::new(),
+            selected: 0,
+            connect_from,
+        });
+    }
+
+    fn choose_catalog(&mut self, item_index: usize, cx: &mut Context<Self>) {
+        let Some(menu) = self.catalog_menu.take() else {
+            return;
+        };
+        let Some(item) = self.catalog.get(item_index) else {
+            return;
+        };
+        let compatible = menu
+            .connect_from
+            .as_ref()
+            .and_then(|origin| self.compatible_catalog_port(item_index, origin))
+            .map(|port| (port.id.clone(), port.direction));
+        cx.emit(core::GraphEvent::CreateNode {
+            item_id: item.id.clone(),
+            position: menu.anchor_world,
+            connect_from: menu.connect_from,
+            connect_to: compatible.as_ref().map(|(id, _)| id.clone()),
+            connect_direction: compatible.map(|(_, direction)| direction),
+        });
+        cx.notify();
+    }
+
     /// Replace domain and transient state after canonicalization and validation.
     pub fn set_graph(
         &mut self,
@@ -84,17 +298,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         graph.canonicalize_ids();
         graph.validate()?;
         self.graph = graph;
-        cx.emit(EditorEvent::GraphReconciled);
-        cx.emit(EditorEvent::SelectionChanged {
-            nodes: self.graph.selected_nodes.clone(),
-            connections: self.graph.selected_connections.clone(),
-        });
-        cx.emit(EditorEvent::ViewportChanged {
+        self.cancel_gestures();
+        cx.emit(core::GraphEvent::GraphReconciled);
+        self.emit_selection(cx);
+        cx.emit(core::GraphEvent::ViewportChanged {
             viewport: self.graph.viewport,
         });
         cx.notify();
         Ok(())
     }
+
     /// Reconcile persisted domain data while preserving valid selection and viewport.
     pub fn reconcile(
         &mut self,
@@ -102,68 +315,467 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx: &mut Context<Self>,
     ) -> Result<(), GraphValidationError> {
         let events = self.graph.reconcile(snapshot)?;
-        cx.emit(EditorEvent::GraphReconciled);
-        if events
-            .iter()
-            .any(|event| matches!(event, GraphEvent::SelectionChanged { .. }))
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|draft| !self.graph.ports.contains_key(&draft.origin))
         {
-            cx.emit(EditorEvent::SelectionChanged {
-                nodes: self.graph.selected_nodes.clone(),
-                connections: self.graph.selected_connections.clone(),
-            });
+            self.draft = None;
+        }
+        self.drag = None;
+        self.box_selection = None;
+        for event in events {
+            cx.emit(event);
         }
         cx.notify();
         Ok(())
     }
+
+    fn cancel_gestures(&mut self) {
+        self.drag = None;
+        self.panning = None;
+        self.draft = None;
+        self.box_selection = None;
+    }
+
+    fn emit_selection(&self, cx: &mut Context<Self>) {
+        cx.emit(core::GraphEvent::SelectionChanged {
+            nodes: self.graph.selected_nodes.clone(),
+            connections: self.graph.selected_connections.clone(),
+        });
+    }
+
+    fn local_screen(&self, position: gpui::Point<Pixels>) -> core::Point {
+        let bounds = self.canvas_bounds.get();
+        core::Point::new(
+            f32::from(position.x - bounds.origin.x),
+            f32::from(position.y - bounds.origin.y),
+        )
+    }
+
+    fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.focus_handle {
+            handle.focus(window, cx);
+        }
+    }
+
+    fn normalized_connection(&self, first: &P, second: &P) -> Option<(P, P)> {
+        let a = self.graph.ports.get(first)?;
+        let b = self.graph.ports.get(second)?;
+        if a.node == b.node || a.direction == b.direction {
+            return None;
+        }
+        let (source, target) = if a.direction == PortDirection::Output {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        (T::compatible(&source.kind, &target.kind)).then(|| (source.id.clone(), target.id.clone()))
+    }
+
+    fn nearest_compatible_port(&self, origin: &P, cursor: core::Point) -> Option<P> {
+        let mut ports: Vec<_> = self.graph.ports.keys().collect();
+        ports.sort_by_cached_key(|id| format!("{id:?}"));
+        let mut nearest: Option<(P, f32)> = None;
+        for id in ports {
+            if id == origin || self.normalized_connection(origin, id).is_none() {
+                continue;
+            }
+            let screen = self
+                .graph
+                .viewport
+                .world_to_screen(self.graph.ports[id].position);
+            let distance = screen.distance(cursor);
+            if distance <= self.config.snap_distance
+                && nearest.as_ref().is_none_or(|(_, best)| distance < *best)
+            {
+                nearest = Some((id.clone(), distance));
+            }
+        }
+        nearest.map(|(id, _)| id)
+    }
+
+    fn start_draft(&mut self, id: &P, cx: &mut Context<Self>) {
+        let Some(port) = self.graph.ports.get(id) else {
+            return;
+        };
+        let mut origin = id.clone();
+        // Dragging an occupied input reroutes its existing source, matching the
+        // reference editor's replace-input gesture.
+        if port.direction == PortDirection::Input
+            && let Some((connection_id, source)) = self
+                .graph
+                .connections
+                .iter()
+                .find(|(_, connection)| &connection.target == id)
+                .map(|(connection_id, connection)| {
+                    (connection_id.clone(), connection.source.clone())
+                })
+        {
+            self.graph.connections.remove(&connection_id);
+            self.graph.selected_connections.remove(&connection_id);
+            cx.emit(core::GraphEvent::ConnectionRemoved { id: connection_id });
+            origin = source;
+        }
+        let current_screen = self
+            .graph
+            .viewport
+            .world_to_screen(self.graph.ports[&origin].position);
+        self.draft = Some(DraftConnection {
+            origin,
+            current_screen,
+            snap_target: None,
+            moved: false,
+        });
+        cx.notify();
+    }
+
+    fn finish_draft(&mut self, target: &P, cx: &mut Context<Self>) -> bool {
+        let Some(draft) = self.draft.take() else {
+            return false;
+        };
+        let Some((source, target)) = self.normalized_connection(&draft.origin, target) else {
+            self.draft = Some(draft);
+            return false;
+        };
+        cx.emit(core::GraphEvent::ConnectionRequested { source, target });
+        cx.notify();
+        true
+    }
+
+    fn connection_at(&self, cursor: core::Point, radius: f32) -> Option<C> {
+        let viewport = self.graph.viewport.sanitized();
+        let mut connections: Vec<_> = self.graph.connections.iter().collect();
+        connections.sort_by_cached_key(|(id, _)| format!("{id:?}"));
+        let mut nearest: Option<(C, f32)> = None;
+        for (id, connection) in connections {
+            let (Some(source), Some(target)) = (
+                self.graph.ports.get(&connection.source),
+                self.graph.ports.get(&connection.target),
+            ) else {
+                continue;
+            };
+            let a = viewport.world_to_screen(source.position);
+            let b = viewport.world_to_screen(target.position);
+            let mid = core::Point::new(a.x * 0.5 + b.x * 0.5, a.y);
+            let mid2 = core::Point::new(mid.x, b.y);
+            let distance = distance_to_segment(cursor, a, mid)
+                .min(distance_to_segment(cursor, mid, mid2))
+                .min(distance_to_segment(cursor, mid2, b));
+            if distance <= radius && nearest.as_ref().is_none_or(|(_, best)| distance < *best) {
+                nearest = Some((id.clone(), distance));
+            }
+        }
+        nearest.map(|(id, _)| id)
+    }
+
+    fn fit_view(&mut self) -> bool {
+        let Some(bounds) = self.graph.bounds() else {
+            return false;
+        };
+        let canvas = self.canvas_bounds.get();
+        let width = f32::from(canvas.size.width);
+        let height = f32::from(canvas.size.height);
+        if width <= 0.0 || height <= 0.0 {
+            return false;
+        }
+        let graph_width = bounds.size.width.max(1.0);
+        let graph_height = bounds.size.height.max(1.0);
+        let available_width = (width - self.config.fit_padding * 2.0).max(1.0);
+        let available_height = (height - self.config.fit_padding * 2.0).max(1.0);
+        let zoom = (available_width / graph_width)
+            .min(available_height / graph_height)
+            .clamp(
+                self.config.min_zoom,
+                self.config.fit_max_zoom.min(self.config.max_zoom),
+            );
+        let center = core::Point::new(
+            bounds.origin.x + graph_width * 0.5,
+            bounds.origin.y + graph_height * 0.5,
+        );
+        let viewport = Viewport {
+            zoom,
+            pan: core::Point::new(
+                width * 0.5 - center.x * zoom,
+                height * 0.5 - center.y * zoom,
+            ),
+        };
+        if viewport.is_valid() && viewport != self.graph.viewport {
+            self.graph.viewport = viewport;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        let connection_ids: Vec<_> = self.graph.selected_connections.iter().cloned().collect();
+        for id in connection_ids {
+            if self.graph.connections.remove(&id).is_some() {
+                cx.emit(core::GraphEvent::ConnectionRemoved { id });
+            }
+        }
+        let node_ids: Vec<_> = self.graph.selected_nodes.iter().cloned().collect();
+        for event in self.graph.remove_nodes(&node_ids) {
+            cx.emit(event);
+        }
+        self.graph.selected_connections.clear();
+        cx.notify();
+    }
+
+    fn finish_left_gesture(&mut self, cx: &mut Context<Self>) {
+        self.panning = None;
+        if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
+            let nodes = drag
+                .offsets
+                .into_iter()
+                .filter_map(|(id, _)| Some((id.clone(), self.graph.nodes.get(&id)?.position)))
+                .collect();
+            cx.emit(core::GraphEvent::NodesMoved { nodes });
+        }
+        self.box_selection = None;
+        let draft_result = self.draft.as_ref().map(|draft| {
+            (
+                draft.snap_target.clone(),
+                draft.moved,
+                draft.current_screen,
+                draft.origin.clone(),
+            )
+        });
+        match draft_result {
+            Some((Some(target), _, _, _)) => {
+                self.finish_draft(&target, cx);
+            }
+            Some((None, true, at, origin)) => {
+                self.open_catalog(at, Some(origin));
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        let shift = event.keystroke.modifiers.shift;
+        if self.catalog_menu.is_some() {
+            let before = self.filtered_catalog_indices();
+            match key {
+                "escape" => self.catalog_menu = None,
+                "enter" => {
+                    if let Some(menu) = self.catalog_menu.as_ref()
+                        && let Some(index) = before.get(menu.selected).copied()
+                    {
+                        self.choose_catalog(index, cx);
+                    }
+                }
+                "up" => {
+                    if let Some(menu) = self.catalog_menu.as_mut() {
+                        menu.selected = menu.selected.saturating_sub(1);
+                    }
+                }
+                "down" => {
+                    if let Some(menu) = self.catalog_menu.as_mut() {
+                        menu.selected = (menu.selected + 1).min(before.len().saturating_sub(1));
+                    }
+                }
+                "backspace" => {
+                    if let Some(menu) = self.catalog_menu.as_mut() {
+                        menu.query.pop();
+                    }
+                }
+                _ if !command => {
+                    if let Some(character) = event.keystroke.key_char.as_ref()
+                        && !character.chars().any(char::is_control)
+                        && let Some(menu) = self.catalog_menu.as_mut()
+                    {
+                        menu.query.push_str(character);
+                    }
+                }
+                _ => {}
+            }
+            let result_len = self.filtered_catalog_indices().len();
+            if let Some(menu) = self.catalog_menu.as_mut() {
+                menu.selected = menu.selected.min(result_len.saturating_sub(1));
+            }
+            cx.notify();
+            cx.stop_propagation();
+            window.prevent_default();
+            return;
+        }
+        match key {
+            "tab" => {
+                let bounds = self.canvas_bounds.get();
+                self.open_catalog(
+                    core::Point::new(
+                        f32::from(bounds.size.width) * 0.5,
+                        f32::from(bounds.size.height) * 0.5,
+                    ),
+                    None,
+                );
+                cx.notify();
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+            "delete" | "backspace" => {
+                self.delete_selected(cx);
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+            "a" if command => {
+                self.graph.selected_nodes = self.graph.nodes.keys().cloned().collect();
+                self.graph.selected_connections.clear();
+                self.emit_selection(cx);
+                cx.notify();
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+            "f" if !command => {
+                if self.fit_view() {
+                    cx.emit(core::GraphEvent::ViewportChanged {
+                        viewport: self.graph.viewport,
+                    });
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+            "escape" => {
+                self.cancel_gestures();
+                self.graph.selected_nodes.clear();
+                self.graph.selected_connections.clear();
+                self.emit_selection(cx);
+                cx.notify();
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+            "c" if command => {
+                cx.emit(core::GraphEvent::NodesCopied {
+                    ids: self.graph.selected_nodes.iter().cloned().collect(),
+                });
+                cx.stop_propagation();
+            }
+            "v" if command => {
+                cx.emit(core::GraphEvent::NodesPasted {
+                    offset: core::Point::new(20.0, 20.0),
+                });
+                cx.stop_propagation();
+            }
+            "z" if command && shift => {
+                cx.emit(core::GraphEvent::Redo);
+                cx.stop_propagation();
+            }
+            "z" if command => {
+                cx.emit(core::GraphEvent::Undo);
+                cx.stop_propagation();
+            }
+            "g" if command => {
+                cx.emit(core::GraphEvent::GroupCreated {
+                    node_ids: self.graph.selected_nodes.iter().cloned().collect(),
+                });
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
+    }
 }
+
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Render
     for NodeGraph<T, N, P, C>
 {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let vp = self.graph.viewport.sanitized();
+        if self.focus_handle.is_none() {
+            self.focus_handle = Some(cx.focus_handle());
+        }
+        let focus_handle = self
+            .focus_handle
+            .as_ref()
+            .expect("focus handle was initialized")
+            .clone();
+        let viewport = self.graph.viewport.sanitized();
+
         let wires: Vec<_> = self
             .graph
             .connections
             .values()
-            .filter_map(|c| {
+            .filter_map(|connection| {
                 Some((
-                    self.graph.ports.get(&c.source)?.position,
-                    self.graph.ports.get(&c.target)?.position,
+                    self.graph.ports.get(&connection.source)?.position,
+                    self.graph.ports.get(&connection.target)?.position,
+                    self.graph.selected_connections.contains(&connection.id),
                 ))
             })
             .collect();
-        let color = rgb(self.theme.wire);
+        let draft = self.draft.as_ref().and_then(|draft| {
+            let source = self.graph.ports.get(&draft.origin)?.position;
+            let end = draft
+                .snap_target
+                .as_ref()
+                .and_then(|id| self.graph.ports.get(id))
+                .map(|port| viewport.world_to_screen(port.position))
+                .unwrap_or(draft.current_screen);
+            Some((source, end))
+        });
+        let wire_color: gpui::Hsla = rgb(self.theme.wire).into();
+        let selected_wire_color: gpui::Hsla = rgb(self.theme.wire_selected).into();
+        let draft_color: gpui::Hsla = rgb(self.theme.wire_draft).into();
+        let canvas_bounds = self.canvas_bounds.clone();
         let wire_layer = canvas(
-            |_, _, _| {},
-            move |_, _, window, _| {
-                for (a, b) in &wires {
-                    let a = vp.world_to_screen(*a);
-                    let b = vp.world_to_screen(*b);
-                    let mid = a.x * 0.5 + b.x * 0.5;
-                    let mut p = PathBuilder::stroke(px(2.));
-                    p.move_to(point(px(a.x), px(a.y)));
-                    p.line_to(point(px(mid), px(a.y)));
-                    p.line_to(point(px(mid), px(b.y)));
-                    p.line_to(point(px(b.x), px(b.y)));
-                    if let Ok(path) = p.build() {
-                        window.paint_path(path, color);
-                    }
+            move |bounds, _, _| {
+                canvas_bounds.set(bounds);
+            },
+            move |bounds, _, window, _| {
+                for (source, target, selected) in &wires {
+                    let a = viewport.world_to_screen(*source);
+                    let b = viewport.world_to_screen(*target);
+                    paint_elbow(
+                        window,
+                        bounds,
+                        a,
+                        b,
+                        if *selected {
+                            selected_wire_color
+                        } else {
+                            wire_color
+                        },
+                        if *selected { 3.0 } else { 2.0 },
+                    );
+                }
+                if let Some((source, end)) = draft {
+                    paint_elbow(
+                        window,
+                        bounds,
+                        viewport.world_to_screen(source),
+                        end,
+                        draft_color,
+                        2.0,
+                    );
                 }
             },
         )
         .absolute()
         .size_full();
+
         let mut root = div()
             .relative()
             .size_full()
             .overflow_hidden()
             .bg(rgb(self.theme.background))
+            .track_focus(&focus_handle)
+            .key_context("NodeGraph")
+            .on_key_down(cx.listener(Self::handle_key_down))
             .child(wire_layer);
-        for n in self.graph.nodes.values() {
-            let id = n.id.clone();
-            let pos = vp.world_to_screen(n.position);
+
+        for node in self.graph.nodes.values() {
+            let id = node.id.clone();
+            let position = viewport.world_to_screen(node.position);
             let selected = self.graph.selected_nodes.contains(&id);
-            let bg = if selected {
+            let background = if selected {
                 self.theme.node_selected
             } else {
                 self.theme.node
@@ -171,76 +783,460 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             root = root.child(
                 div()
                     .absolute()
-                    .left(px(pos.x))
-                    .top(px(pos.y))
-                    .w(px(vp.scale_length(n.size.width)))
-                    .h(px(vp.scale_length(n.size.height)))
+                    .left(px(position.x))
+                    .top(px(position.y))
+                    .w(px(viewport.scale_length(node.size.width)))
+                    .h(px(viewport.scale_length(node.size.height)))
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(0x52525b))
-                    .bg(rgb(bg))
+                    .bg(rgb(background))
                     .text_color(rgb(self.theme.text))
-                    .text_size(px(vp.scale_length(14.)))
-                    .p(px(vp.scale_length(8.)))
-                    .child(n.title.clone())
+                    .text_size(px(viewport.scale_length(14.0).clamp(8.0, 24.0)))
+                    .p(px(viewport.scale_length(8.0)))
+                    .child(node.title.clone())
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                            let screen = core::Point::new(e.position.x.into(), e.position.y.into());
-                            let world = this.graph.viewport.screen_to_world(screen);
-                            if let Some(node) = this.graph.nodes.get(&id) {
-                                this.drag = Some((id.clone(), world - node.position));
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            this.focus(window, cx);
+                            let cursor = this
+                                .graph
+                                .viewport
+                                .screen_to_world(this.local_screen(event.position));
+                            let before = (
+                                this.graph.selected_nodes.clone(),
+                                this.graph.selected_connections.clone(),
+                            );
+                            if event.modifiers.shift {
+                                if !this.graph.selected_nodes.remove(&id) {
+                                    this.graph.selected_nodes.insert(id.clone());
+                                }
+                            } else if !this.graph.selected_nodes.contains(&id) {
                                 this.graph.selected_nodes.clear();
+                                this.graph.selected_connections.clear();
                                 this.graph.selected_nodes.insert(id.clone());
-                                cx.emit(EditorEvent::SelectionChanged {
-                                    nodes: this.graph.selected_nodes.clone(),
-                                    connections: this.graph.selected_connections.clone(),
-                                });
-                                cx.notify();
+                            } else {
+                                this.graph.selected_connections.clear();
                             }
+                            if before
+                                != (
+                                    this.graph.selected_nodes.clone(),
+                                    this.graph.selected_connections.clone(),
+                                )
+                            {
+                                this.emit_selection(cx);
+                            }
+                            if this.graph.selected_nodes.contains(&id) {
+                                let offsets = this
+                                    .graph
+                                    .selected_nodes
+                                    .iter()
+                                    .filter_map(|selected_id| {
+                                        let node = this.graph.nodes.get(selected_id)?;
+                                        Some((selected_id.clone(), cursor - node.position))
+                                    })
+                                    .collect();
+                                this.drag = Some(NodeDrag {
+                                    offsets,
+                                    moved: false,
+                                });
+                            }
+                            cx.notify();
                         }),
                     ),
-            )
+            );
         }
+
+        for port in self.graph.ports.values() {
+            let id = port.id.clone();
+            let position = viewport.world_to_screen(port.position);
+            let connected = self
+                .graph
+                .connections
+                .values()
+                .any(|connection| connection.source == port.id || connection.target == port.id);
+            let is_source = self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.origin == port.id);
+            let is_snap = self
+                .draft
+                .as_ref()
+                .and_then(|draft| draft.snap_target.as_ref())
+                == Some(&port.id);
+            let compatible = self.draft.as_ref().is_some_and(|draft| {
+                self.normalized_connection(&draft.origin, &port.id)
+                    .is_some()
+            });
+            let color = if is_source || is_snap || compatible {
+                self.theme.port_compatible
+            } else if connected {
+                self.theme.port_connected
+            } else if port.direction == PortDirection::Input {
+                self.theme.port_input
+            } else {
+                self.theme.port_output
+            };
+            let label_x = if port.direction == PortDirection::Input {
+                position.x + 9.0
+            } else {
+                position.x - 89.0
+            };
+            root = root
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(label_x))
+                        .top(px(position.y - 8.0))
+                        .w(px(80.0))
+                        .text_size(px(11.0))
+                        .text_color(rgb(self.theme.text))
+                        .when(port.direction == PortDirection::Output, |element| {
+                            element.text_right()
+                        })
+                        .child(port.label.clone()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(position.x - 7.0))
+                        .top(px(position.y - 7.0))
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(self.theme.text))
+                        .bg(rgb(color))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let id = id.clone();
+                                move |this, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    this.focus(window, cx);
+                                    if this.draft.as_ref().is_some_and(|draft| draft.origin != id)
+                                        && this.finish_draft(&id, cx)
+                                    {
+                                        return;
+                                    }
+                                    if this.draft.is_none() {
+                                        this.start_draft(&id, cx);
+                                    }
+                                }
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                                cx.stop_propagation();
+                                if this.draft.as_ref().is_some_and(|draft| draft.origin != id) {
+                                    this.finish_draft(&id, cx);
+                                }
+                            }),
+                        ),
+                );
+        }
+
+        if let Some(selection) = &self.box_selection {
+            let rect = selection.rect();
+            let top_left = viewport.world_to_screen(rect.origin);
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(top_left.x))
+                    .top(px(top_left.y))
+                    .w(px(viewport.scale_length(rect.size.width)))
+                    .h(px(viewport.scale_length(rect.size.height)))
+                    .border_1()
+                    .border_color(rgb(self.theme.selection_border))
+                    .bg(rgb(self.theme.selection_fill)),
+            );
+        }
+
+        if let Some(menu) = self.catalog_menu.as_ref() {
+            let anchor = viewport.world_to_screen(menu.anchor_world);
+            let selected = menu.selected;
+            let query = menu.query.clone();
+            let filtered = self.filtered_catalog_indices();
+            let mut menu_element = div()
+                .absolute()
+                .left(px(anchor.x))
+                .top(px(anchor.y))
+                .w(px(280.0))
+                .max_h(px(360.0))
+                .overflow_hidden()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x52525b))
+                .bg(rgb(0x202023))
+                .text_color(rgb(self.theme.text))
+                .p_2()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .pb_2()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xa1a1aa))
+                        .child(if query.is_empty() {
+                            "Create node · type to search".to_string()
+                        } else {
+                            format!("Search: {query}")
+                        }),
+                );
+            if filtered.is_empty() {
+                menu_element = menu_element
+                    .child(div().p_2().text_size(px(12.0)).child("No compatible nodes"));
+            }
+            for (row, item_index) in filtered.into_iter().take(8).enumerate() {
+                let item = &self.catalog[item_index];
+                let item_id = item_index;
+                let subtitle = if item.description.is_empty() {
+                    item.category.clone()
+                } else {
+                    format!("{} · {}", item.category, item.description)
+                };
+                menu_element = menu_element.child(
+                    div()
+                        .rounded_sm()
+                        .px_2()
+                        .py_1()
+                        .when(row == selected, |element| element.bg(rgb(0x3f3f46)))
+                        .child(div().text_size(px(13.0)).child(item.label.clone()))
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(0xa1a1aa))
+                                .child(subtitle),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.choose_catalog(item_id, cx);
+                            }),
+                        ),
+                );
+            }
+            root = root.child(menu_element);
+        }
+
         root.on_mouse_down(
             MouseButton::Middle,
-            cx.listener(|this, e: &MouseDownEvent, _, _| {
-                this.panning = Some(core::Point::new(e.position.x.into(), e.position.y.into()))
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.focus(window, cx);
+                this.panning = Some(this.local_screen(event.position));
+                cx.stop_propagation();
+                window.prevent_default();
             }),
         )
-        .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-            let s = core::Point::new(e.position.x.into(), e.position.y.into());
-            if let Some(last) = this.panning.as_mut() {
-                let previous = *last;
-                *last = s;
-                if this.graph.viewport.pan_between(previous, s) {
-                    cx.emit(EditorEvent::ViewportChanged {
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.focus(window, cx);
+                let local = this.local_screen(event.position);
+                if event.click_count >= 2 {
+                    this.open_catalog(local, None);
+                    cx.notify();
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
+                this.catalog_menu = None;
+                if event.modifiers.control {
+                    this.panning = Some(local);
+                    this.box_selection = None;
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
+                let before = (
+                    this.graph.selected_nodes.clone(),
+                    this.graph.selected_connections.clone(),
+                );
+                if let Some(connection) = this.connection_at(local, 7.0) {
+                    if event.modifiers.shift {
+                        if !this.graph.selected_connections.remove(&connection) {
+                            this.graph.selected_connections.insert(connection);
+                        }
+                    } else {
+                        this.graph.selected_nodes.clear();
+                        this.graph.selected_connections.clear();
+                        this.graph.selected_connections.insert(connection);
+                    }
+                    this.box_selection = None;
+                } else {
+                    let start = this.graph.viewport.screen_to_world(local);
+                    let (baseline_nodes, baseline_connections) = if event.modifiers.shift {
+                        (
+                            this.graph.selected_nodes.clone(),
+                            this.graph.selected_connections.clone(),
+                        )
+                    } else {
+                        this.graph.selected_nodes.clear();
+                        this.graph.selected_connections.clear();
+                        (HashSet::new(), HashSet::new())
+                    };
+                    this.box_selection = Some(BoxSelection {
+                        start,
+                        current: start,
+                        baseline_nodes,
+                        baseline_connections,
+                    });
+                }
+                if before
+                    != (
+                        this.graph.selected_nodes.clone(),
+                        this.graph.selected_connections.clone(),
+                    )
+                {
+                    this.emit_selection(cx);
+                }
+                cx.notify();
+                window.prevent_default();
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            let local = this.local_screen(event.position);
+            if let Some(previous) = this.panning.as_mut() {
+                let old = *previous;
+                *previous = local;
+                if this.graph.viewport.pan_between(old, local) {
+                    cx.emit(core::GraphEvent::ViewportChanged {
                         viewport: this.graph.viewport,
                     });
                     cx.notify();
                 }
             }
-            if let Some((id, off)) = this.drag.clone() {
-                let position = this.graph.viewport.screen_to_world(s) - off;
-                if let Some(GraphEvent::NodesMoved { nodes }) = this.graph.move_node(&id, position)
-                {
-                    for (id, position) in nodes {
-                        cx.emit(EditorEvent::NodeMoved { id, position });
+
+            if let Some(drag) = this.drag.clone() {
+                let cursor = this.graph.viewport.screen_to_world(local);
+                let updates: Vec<_> = drag
+                    .offsets
+                    .iter()
+                    .map(|(id, offset)| {
+                        let mut position = cursor - *offset;
+                        if let Some(grid) = this.config.grid_size.filter(|grid| *grid > 0.0) {
+                            position.x = (position.x / grid).round() * grid;
+                            position.y = (position.y / grid).round() * grid;
+                        }
+                        (id.clone(), position)
+                    })
+                    .collect();
+                if this.graph.move_nodes(&updates).is_some() {
+                    if let Some(active) = this.drag.as_mut() {
+                        active.moved = true;
                     }
                     cx.notify();
                 }
             }
+
+            if let Some(selection) = this.box_selection.as_mut() {
+                selection.current = this.graph.viewport.screen_to_world(local);
+                let mut nodes = this.graph.nodes_in_rect(selection.rect());
+                nodes.extend(selection.baseline_nodes.iter().cloned());
+                let before = this.graph.selected_nodes.clone();
+                this.graph.selected_nodes = nodes;
+                this.graph.selected_connections = selection.baseline_connections.clone();
+                if before != this.graph.selected_nodes {
+                    this.emit_selection(cx);
+                }
+                cx.notify();
+            }
+
+            if let Some(origin) = this.draft.as_ref().map(|draft| draft.origin.clone()) {
+                let snap_target = this.nearest_compatible_port(&origin, local);
+                if let Some(draft) = this.draft.as_mut() {
+                    if draft.current_screen.distance(local) > 2.0 {
+                        draft.moved = true;
+                    }
+                    draft.current_screen = local;
+                    draft.snap_target = snap_target;
+                }
+                cx.notify();
+            }
         }))
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|this, _, _, _| {
-                this.drag = None;
-            }),
+            cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_left_gesture(cx)),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_left_gesture(cx)),
         )
         .on_mouse_up(
             MouseButton::Middle,
-            cx.listener(|this, _, _, _| this.panning = None),
+            cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
         )
+        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+            let delta = event.delta.pixel_delta(window.line_height());
+            let factor = if f32::from(delta.y) < 0.0 {
+                this.config.zoom_step.exp()
+            } else {
+                (-this.config.zoom_step).exp()
+            };
+            let local = this.local_screen(event.position);
+            let previous = this.graph.viewport;
+            this.graph
+                .viewport
+                .zoom_at(local, factor, this.config.min_zoom, this.config.max_zoom);
+            if this.graph.viewport != previous {
+                cx.emit(core::GraphEvent::ViewportChanged {
+                    viewport: this.graph.viewport,
+                });
+                cx.notify();
+            }
+            cx.stop_propagation();
+            window.prevent_default();
+        }))
+    }
+}
+
+fn distance_to_segment(point: core::Point, start: core::Point, end: core::Point) -> f32 {
+    let segment = end - start;
+    let length_squared = segment.x * segment.x + segment.y * segment.y;
+    if length_squared <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let offset = point - start;
+    let t = ((offset.x * segment.x + offset.y * segment.y) / length_squared).clamp(0.0, 1.0);
+    point.distance(core::Point::new(
+        start.x + segment.x * t,
+        start.y + segment.y * t,
+    ))
+}
+
+fn paint_elbow(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    start: core::Point,
+    end: core::Point,
+    color: gpui::Hsla,
+    width: f32,
+) {
+    let mid = start.x * 0.5 + end.x * 0.5;
+    let mut path = PathBuilder::stroke(px(width));
+    path.move_to(point(
+        bounds.origin.x + px(start.x),
+        bounds.origin.y + px(start.y),
+    ));
+    path.line_to(point(
+        bounds.origin.x + px(mid),
+        bounds.origin.y + px(start.y),
+    ));
+    path.line_to(point(
+        bounds.origin.x + px(mid),
+        bounds.origin.y + px(end.y),
+    ));
+    path.line_to(point(
+        bounds.origin.x + px(end.x),
+        bounds.origin.y + px(end.y),
+    ));
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
     }
 }
 
@@ -262,5 +1258,162 @@ mod tests {
         graph.viewport.zoom = 0.0;
         assert!(NodeGraph::try_new(graph.clone()).is_err());
         assert!(std::panic::catch_unwind(|| NodeGraph::new(graph)).is_err());
+    }
+
+    fn interactive_graph() -> GraphState<String, String, String, Kind> {
+        let mut graph = GraphState::default();
+        for (id, x) in [("a", 0.0), ("b", 100.0)] {
+            graph.nodes.insert(
+                id.into(),
+                Node {
+                    id: id.into(),
+                    title: id.into(),
+                    position: core::Point::new(x, 0.0),
+                    size: core::Size {
+                        width: 50.0,
+                        height: 50.0,
+                    },
+                },
+            );
+        }
+        graph.ports.insert(
+            "out".into(),
+            Port {
+                id: "out".into(),
+                node: "a".into(),
+                label: "Out".into(),
+                direction: PortDirection::Output,
+                kind: Kind,
+                position: core::Point::new(50.0, 25.0),
+            },
+        );
+        graph.ports.insert(
+            "in".into(),
+            Port {
+                id: "in".into(),
+                node: "b".into(),
+                label: "In".into(),
+                direction: PortDirection::Input,
+                kind: Kind,
+                position: core::Point::new(100.0, 25.0),
+            },
+        );
+        graph.connections.insert(
+            "wire".into(),
+            Connection {
+                id: "wire".into(),
+                source: "out".into(),
+                target: "in".into(),
+            },
+        );
+        graph
+    }
+
+    #[test]
+    fn draft_normalizes_direction_and_snaps_in_screen_pixels() {
+        let editor = NodeGraph::new(interactive_graph());
+        assert_eq!(
+            editor.normalized_connection(&"in".into(), &"out".into()),
+            Some(("out".into(), "in".into()))
+        );
+        assert_eq!(
+            editor.nearest_compatible_port(&"out".into(), core::Point::new(102.0, 25.0)),
+            Some("in".into())
+        );
+        assert_eq!(
+            editor.nearest_compatible_port(&"out".into(), core::Point::new(200.0, 25.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn catalog_filters_search_and_draft_compatibility() {
+        let mut editor = NodeGraph::new(interactive_graph()).with_catalog(vec![
+            NodeCatalogItem {
+                id: "sink".into(),
+                label: "Number Sink".into(),
+                category: "Output".into(),
+                description: "Consumes values".into(),
+                keywords: vec!["final".into()],
+                ports: vec![CatalogPort {
+                    id: "value".into(),
+                    label: "Value".into(),
+                    direction: PortDirection::Input,
+                    kind: Kind,
+                }],
+            },
+            NodeCatalogItem {
+                id: "source".into(),
+                label: "Source".into(),
+                category: "Input".into(),
+                description: String::new(),
+                keywords: Vec::new(),
+                ports: vec![CatalogPort {
+                    id: "value".into(),
+                    label: "Value".into(),
+                    direction: PortDirection::Output,
+                    kind: Kind,
+                }],
+            },
+        ]);
+        editor.catalog_menu = Some(CatalogMenu {
+            anchor_world: core::Point::default(),
+            query: "final".into(),
+            selected: 0,
+            connect_from: Some("out".into()),
+        });
+        assert_eq!(editor.filtered_catalog_indices(), vec![0]);
+        editor.catalog_menu.as_mut().unwrap().query = "source".into();
+        assert!(editor.filtered_catalog_indices().is_empty());
+    }
+
+    #[test]
+    fn connection_hit_testing_and_fit_use_render_coordinates() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        assert_eq!(
+            editor.connection_at(core::Point::new(75.0, 27.0), 3.0),
+            Some("wire".into())
+        );
+        editor.canvas_bounds.set(Bounds {
+            origin: point(px(20.0), px(30.0)),
+            size: gpui::size(px(500.0), px(300.0)),
+        });
+        assert!(editor.fit_view());
+        assert!(editor.graph.viewport.is_valid());
+        assert!(editor.graph.viewport.zoom <= editor.config.fit_max_zoom);
+    }
+
+    #[test]
+    fn box_selection_rect_normalizes_drag_direction() {
+        let selection = BoxSelection::<String, String> {
+            start: core::Point::new(20.0, 30.0),
+            current: core::Point::new(5.0, 10.0),
+            baseline_nodes: HashSet::new(),
+            baseline_connections: HashSet::new(),
+        };
+        assert_eq!(
+            selection.rect(),
+            core::Rect {
+                origin: core::Point::new(5.0, 10.0),
+                size: core::Size {
+                    width: 15.0,
+                    height: 20.0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn segment_hit_distance_handles_degenerate_and_projected_points() {
+        let start = core::Point::new(0.0, 0.0);
+        let end = core::Point::new(10.0, 0.0);
+        assert_eq!(
+            distance_to_segment(core::Point::new(4.0, 3.0), start, end),
+            3.0
+        );
+        assert_eq!(
+            distance_to_segment(core::Point::new(4.0, 3.0), start, start),
+            5.0
+        );
     }
 }
