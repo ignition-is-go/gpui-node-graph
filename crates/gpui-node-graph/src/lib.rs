@@ -69,6 +69,16 @@ pub struct NodeOverlay {
     /// viewport-scaled, so retained controls keep normal GPUI hit testing.
     pub offset: core::Point,
     pub element: AnyElement,
+    pub behavior: Option<OverlayBehavior>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayBehavior {
+    pub id: String,
+    pub estimated_size: core::Size,
+    pub flip_horizontal: bool,
+    pub clamp_to_canvas: bool,
+    pub dismiss_on_escape: bool,
 }
 
 impl NodeOverlay {
@@ -76,7 +86,24 @@ impl NodeOverlay {
         Self {
             offset,
             element: element.into_any_element(),
+            behavior: None,
         }
+    }
+
+    pub fn adaptive(mut self, id: impl Into<String>, estimated_size: core::Size) -> Self {
+        self.behavior = Some(OverlayBehavior {
+            id: id.into(),
+            estimated_size,
+            flip_horizontal: true,
+            clamp_to_canvas: true,
+            dismiss_on_escape: true,
+        });
+        self
+    }
+
+    pub fn with_behavior(mut self, behavior: OverlayBehavior) -> Self {
+        self.behavior = Some(behavior);
+        self
     }
 }
 
@@ -510,6 +537,8 @@ pub struct NodeGraph<
     groups: Vec<GraphGroup<N>>,
     render_geometry: RenderGeometry<N, P>,
     dangling_connections: Vec<DanglingConnection<P, C>>,
+    dismissed_overlays: HashSet<String>,
+    active_dismissible_overlays: HashSet<String>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -553,6 +582,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             groups: Vec::new(),
             render_geometry: RenderGeometry::default(),
             dangling_connections: Vec::new(),
+            dismissed_overlays: HashSet::new(),
+            active_dismissible_overlays: HashSet::new(),
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -686,6 +717,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     pub fn clear_dangling_connections(&mut self, cx: &mut Context<Self>) {
         if !self.dangling_connections.is_empty() {
             self.dangling_connections.clear();
+            cx.notify();
+        }
+    }
+
+    pub fn dismiss_overlay(&mut self, id: impl Into<String>, cx: &mut Context<Self>) {
+        if self.dismissed_overlays.insert(id.into()) {
+            cx.notify();
+        }
+    }
+
+    pub fn reopen_overlay(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.dismissed_overlays.remove(id) {
             cx.notify();
         }
     }
@@ -1304,10 +1347,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 window.prevent_default();
             }
             "escape" => {
-                self.cancel_gestures();
-                self.graph.selected_nodes.clear();
-                self.graph.selected_connections.clear();
-                self.emit_selection(cx);
+                if !self.active_dismissible_overlays.is_empty() {
+                    self.dismissed_overlays
+                        .extend(self.active_dismissible_overlays.drain());
+                } else {
+                    self.cancel_gestures();
+                    self.graph.selected_nodes.clear();
+                    self.graph.selected_connections.clear();
+                    self.emit_selection(cx);
+                }
                 cx.notify();
                 cx.stop_propagation();
                 window.prevent_default();
@@ -1474,6 +1522,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         root = root.child(wire_layer);
 
         let mut node_overlays = Vec::new();
+        self.active_dismissible_overlays.clear();
         let mut body_anchored_nodes = HashSet::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
@@ -1515,12 +1564,30 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             if body.ports == PortPresentation::BodyAnchors {
                 body_anchored_nodes.insert(id.clone());
             }
-            node_overlays.extend(body.overlays.drain(..).map(|overlay| {
-                (
-                    core::Point::new(position.x + overlay.offset.x, position.y + overlay.offset.y),
-                    overlay.element,
-                )
-            }));
+            for overlay in body.overlays.drain(..) {
+                let mut overlay_position =
+                    core::Point::new(position.x + overlay.offset.x, position.y + overlay.offset.y);
+                if let Some(behavior) = &overlay.behavior {
+                    if self.dismissed_overlays.contains(&behavior.id) {
+                        continue;
+                    }
+                    if behavior.dismiss_on_escape {
+                        self.active_dismissible_overlays.insert(behavior.id.clone());
+                    }
+                    let canvas = self.canvas_bounds.get();
+                    overlay_position = resolve_overlay_position(
+                        position,
+                        viewport.scale_length(node.size.width),
+                        overlay.offset,
+                        behavior,
+                        core::Size {
+                            width: f32::from(canvas.size.width),
+                            height: f32::from(canvas.size.height),
+                        },
+                    );
+                }
+                node_overlays.push((overlay_position, overlay.element));
+            }
             let background = if selected {
                 self.theme.node_selected
             } else {
@@ -2057,6 +2124,34 @@ fn distance_to_segment(point: core::Point, start: core::Point, end: core::Point)
     ))
 }
 
+fn resolve_overlay_position(
+    node_origin: core::Point,
+    node_width: f32,
+    offset: core::Point,
+    behavior: &OverlayBehavior,
+    canvas_size: core::Size,
+) -> core::Point {
+    let mut position = node_origin + offset;
+    if behavior.flip_horizontal
+        && canvas_size.width > 0.0
+        && position.x + behavior.estimated_size.width > canvas_size.width
+    {
+        let gap = (offset.x - node_width).max(0.0);
+        position.x = node_origin.x - behavior.estimated_size.width - gap;
+    }
+    if behavior.clamp_to_canvas && canvas_size.width > 0.0 && canvas_size.height > 0.0 {
+        position.x = position.x.clamp(
+            0.0,
+            (canvas_size.width - behavior.estimated_size.width).max(0.0),
+        );
+        position.y = position.y.clamp(
+            0.0,
+            (canvas_size.height - behavior.estimated_size.height).max(0.0),
+        );
+    }
+    position
+}
+
 fn paint_route(
     window: &mut Window,
     bounds: Bounds<Pixels>,
@@ -2331,6 +2426,33 @@ mod tests {
         assert_eq!(
             editor.connection_at(core::Point::new(125.0, -16.0), 4.0),
             Some("wire".into())
+        );
+    }
+
+    #[test]
+    fn adaptive_overlay_flips_and_clamps_to_canvas() {
+        let behavior = OverlayBehavior {
+            id: "menu".into(),
+            estimated_size: core::Size {
+                width: 100.0,
+                height: 50.0,
+            },
+            flip_horizontal: true,
+            clamp_to_canvas: true,
+            dismiss_on_escape: true,
+        };
+        assert_eq!(
+            resolve_overlay_position(
+                core::Point::new(250.0, 280.0),
+                50.0,
+                core::Point::new(60.0, 0.0),
+                &behavior,
+                core::Size {
+                    width: 300.0,
+                    height: 300.0,
+                },
+            ),
+            core::Point::new(140.0, 250.0)
         );
     }
 

@@ -459,7 +459,8 @@ fn launch(cx: &mut App) {
                                                 window.prevent_default();
                                             },
                                         ),
-                                ))
+                                )
+                                .adaptive("blend-controls", Size { width: 112.0, height: 54.0 }))
                             } else {
                                 body
                             }
