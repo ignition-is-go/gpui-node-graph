@@ -28,6 +28,16 @@ pub enum PortPresentation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DanglingConnection<P, C> {
+    pub id: C,
+    pub source: P,
+    pub target: P,
+    pub missing_port: P,
+    pub source_position: core::Point,
+    pub target_position: core::Point,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderGeometry<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> {
     port_offsets: HashMap<P, (N, core::Point)>,
 }
@@ -499,6 +509,7 @@ pub struct NodeGraph<
     node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
     groups: Vec<GraphGroup<N>>,
     render_geometry: RenderGeometry<N, P>,
+    dangling_connections: Vec<DanglingConnection<P, C>>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -541,6 +552,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             node_body_renderer: None,
             groups: Vec::new(),
             render_geometry: RenderGeometry::default(),
+            dangling_connections: Vec::new(),
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -613,6 +625,69 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     pub fn invalidate_render_geometry(&mut self, cx: &mut Context<Self>) {
         self.render_geometry = RenderGeometry::default();
         cx.notify();
+    }
+
+    pub fn dangling_connections(&self) -> &[DanglingConnection<P, C>] {
+        &self.dangling_connections
+    }
+
+    /// Remove a dynamic port without weakening snapshot validation. Connections touching the
+    /// port are removed from the strict graph and retained only as transient visual tombstones.
+    pub fn remove_port_with_tombstones(&mut self, id: &P, cx: &mut Context<Self>) -> bool {
+        let Some(removed_connections) = self.remove_port_to_tombstones(id) else {
+            return false;
+        };
+        for id in removed_connections {
+            cx.emit(core::GraphEvent::ConnectionRemoved { id });
+        }
+        cx.notify();
+        true
+    }
+
+    fn remove_port_to_tombstones(&mut self, id: &P) -> Option<Vec<C>> {
+        if !self.graph.ports.contains_key(id) {
+            return None;
+        }
+        let mut affected: Vec<_> = self
+            .graph
+            .connections
+            .values()
+            .filter(|connection| connection.source == *id || connection.target == *id)
+            .cloned()
+            .collect();
+        affected.sort_by_cached_key(|connection| format!("{:?}", connection.id));
+        let mut removed_connections = Vec::with_capacity(affected.len());
+        for connection in affected {
+            let Some(source_position) = self.resolved_port_position(&connection.source) else {
+                continue;
+            };
+            let Some(target_position) = self.resolved_port_position(&connection.target) else {
+                continue;
+            };
+            self.graph.connections.remove(&connection.id);
+            self.graph.selected_connections.remove(&connection.id);
+            self.dangling_connections
+                .retain(|tombstone| tombstone.id != connection.id);
+            self.dangling_connections.push(DanglingConnection {
+                id: connection.id.clone(),
+                source: connection.source,
+                target: connection.target,
+                missing_port: id.clone(),
+                source_position,
+                target_position,
+            });
+            removed_connections.push(connection.id);
+        }
+        self.graph.ports.remove(id);
+        self.render_geometry.port_offsets.remove(id);
+        Some(removed_connections)
+    }
+
+    pub fn clear_dangling_connections(&mut self, cx: &mut Context<Self>) {
+        if !self.dangling_connections.is_empty() {
+            self.dangling_connections.clear();
+            cx.notify();
+        }
     }
 
     pub fn upsert_group(&mut self, group: GraphGroup<N>, cx: &mut Context<Self>) {
@@ -719,6 +794,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.render_geometry.port_offsets.retain(|port, (node, _)| {
             self.graph.ports.contains_key(port) && self.graph.nodes.contains_key(node)
         });
+        self.dangling_connections
+            .retain(|connection| !self.graph.ports.contains_key(&connection.missing_port));
         self.cancel_gestures();
         cx.emit(core::GraphEvent::GraphReconciled);
         self.emit_selection(cx);
@@ -748,6 +825,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.render_geometry.port_offsets.retain(|port, (node, _)| {
             self.graph.ports.contains_key(port) && self.graph.nodes.contains_key(node)
         });
+        self.dangling_connections
+            .retain(|connection| !self.graph.ports.contains_key(&connection.missing_port));
         for event in events {
             cx.emit(event);
         }
@@ -1278,7 +1357,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .clone();
         let viewport = self.graph.viewport.sanitized();
 
-        let wires: Vec<_> = self
+        let mut wires: Vec<_> = self
             .graph
             .connections
             .values()
@@ -1286,9 +1365,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 Some((
                     self.connection_route(connection)?,
                     self.graph.selected_connections.contains(&connection.id),
+                    false,
                 ))
             })
             .collect();
+        wires.extend(self.dangling_connections.iter().map(|connection| {
+            let source = self
+                .resolved_port_position(&connection.source)
+                .unwrap_or(connection.source_position);
+            let target = self
+                .resolved_port_position(&connection.target)
+                .unwrap_or(connection.target_position);
+            (core::orthogonal_route(source, target), false, true)
+        }));
         let draft = self.draft.as_ref().and_then(|draft| {
             let source = self.resolved_port_position(&draft.origin)?;
             let end = draft
@@ -1302,23 +1391,26 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let wire_color: gpui::Hsla = rgb(self.theme.wire).into();
         let selected_wire_color: gpui::Hsla = rgb(self.theme.wire_selected).into();
         let draft_color: gpui::Hsla = rgb(self.theme.wire_draft).into();
+        let dangling_color: gpui::Hsla = rgb(0xef4444).into();
         let canvas_bounds = self.canvas_bounds.clone();
         let wire_layer = canvas(
             move |bounds, _, _| {
                 canvas_bounds.set(bounds);
             },
             move |bounds, _, window, _| {
-                for (route, selected) in &wires {
+                for (route, selected, dangling) in &wires {
                     paint_route(
                         window,
                         bounds,
                         route.iter().map(|point| viewport.world_to_screen(*point)),
-                        if *selected {
+                        if *dangling {
+                            dangling_color
+                        } else if *selected {
                             selected_wire_color
                         } else {
                             wire_color
                         },
-                        if *selected { 3.0 } else { 2.0 },
+                        if *selected || *dangling { 3.0 } else { 2.0 },
                     );
                 }
                 if let Some((source, end)) = draft {
@@ -2239,6 +2331,22 @@ mod tests {
         assert_eq!(
             editor.connection_at(core::Point::new(125.0, -16.0), 4.0),
             Some("wire".into())
+        );
+    }
+
+    #[test]
+    fn dynamic_port_removal_uses_transient_tombstones_and_keeps_graph_strict() {
+        let mut editor = NodeGraph::new(interactive_graph());
+        let removed = editor.remove_port_to_tombstones(&"out".into()).unwrap();
+        assert_eq!(removed, vec![String::from("wire")]);
+        assert!(!editor.graph.ports.contains_key("out"));
+        assert!(editor.graph.connections.is_empty());
+        editor.graph.validate().unwrap();
+        assert_eq!(editor.dangling_connections.len(), 1);
+        assert_eq!(editor.dangling_connections[0].missing_port, "out");
+        assert_eq!(
+            editor.dangling_connections[0].source_position,
+            core::Point::new(50.0, 25.0)
         );
     }
 

@@ -414,23 +414,12 @@ fn launch(cx: &mut App) {
                                                                             && id.contains(
                                                                                 ".dynamic-",
                                                                             )
-                                                                            && !editor
-                                                                                .graph
-                                                                                .connections
-                                                                                .values()
-                                                                                .any(|connection| {
-                                                                                    connection.source
-                                                                                        == **id
-                                                                                        || connection
-                                                                                            .target
-                                                                                            == **id
-                                                                                })
                                                                     })
                                                                     .map(|(id, _)| id.clone())
                                                                     .collect();
                                                                 candidates.sort();
                                                                 if let Some(id) = candidates.pop() {
-                                                                    editor.graph.ports.remove(&id);
+                                                                    editor.remove_port_with_tombstones(&id, cx);
                                                                     if let Some(node) = editor
                                                                         .graph
                                                                         .nodes
