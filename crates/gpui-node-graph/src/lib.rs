@@ -724,11 +724,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     pub fn resolved_node_size(&self, id: &N) -> Option<core::Size> {
-        self.render_geometry
-            .node_sizes
-            .get(id)
-            .copied()
-            .or_else(|| self.graph.nodes.get(id).map(|node| node.size))
+        let node = self.graph.nodes.get(id)?;
+        Some(core::Size {
+            // Width is model-owned and explicitly resizable. Feeding a width measured under
+            // that same constraint back into the shell creates a destructive shrink loop.
+            width: node.size.width,
+            height: self
+                .render_geometry
+                .node_sizes
+                .get(id)
+                .map_or(node.size.height, |measured| {
+                    measured.height.max(node.size.height)
+                }),
+        })
     }
 
     pub fn resolved_port_position(&self, id: &P) -> Option<core::Point> {
@@ -2247,7 +2255,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let body_element = if has_custom_body {
                 MeasuredElement::new(raw_body_element, move |bounds, cx| {
                     let measured = core::Size {
-                        width: f32::from(bounds.size.width) / viewport.zoom + 16.0,
+                        width: model_size.width,
                         height: f32::from(bounds.size.height) / viewport.zoom + 16.0,
                     };
                     if !measured.width.is_finite()
@@ -3320,7 +3328,7 @@ mod tests {
         assert_eq!(
             editor.resolved_node_size(&"a".into()),
             Some(core::Size {
-                width: 80.0,
+                width: 50.0,
                 height: 90.0,
             })
         );

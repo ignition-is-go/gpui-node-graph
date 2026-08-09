@@ -645,11 +645,14 @@ fn browser_test_state() -> String {
             application.update(|cx| {
                 let graph = graph.read(cx);
                 format!(
-                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{}}}"#,
+                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{}}}"#,
                     graph.graph.nodes.len(),
                     graph.catalog_is_open(),
                     graph.is_overlay_dismissed("blend-controls"),
                     graph.graph.viewport.zoom,
+                    graph
+                        .resolved_node_size(&String::from("source"))
+                        .map_or(0.0, |size| size.width),
                 )
             })
         })

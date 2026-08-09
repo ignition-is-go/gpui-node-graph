@@ -115,6 +115,9 @@ async function waitFor(label, predicate) {
 }
 
 const baseline = await graphState();
+if (baseline.sourceWidth < 100) {
+  throw new Error(`node width collapsed before interaction trace: ${JSON.stringify(baseline)}`);
+}
 await click();
 await key("Tab", "Tab");
 await waitFor("catalog opening", (value) => value.catalogOpen);
@@ -130,6 +133,11 @@ await command("Input.dispatchMouseEvent", {
   type: "mouseWheel", x, y, deltaX: 0, deltaY: -180,
 });
 const zoomed = await waitFor("pointer zoom", (value) => value.zoom !== created.zoom);
+await pause(1_000);
+const stable = await graphState();
+if (Math.abs(stable.sourceWidth - baseline.sourceWidth) > 0.1) {
+  throw new Error(`node width changed across retained frames: ${JSON.stringify({ baseline, stable })}`);
+}
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
