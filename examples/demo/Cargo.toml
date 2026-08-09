@@ -7,3 +7,5 @@ license.workspace=true
 gpui.workspace=true
 gpui-node-graph.workspace=true
 node-graph-core.workspace=true
+
+gpui_platform.workspace=true

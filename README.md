@@ -1,21 +1,23 @@
 # gpui-node-graph
 
-Native, cross-platform node graph editor for **GPUI 0.2.2**. This is the standalone replacement for the browser/Leptos graph used during the Rship desktop migration; it does not depend on Leptos, WASM, a DOM, or a browser runtime.
+Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries/zed@08827f9208b4848d62f3faf86ffa15155966d63c`. This is the standalone replacement for the browser/Leptos graph used during the Rship desktop migration; it does not depend on Leptos, WASM, a DOM, or a browser runtime.
 
 ## Status
 
-The initial production foundation includes a serde-compatible framework-free model, typed port compatibility, geometry/viewport and selection queries, deterministic orthogonal routes, a native GPUI view, painted connections, positioned nodes, selection, node dragging with events, and middle-button panning. The demo runs on Windows, macOS and Linux.
+The initial production foundation includes a serde-compatible framework-free model, typed port compatibility, geometry/viewport and selection queries, deterministic orthogonal routes, a native GPUI view, painted connections, positioned nodes, selection, node dragging with events, and middle-button panning. The same view code runs on Windows, macOS, Linux, and WebAssembly.
 
 ```sh
 cargo run -p gpui-node-graph-demo
 cargo test --workspace
+# Browser host (requires Trunk)
+cd examples/demo && trunk serve
 ```
 
 ## Architecture
 
 - `node-graph-core`: canonical serializable model and deterministic logic. Keep persisted Rship graph DTOs here; UI state must not leak into serialization.
 - `gpui-node-graph`: native retained-mode view and input adapter. Consumers own/reconcile domain data and can subscribe to `EditorEvent`.
-- `examples/demo`: minimal native smoke application.
+- `examples/demo`: shared GPUI application with thin target-specific desktop/browser packaging. `gpui_platform::application()` selects the backend.
 
 All saved-model migrations belong in core and must have fixture round-trip tests. Leptos is a behavior/serialization reference during migration only, not a co-maintained target.
 
@@ -31,9 +33,10 @@ All saved-model migrations belong in core and must have fixture round-trip tests
 - [ ] groups, resizing, overlays, culling and keyboard actions
 - [ ] Rship persisted-graph fixtures and full interaction replay tests
 - [ ] visual regression/performance suite
+- [x] one-window browser architecture and native-only detached-window capability boundary
 
 ## Platform support
 
-First-class Windows, macOS and Linux are checked in CI. Platform-specific behavior must be isolated behind GPUI APIs; browser-only behavior is intentionally out of scope.
+First-class Windows, macOS, Linux, and `wasm32-unknown-unknown` builds are checked in CI. The browser has exactly **one document-owned GPUI window**; Mullion composes every pane and workspace inside that root. `PlatformWindowService` is the only optional detached-window gateway: native builds may open an OS window, while wasm returns `DetachedWindowError::UnavailableInBrowser` without changing shared view code. Browser launch/HTML/COOP+COEP packaging is isolated in the demo host.
 
 Licensed under Apache-2.0.

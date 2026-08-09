@@ -1,5 +1,5 @@
 use gpui::prelude::*;
-use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_node_graph::{NodeGraph, core::*};
 #[derive(Clone, Debug, PartialEq)]
 enum Kind {
@@ -11,7 +11,9 @@ impl PortType for Kind {
     }
 }
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    #[cfg(target_family = "wasm")]
+    gpui_platform::web_init();
+    gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1000.), px(700.)), cx);
         cx.open_window(
             WindowOptions {

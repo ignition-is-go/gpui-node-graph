@@ -1,9 +1,11 @@
+mod windows;
 use gpui::{
     Context, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Render, Window, canvas, div,
     point, prelude::*, px, rgb,
 };
 pub use node_graph_core as core;
 pub use node_graph_core::*;
+pub use windows::*;
 
 #[derive(Clone, Debug)]
 pub enum EditorEvent {
@@ -141,8 +143,9 @@ impl<T: PortType> Render for NodeGraph<T> {
         )
         .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
             let s = core::Point::new(e.position.x.into(), e.position.y.into());
-            if let Some(last) = this.panning.replace(s) {
-                this.graph.viewport.pan = this.graph.viewport.pan + (s - last);
+            if let Some(last) = this.panning.as_mut() {
+                this.graph.viewport.pan = this.graph.viewport.pan + (s - *last);
+                *last = s;
                 cx.notify();
             }
             if let Some((id, off)) = this.drag.clone() {
