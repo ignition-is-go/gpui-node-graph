@@ -7,7 +7,7 @@ use gpui::{
     point, prelude::*, px, rgb,
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::Arc,
@@ -326,6 +326,10 @@ pub struct EditorConfig {
     pub default_node_width: f32,
     /// Screen-pixel margin used by [`NodeVisualState::visible`].
     pub visibility_margin: f32,
+    /// World-space separation between deterministic routes that share a source pin.
+    pub route_lane_spacing: f32,
+    /// Screen-pixel radius used to round orthogonal route corners.
+    pub route_corner_radius: f32,
 }
 impl Default for EditorConfig {
     fn default() -> Self {
@@ -342,6 +346,8 @@ impl Default for EditorConfig {
             max_node_width: 800.0,
             default_node_width: 180.0,
             visibility_margin: 160.0,
+            route_lane_spacing: 8.0,
+            route_corner_radius: 7.0,
         }
     }
 }
@@ -542,6 +548,22 @@ impl<N, C> BoxSelection<N, C> {
 
 /// Shared native/WebAssembly retained-mode GPUI node editor. Domain state stays
 /// framework-free in `node_graph_core`.
+struct RouteCache<C: Eq + std::hash::Hash> {
+    fingerprint: String,
+    routes: HashMap<C, Vec<core::Point>>,
+    generation: u64,
+}
+
+impl<C: Eq + std::hash::Hash> Default for RouteCache<C> {
+    fn default() -> Self {
+        Self {
+            fingerprint: String::new(),
+            routes: HashMap::new(),
+            generation: 0,
+        }
+    }
+}
+
 pub struct NodeGraph<
     T: PortType,
     N: core::NodeId = String,
@@ -563,6 +585,7 @@ pub struct NodeGraph<
     dangling_connections: Vec<DanglingConnection<P, C>>,
     dismissed_overlays: HashSet<String>,
     active_dismissible_overlays: HashSet<String>,
+    route_cache: RefCell<RouteCache<C>>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -608,6 +631,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             dangling_connections: Vec::new(),
             dismissed_overlays: HashSet::new(),
             active_dismissible_overlays: HashSet::new(),
+            route_cache: RefCell::new(RouteCache::default()),
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -1147,13 +1171,68 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    fn connection_routes(&self) -> HashMap<C, Vec<core::Point>> {
+        let fingerprint = format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            self.config.routing,
+            self.config.route_lane_spacing,
+            self.graph.nodes,
+            self.graph.ports,
+            self.graph.connections,
+            self.render_geometry.port_offsets,
+        );
+        if self.route_cache.borrow().fingerprint == fingerprint {
+            return self.route_cache.borrow().routes.clone();
+        }
+
+        let mut connections: Vec<_> = self.graph.connections.values().collect();
+        connections.sort_by_cached_key(|connection| format!("{:?}", connection.id));
+        let mut source_lanes: HashMap<P, Vec<C>> = HashMap::new();
+        for connection in &connections {
+            source_lanes
+                .entry(connection.source.clone())
+                .or_default()
+                .push(connection.id.clone());
+        }
+        for ids in source_lanes.values_mut() {
+            ids.sort_by_cached_key(|id| format!("{id:?}"));
+        }
+
+        let mut routes = HashMap::new();
+        for connection in connections {
+            let Some(mut route) = self.connection_route(connection) else {
+                continue;
+            };
+            let ids = &source_lanes[&connection.source];
+            let index = ids
+                .iter()
+                .position(|id| id == &connection.id)
+                .unwrap_or_default();
+            let lane = (index as f32 - (ids.len().saturating_sub(1) as f32 * 0.5))
+                * self.config.route_lane_spacing;
+            apply_route_lane(&mut route, lane, self.config.routing);
+            routes.insert(connection.id.clone(), route);
+        }
+
+        let mut cache = self.route_cache.borrow_mut();
+        cache.fingerprint = fingerprint;
+        cache.routes = routes.clone();
+        cache.generation = cache.generation.saturating_add(1);
+        routes
+    }
+
+    pub fn route_cache_generation(&self) -> u64 {
+        self.route_cache.borrow().generation
+    }
+
     fn connection_at(&self, cursor: core::Point, radius: f32) -> Option<C> {
         let viewport = self.graph.viewport.sanitized();
         let mut connections: Vec<_> = self.graph.connections.iter().collect();
         connections.sort_by_cached_key(|(id, _)| format!("{id:?}"));
+        let routes = self.connection_routes();
         let mut nearest: Option<(C, f32)> = None;
-        for (id, connection) in connections {
-            let Some(route) = self.connection_route(connection) else {
+        for (id, _) in connections {
+            let Some(route) = routes.get(id) else {
                 continue;
             };
             let distance = route
@@ -1429,13 +1508,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .clone();
         let viewport = self.graph.viewport.sanitized();
 
+        let routes = self.connection_routes();
         let mut wires: Vec<_> = self
             .graph
             .connections
             .values()
             .filter_map(|connection| {
                 Some((
-                    self.connection_route(connection)?,
+                    routes.get(&connection.id)?.clone(),
                     self.graph.selected_connections.contains(&connection.id),
                     false,
                 ))
@@ -1465,6 +1545,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let draft_color: gpui::Hsla = rgb(self.theme.wire_draft).into();
         let dangling_color: gpui::Hsla = rgb(0xef4444).into();
         let canvas_bounds = self.canvas_bounds.clone();
+        let corner_radius = if self.config.routing == RoutingMode::Bezier {
+            0.0
+        } else {
+            self.config.route_corner_radius
+        };
         let wire_layer = canvas(
             move |bounds, _, _| {
                 canvas_bounds.set(bounds);
@@ -1483,6 +1568,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             wire_color
                         },
                         if *selected || *dangling { 3.0 } else { 2.0 },
+                        corner_radius,
                     );
                 }
                 if let Some((source, end)) = draft {
@@ -2148,6 +2234,36 @@ fn distance_to_segment(point: core::Point, start: core::Point, end: core::Point)
     ))
 }
 
+fn apply_route_lane(route: &mut Vec<core::Point>, lane: f32, mode: RoutingMode) {
+    if lane.abs() <= f32::EPSILON || route.len() < 3 {
+        return;
+    }
+    if mode == RoutingMode::Bezier {
+        let last = route.len() - 1;
+        for (index, point) in route.iter_mut().enumerate().skip(1).take(last - 1) {
+            let t = index as f32 / last as f32;
+            point.y += lane * (std::f32::consts::PI * t).sin();
+        }
+        return;
+    }
+
+    let original = route.clone();
+    let start = original[0];
+    let end = *original.last().expect("route has at least three points");
+    let first = original[1];
+    let last = original[original.len() - 2];
+    let mut separated = Vec::with_capacity(original.len() + 4);
+    separated.push(start);
+    separated.push(core::Point::new(first.x, start.y));
+    for point in original.iter().take(original.len() - 1).skip(1) {
+        separated.push(core::Point::new(point.x, point.y + lane));
+    }
+    separated.push(core::Point::new(last.x, end.y));
+    separated.push(end);
+    separated.dedup();
+    *route = separated;
+}
+
 fn resolve_overlay_position(
     node_origin: core::Point,
     node_width: f32,
@@ -2182,21 +2298,49 @@ fn paint_route(
     points: impl IntoIterator<Item = core::Point>,
     color: gpui::Hsla,
     width: f32,
+    corner_radius: f32,
 ) {
-    let mut points = points.into_iter();
-    let Some(first) = points.next() else {
+    let points: Vec<_> = points.into_iter().collect();
+    let Some(first) = points.first() else {
         return;
     };
     let mut path = PathBuilder::stroke(px(width));
-    path.move_to(point(
-        bounds.origin.x + px(first.x),
-        bounds.origin.y + px(first.y),
-    ));
-    for point_value in points {
-        path.line_to(point(
-            bounds.origin.x + px(point_value.x),
-            bounds.origin.y + px(point_value.y),
-        ));
+    let absolute =
+        |value: core::Point| point(bounds.origin.x + px(value.x), bounds.origin.y + px(value.y));
+    path.move_to(absolute(*first));
+    if corner_radius <= 0.0 || points.len() < 3 {
+        for value in points.iter().skip(1) {
+            path.line_to(absolute(*value));
+        }
+    } else {
+        for index in 1..points.len() - 1 {
+            let previous = points[index - 1];
+            let corner = points[index];
+            let next = points[index + 1];
+            let incoming = corner - previous;
+            let outgoing = next - corner;
+            let incoming_length = (incoming.x * incoming.x + incoming.y * incoming.y).sqrt();
+            let outgoing_length = (outgoing.x * outgoing.x + outgoing.y * outgoing.y).sqrt();
+            if incoming_length <= f32::EPSILON || outgoing_length <= f32::EPSILON {
+                continue;
+            }
+            let radius = corner_radius
+                .min(incoming_length * 0.5)
+                .min(outgoing_length * 0.5);
+            let entry = core::Point::new(
+                corner.x - incoming.x / incoming_length * radius,
+                corner.y - incoming.y / incoming_length * radius,
+            );
+            let exit = core::Point::new(
+                corner.x + outgoing.x / outgoing_length * radius,
+                corner.y + outgoing.y / outgoing_length * radius,
+            );
+            path.line_to(absolute(entry));
+            path.curve_to(absolute(exit), absolute(corner));
+        }
+        if let Some(last) = points.last() {
+            path.line_to(absolute(*last));
+        }
     }
     if let Ok(path) = path.build() {
         window.paint_path(path, color);
@@ -2400,6 +2544,41 @@ mod tests {
         assert_eq!(editor.filtered_catalog_indices(), vec![0]);
         editor.catalog_menu.as_mut().unwrap().query = "source".into();
         assert!(editor.filtered_catalog_indices().is_empty());
+    }
+
+    #[test]
+    fn route_batch_separates_shared_pins_and_reuses_stable_cache() {
+        let mut graph = interactive_graph();
+        graph.ports.insert(
+            "in2".into(),
+            Port {
+                id: "in2".into(),
+                node: "b".into(),
+                label: "In 2".into(),
+                direction: PortDirection::Input,
+                kind: Kind,
+                position: core::Point::new(100.0, 40.0),
+            },
+        );
+        graph.connections.insert(
+            "wire2".into(),
+            Connection {
+                id: "wire2".into(),
+                source: "out".into(),
+                target: "in2".into(),
+            },
+        );
+        let mut editor = NodeGraph::new(graph);
+        editor.config.routing = RoutingMode::SimpleOrthogonal;
+        let routes = editor.connection_routes();
+        assert_ne!(routes["wire"], routes["wire2"]);
+        assert_eq!(routes["wire"].first(), Some(&core::Point::new(50.0, 25.0)));
+        assert_eq!(editor.route_cache_generation(), 1);
+        assert_eq!(routes, editor.connection_routes());
+        assert_eq!(editor.route_cache_generation(), 1);
+        editor.graph.nodes.get_mut("b").unwrap().position.x += 10.0;
+        editor.connection_routes();
+        assert_eq!(editor.route_cache_generation(), 2);
     }
 
     #[test]

@@ -52,7 +52,8 @@ least three seconds, preventing both lifecycle and false-mount positives.
   bounds/rendering and create-group handling are now present);
 - dangling dynamic-port presentation without weakening strict persisted validation (the demo
   now adds/removes stable dynamic inputs, but refuses removal while referenced);
-- batching, lane separation, rounded corners and caching for the integrated
-  deterministic obstacle-aware subway router (Bezier/simple runtime switching now works);
+- deeper large-graph routing performance/visual tuning; deterministic subway routes now
+  batch into stable per-source lanes, cache by graph/geometry/config fingerprint, paint rounded
+  orthogonal corners, and switch at runtime to Bezier/simple modes;
 - captured dragging outside embedded bounds and broader scripted native/browser
   interaction and visual tests (rich renderers now receive an opt-in visibility hook).
