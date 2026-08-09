@@ -14,15 +14,38 @@ pub use windows::*;
 /// The GPUI adapter and framework-free core now expose one event vocabulary.
 pub type EditorEvent<N = String, P = String, C = String> = core::GraphEvent<N, P, C>;
 
+pub struct NodeOverlay {
+    /// Screen-pixel offset from the rendered node origin. Overlay content is not
+    /// viewport-scaled, so retained controls keep normal GPUI hit testing.
+    pub offset: core::Point,
+    pub element: AnyElement,
+}
+
+impl NodeOverlay {
+    pub fn new(offset: core::Point, element: impl IntoElement) -> Self {
+        Self {
+            offset,
+            element: element.into_any_element(),
+        }
+    }
+}
+
 pub struct NodeBody {
     pub element: AnyElement,
+    pub overlays: Vec<NodeOverlay>,
 }
 
 impl NodeBody {
     pub fn new(element: impl IntoElement) -> Self {
         Self {
             element: element.into_any_element(),
+            overlays: Vec::new(),
         }
+    }
+
+    pub fn with_overlay(mut self, overlay: NodeOverlay) -> Self {
+        self.overlays.push(overlay);
+        self
     }
 }
 
@@ -1061,6 +1084,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
         root = root.child(wire_layer);
 
+        let mut node_overlays = Vec::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
         for node in nodes {
@@ -1068,7 +1092,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let position = viewport.world_to_screen(node.position);
             let selected = self.graph.selected_nodes.contains(&id);
             let resize_id = id.clone();
-            let body = if let Some(renderer) = self.node_body_renderer.as_mut() {
+            let mut body = if let Some(renderer) = self.node_body_renderer.as_mut() {
                 let mut ports: Vec<_> = self
                     .graph
                     .ports
@@ -1094,6 +1118,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             } else {
                 NodeBody::new(div().child(node.title.clone()))
             };
+            node_overlays.extend(body.overlays.drain(..).map(|overlay| {
+                (
+                    core::Point::new(position.x + overlay.offset.x, position.y + overlay.offset.y),
+                    overlay.element,
+                )
+            }));
             let background = if selected {
                 self.theme.node_selected
             } else {
@@ -1338,6 +1368,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .border_1()
                     .border_color(rgb(self.theme.selection_border))
                     .bg(rgb(self.theme.selection_fill)),
+            );
+        }
+
+        for (position, overlay) in node_overlays {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(position.x))
+                    .top(px(position.y))
+                    .child(overlay),
             );
         }
 

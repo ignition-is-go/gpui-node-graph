@@ -1,7 +1,8 @@
 use gpui::prelude::*;
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_node_graph::{
-    CatalogPort, GraphGroup, NodeBody, NodeBodyContext, NodeCatalogItem, NodeGraph, core::*,
+    CatalogPort, GraphGroup, NodeBody, NodeBodyContext, NodeCatalogItem, NodeGraph, NodeOverlay,
+    core::*,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,29 +247,199 @@ fn launch(cx: &mut App) {
                          _: &mut gpui::Window,
                          _: &mut App| {
                             let port_count = context.ports.len();
-                            NodeBody::new(
-                                gpui::div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(context.node.title)
-                                    .child(
-                                        gpui::div()
-                                            .rounded_sm()
-                                            .bg(gpui::rgb(0x18181b))
-                                            .px_2()
-                                            .py_1()
-                                            .text_size(gpui::px(10.0))
-                                            .child(format!("{port_count} typed ports"))
-                                            .on_mouse_down(
-                                                gpui::MouseButton::Left,
-                                                |_, window, cx| {
-                                                    cx.stop_propagation();
-                                                    window.prevent_default();
-                                                },
-                                            ),
-                                    ),
-                            )
+                            let is_custom = context.node.title == "Custom";
+                            let show_overlay = context.node.title == "Multiply";
+                            let overlay_x = context.node.size.width + 12.0;
+                            let node_id = context.node.id.clone();
+                            let add_graph = context.graph();
+                            let remove_graph = context.graph();
+                            let mut body = gpui::div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(context.node.title)
+                                .child(
+                                    gpui::div()
+                                        .rounded_sm()
+                                        .bg(gpui::rgb(0x18181b))
+                                        .px_2()
+                                        .py_1()
+                                        .text_size(gpui::px(10.0))
+                                        .child(format!("{port_count} typed ports"))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            |_, window, cx| {
+                                                cx.stop_propagation();
+                                                window.prevent_default();
+                                            },
+                                        ),
+                                );
+                            if is_custom {
+                                let add_node = node_id.clone();
+                                let remove_node = node_id;
+                                body = body.child(
+                                    gpui::div()
+                                        .flex()
+                                        .gap_1()
+                                        .child(
+                                            gpui::div()
+                                                .rounded_sm()
+                                                .bg(gpui::rgb(0x334155))
+                                                .px_2()
+                                                .child("+ input")
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    move |_, window, cx| {
+                                                        cx.stop_propagation();
+                                                        window.prevent_default();
+                                                        let _ = add_graph.update(cx, |editor, cx| {
+                                                            let Some(node) = editor
+                                                                .graph
+                                                                .nodes
+                                                                .get(&add_node)
+                                                                .cloned()
+                                                            else {
+                                                                return;
+                                                            };
+                                                            let mut sequence = 1;
+                                                            let port_id = loop {
+                                                                let id = format!(
+                                                                    "{}.dynamic-{sequence}",
+                                                                    add_node
+                                                                );
+                                                                if !editor
+                                                                    .graph
+                                                                    .ports
+                                                                    .contains_key(&id)
+                                                                {
+                                                                    break id;
+                                                                }
+                                                                sequence += 1;
+                                                            };
+                                                            let row = editor
+                                                                .graph
+                                                                .ports
+                                                                .values()
+                                                                .filter(|port| {
+                                                                    port.node == add_node
+                                                                        && port.direction
+                                                                            == PortDirection::Input
+                                                                })
+                                                                .count();
+                                                            editor.graph.ports.insert(
+                                                                port_id.clone(),
+                                                                Port {
+                                                                    id: port_id,
+                                                                    node: add_node.clone(),
+                                                                    label: format!(
+                                                                        "Dynamic {}",
+                                                                        row + 1
+                                                                    ),
+                                                                    direction: PortDirection::Input,
+                                                                    kind: Kind::Number,
+                                                                    position: Point::new(
+                                                                        node.position.x,
+                                                                        node.position.y
+                                                                            + 52.0
+                                                                            + row as f32 * 22.0,
+                                                                    ),
+                                                                },
+                                                            );
+                                                            if let Some(node) = editor
+                                                                .graph
+                                                                .nodes
+                                                                .get_mut(&add_node)
+                                                            {
+                                                                node.size.height += 22.0;
+                                                            }
+                                                            cx.notify();
+                                                        });
+                                                    },
+                                                ),
+                                        )
+                                        .child(
+                                            gpui::div()
+                                                .rounded_sm()
+                                                .bg(gpui::rgb(0x3f2a2a))
+                                                .px_2()
+                                                .child("− input")
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    move |_, window, cx| {
+                                                        cx.stop_propagation();
+                                                        window.prevent_default();
+                                                        let _ = remove_graph.update(
+                                                            cx,
+                                                            |editor, cx| {
+                                                                let mut candidates: Vec<_> = editor
+                                                                    .graph
+                                                                    .ports
+                                                                    .iter()
+                                                                    .filter(|(id, port)| {
+                                                                        port.node == remove_node
+                                                                            && id.contains(
+                                                                                ".dynamic-",
+                                                                            )
+                                                                            && !editor
+                                                                                .graph
+                                                                                .connections
+                                                                                .values()
+                                                                                .any(|connection| {
+                                                                                    connection.source
+                                                                                        == **id
+                                                                                        || connection
+                                                                                            .target
+                                                                                            == **id
+                                                                                })
+                                                                    })
+                                                                    .map(|(id, _)| id.clone())
+                                                                    .collect();
+                                                                candidates.sort();
+                                                                if let Some(id) = candidates.pop() {
+                                                                    editor.graph.ports.remove(&id);
+                                                                    if let Some(node) = editor
+                                                                        .graph
+                                                                        .nodes
+                                                                        .get_mut(&remove_node)
+                                                                    {
+                                                                        node.size.height =
+                                                                            (node.size.height - 22.0)
+                                                                                .max(110.0);
+                                                                    }
+                                                                    cx.notify();
+                                                                }
+                                                            },
+                                                        );
+                                                    },
+                                                ),
+                                        ),
+                                );
+                            }
+                            let body = NodeBody::new(body);
+                            if show_overlay {
+                                body.with_overlay(NodeOverlay::new(
+                                    Point::new(overlay_x, 20.0),
+                                    gpui::div()
+                                        .w(gpui::px(112.0))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(gpui::rgb(0x52525b))
+                                        .bg(gpui::rgb(0x202023))
+                                        .p_2()
+                                        .text_size(gpui::px(11.0))
+                                        .child("Blend controls")
+                                        .child("Mode · Multiply")
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            |_, window, cx| {
+                                                cx.stop_propagation();
+                                                window.prevent_default();
+                                            },
+                                        ),
+                                ))
+                            } else {
+                                body
+                            }
                         },
                     )
                     .with_groups(vec![GraphGroup {
