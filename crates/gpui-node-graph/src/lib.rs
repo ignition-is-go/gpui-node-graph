@@ -139,7 +139,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 for (a, b) in &wires {
                     let a = vp.world_to_screen(*a);
                     let b = vp.world_to_screen(*b);
-                    let mid = (a.x + b.x) / 2.;
+                    let mid = a.x * 0.5 + b.x * 0.5;
                     let mut p = PathBuilder::stroke(px(2.));
                     p.move_to(point(px(a.x), px(a.y)));
                     p.line_to(point(px(mid), px(a.y)));
@@ -173,15 +173,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .absolute()
                     .left(px(pos.x))
                     .top(px(pos.y))
-                    .w(px(n.size.width * vp.zoom))
-                    .h(px(n.size.height * vp.zoom))
+                    .w(px(vp.scale_length(n.size.width)))
+                    .h(px(vp.scale_length(n.size.height)))
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(0x52525b))
                     .bg(rgb(bg))
                     .text_color(rgb(self.theme.text))
-                    .text_size(px(14. * vp.zoom))
-                    .p(px(8. * vp.zoom))
+                    .text_size(px(vp.scale_length(14.)))
+                    .p(px(vp.scale_length(8.)))
                     .child(n.title.clone())
                     .on_mouse_down(
                         MouseButton::Left,
@@ -211,12 +211,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
             let s = core::Point::new(e.position.x.into(), e.position.y.into());
             if let Some(last) = this.panning.as_mut() {
-                this.graph.viewport.pan = this.graph.viewport.pan + (s - *last);
+                let previous = *last;
                 *last = s;
-                cx.emit(EditorEvent::ViewportChanged {
-                    viewport: this.graph.viewport,
-                });
-                cx.notify();
+                if this.graph.viewport.pan_between(previous, s) {
+                    cx.emit(EditorEvent::ViewportChanged {
+                        viewport: this.graph.viewport,
+                    });
+                    cx.notify();
+                }
             }
             if let Some((id, off)) = this.drag.clone() {
                 let position = this.graph.viewport.screen_to_world(s) - off;

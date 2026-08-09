@@ -117,6 +117,30 @@ impl Viewport {
             (Self::finite_coordinate(p.y) as f64 - viewport.pan.y as f64) / viewport.zoom as f64;
         Point::new(Self::finite_f32(x), Self::finite_f32(y))
     }
+    /// Scale a non-negative world-space length into a finite render-space length.
+    pub fn scale_length(self, value: f32) -> f32 {
+        if !value.is_finite() || value <= 0.0 {
+            return 0.0;
+        }
+        Self::finite_f32(value as f64 * self.sanitized().zoom as f64)
+    }
+    /// Pan by the screen-space displacement from `previous` to `current` using
+    /// wide intermediates so finite cursor coordinates cannot overflow the viewport.
+    pub fn pan_between(&mut self, previous: Point, current: Point) -> bool {
+        if !previous.x.is_finite()
+            || !previous.y.is_finite()
+            || !current.x.is_finite()
+            || !current.y.is_finite()
+        {
+            return false;
+        }
+        let viewport = self.sanitized();
+        let x = viewport.pan.x as f64 + current.x as f64 - previous.x as f64;
+        let y = viewport.pan.y as f64 + current.y as f64 - previous.y as f64;
+        self.zoom = viewport.zoom;
+        self.pan = Point::new(Self::finite_f32(x), Self::finite_f32(y));
+        true
+    }
     /// Zoom while preserving the world point beneath `screen`.
     /// Invalid/non-positive factors and bounds are ignored rather than allowing
     /// NaN, infinity, or a zero zoom into the viewport.
@@ -849,6 +873,13 @@ mod tests {
             f32::MAX,
         );
         assert!(v.is_valid());
+        assert!(v.pan_between(
+            Point::new(-f32::MAX, f32::MAX),
+            Point::new(f32::MAX, -f32::MAX),
+        ));
+        assert!(v.is_valid());
+        assert!(v.scale_length(f32::MAX).is_finite());
+        assert_eq!(v.scale_length(f32::INFINITY), 0.0);
     }
     #[test]
     fn reconciliation_and_removal_report_pruned_selection() {
