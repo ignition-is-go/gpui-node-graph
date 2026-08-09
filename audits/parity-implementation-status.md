@@ -45,7 +45,8 @@ least three seconds, preventing both lifecycle and false-mount positives.
 - measured/dynamic port geometry on top of the new consumer-defined `NodeBodyRenderer`
   seam, body-control keyboard/wheel isolation, and overlay/popover support (right-edge
   node resize, rollback, reset, output-anchor translation and one-shot events now work);
-- groups and membership gestures;
+- group inline editing plus Alt-drag membership gestures (consumer-supplied group
+  bounds/rendering and create-group handling are now present);
 - dangling dynamic-port presentation without weakening strict persisted validation;
 - Bezier mode plus batching, lane separation, rounded corners and caching for the
   now-integrated deterministic obstacle-aware subway router;

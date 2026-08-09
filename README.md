@@ -16,7 +16,8 @@ cargo test --workspace
 # drag/click between ports to connect; drag a wire to blank space to create-and-connect;
 # double-click blank space or press Tab to search/create; click wires and press Delete;
 # drag a node's right edge to resize (double-click resets); wheel zoom;
-# middle-drag or Ctrl-drag to pan; F fits; Escape rolls back/cancels/clears.
+# middle-drag or Ctrl-drag to pan; Ctrl/Cmd+G groups a multi-selection;
+# F fits; Escape rolls back/cancels/clears.
 
 # Browser host (requires Trunk)
 cd examples/demo && trunk serve

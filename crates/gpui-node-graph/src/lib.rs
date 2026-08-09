@@ -149,6 +149,14 @@ struct CatalogMenu<P> {
     connect_from: Option<P>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphGroup<N: Eq + std::hash::Hash> {
+    pub id: String,
+    pub label: String,
+    pub color: u32,
+    pub nodes: HashSet<N>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub background: u32,
@@ -248,6 +256,7 @@ pub struct NodeGraph<
     catalog: Vec<NodeCatalogItem<T>>,
     catalog_menu: Option<CatalogMenu<P>>,
     node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
+    groups: Vec<GraphGroup<N>>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -288,6 +297,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             catalog: Vec::new(),
             catalog_menu: None,
             node_body_renderer: None,
+            groups: Vec::new(),
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -327,6 +337,33 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     pub fn clear_node_body_renderer(&mut self, cx: &mut Context<Self>) {
         self.node_body_renderer = None;
+        cx.notify();
+    }
+
+    pub fn with_groups(mut self, groups: Vec<GraphGroup<N>>) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    pub fn set_groups(&mut self, groups: Vec<GraphGroup<N>>, cx: &mut Context<Self>) {
+        self.groups = groups;
+        cx.notify();
+    }
+
+    pub fn groups(&self) -> &[GraphGroup<N>] {
+        &self.groups
+    }
+
+    pub fn upsert_group(&mut self, group: GraphGroup<N>, cx: &mut Context<Self>) {
+        if let Some(existing) = self
+            .groups
+            .iter_mut()
+            .find(|existing| existing.id == group.id)
+        {
+            *existing = group;
+        } else {
+            self.groups.push(group);
+        }
         cx.notify();
     }
 
@@ -986,8 +1023,43 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .bg(rgb(self.theme.background))
             .track_focus(&focus_handle)
             .key_context("NodeGraph")
-            .on_key_down(cx.listener(Self::handle_key_down))
-            .child(wire_layer);
+            .on_key_down(cx.listener(Self::handle_key_down));
+
+        for group in &self.groups {
+            let mut members = group.nodes.iter().filter_map(|id| self.graph.nodes.get(id));
+            let Some(first) = members.next() else {
+                continue;
+            };
+            let mut left = first.position.x;
+            let mut top = first.position.y;
+            let mut right = first.position.x + first.size.width;
+            let mut bottom = first.position.y + first.size.height;
+            for node in members {
+                left = left.min(node.position.x);
+                top = top.min(node.position.y);
+                right = right.max(node.position.x + node.size.width);
+                bottom = bottom.max(node.position.y + node.size.height);
+            }
+            let padding = 24.0;
+            let origin = viewport.world_to_screen(core::Point::new(left - padding, top - padding));
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(origin.x))
+                    .top(px(origin.y))
+                    .w(px(viewport.scale_length(right - left + padding * 2.0)))
+                    .h(px(viewport.scale_length(bottom - top + padding * 2.0)))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(group.color).opacity(0.75))
+                    .bg(rgb(group.color).opacity(0.08))
+                    .text_color(rgb(group.color))
+                    .text_size(px(11.0))
+                    .p_1()
+                    .child(group.label.clone()),
+            );
+        }
+        root = root.child(wire_layer);
 
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));

@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_node_graph::{
-    CatalogPort, NodeBody, NodeBodyContext, NodeCatalogItem, NodeGraph, core::*,
+    CatalogPort, GraphGroup, NodeBody, NodeBodyContext, NodeCatalogItem, NodeGraph, core::*,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -271,6 +271,14 @@ fn launch(cx: &mut App) {
                             )
                         },
                     )
+                    .with_groups(vec![GraphGroup {
+                        id: "initial".into(),
+                        label: "Processing".into(),
+                        color: 0x60a5fa,
+                        nodes: ["source".to_string(), "math".to_string()]
+                            .into_iter()
+                            .collect(),
+                    }])
             });
             graph.update(cx, |_, cx| {
                 cx.subscribe(&graph, move |editor, _, event, cx| {
@@ -293,6 +301,18 @@ fn launch(cx: &mut App) {
                             connect_to.as_deref(),
                             *connect_direction,
                         ),
+                        GraphEvent::GroupCreated { node_ids } if node_ids.len() > 1 => {
+                            let sequence = editor.groups().len() + 1;
+                            editor.upsert_group(
+                                GraphGroup {
+                                    id: format!("group-{sequence}"),
+                                    label: format!("Group {sequence}"),
+                                    color: 0xa78bfa,
+                                    nodes: node_ids.iter().cloned().collect(),
+                                },
+                                cx,
+                            );
+                        }
                         _ => return,
                     }
                     cx.notify();
