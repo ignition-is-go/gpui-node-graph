@@ -27,6 +27,9 @@ All saved-model migrations belong in core and must have fixture round-trip tests
 
 ## Parity roadmap
 
+The evidence-backed Leptos parity audit and phased acceptance plan are in
+[`audits/leptos-parity-audit.md`](audits/leptos-parity-audit.md).
+
 - [x] portable typed model, viewport transforms, selection geometry
 - [x] native nodes and connection painting
 - [x] node drag event and middle-button pan
