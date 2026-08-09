@@ -428,6 +428,13 @@ struct NodeDrag<N> {
     offsets: Vec<(N, core::Point)>,
     starts: Vec<(N, core::Point)>,
     moved: bool,
+    alter_groups: bool,
+}
+
+#[derive(Clone)]
+struct GroupEditor {
+    id: String,
+    query: String,
 }
 #[derive(Clone)]
 struct ResizeDrag<N, P> {
@@ -586,6 +593,7 @@ pub struct NodeGraph<
     dismissed_overlays: HashSet<String>,
     active_dismissible_overlays: HashSet<String>,
     route_cache: RefCell<RouteCache<C>>,
+    group_editor: Option<GroupEditor>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -632,6 +640,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             dismissed_overlays: HashSet::new(),
             active_dismissible_overlays: HashSet::new(),
             route_cache: RefCell::new(RouteCache::default()),
+            group_editor: None,
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -1252,6 +1261,30 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         nearest.map(|(id, _)| id)
     }
 
+    fn group_label_at(&self, screen: core::Point) -> Option<String> {
+        let viewport = self.graph.viewport.sanitized();
+        for group in &self.groups {
+            let mut members = group.nodes.iter().filter_map(|id| self.graph.nodes.get(id));
+            let first = members.next()?;
+            let mut left = first.position.x;
+            let mut top = first.position.y;
+            for node in members {
+                left = left.min(node.position.x);
+                top = top.min(node.position.y);
+            }
+            let origin = viewport.world_to_screen(core::Point::new(left - 24.0, top - 24.0));
+            let width = (group.label.chars().count() as f32 * 7.0 + 12.0).max(48.0);
+            if screen.x >= origin.x
+                && screen.x <= origin.x + width
+                && screen.y >= origin.y
+                && screen.y <= origin.y + 18.0
+            {
+                return Some(group.id.clone());
+            }
+        }
+        None
+    }
+
     fn fit_view(&mut self) -> bool {
         let Some(bounds) = self.graph.bounds() else {
             return false;
@@ -1306,6 +1339,57 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.notify();
     }
 
+    fn update_group_memberships(&mut self, dragged: &[N]) -> Vec<(String, Vec<N>)> {
+        let dragged_set: HashSet<_> = dragged.iter().cloned().collect();
+        let mut changes = Vec::new();
+        for group in &mut self.groups {
+            let mut members = group
+                .nodes
+                .iter()
+                .filter(|id| !dragged_set.contains(*id))
+                .filter_map(|id| self.graph.nodes.get(id));
+            let Some(first) = members.next() else {
+                continue;
+            };
+            let mut left = first.position.x;
+            let mut top = first.position.y;
+            let mut right = first.position.x + first.size.width;
+            let mut bottom = first.position.y + first.size.height;
+            for node in members {
+                left = left.min(node.position.x);
+                top = top.min(node.position.y);
+                right = right.max(node.position.x + node.size.width);
+                bottom = bottom.max(node.position.y + node.size.height);
+            }
+            let padding = 24.0;
+            let mut changed = false;
+            for id in dragged {
+                let Some(node) = self.graph.nodes.get(id) else {
+                    continue;
+                };
+                let center = core::Point::new(
+                    node.position.x + node.size.width * 0.5,
+                    node.position.y + node.size.height * 0.5,
+                );
+                let inside = center.x >= left - padding
+                    && center.x <= right + padding
+                    && center.y >= top - padding
+                    && center.y <= bottom + padding;
+                changed |= if inside {
+                    group.nodes.insert(id.clone())
+                } else {
+                    group.nodes.remove(id)
+                };
+            }
+            if changed {
+                let mut node_ids: Vec<_> = group.nodes.iter().cloned().collect();
+                node_ids.sort_by_cached_key(|id| format!("{id:?}"));
+                changes.push((group.id.clone(), node_ids));
+            }
+        }
+        changes
+    }
+
     fn finish_left_gesture(&mut self, cx: &mut Context<Self>) {
         self.panning = None;
         if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
@@ -1317,12 +1401,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             });
         }
         if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
+            let alter_groups = drag.alter_groups;
+            let dragged: Vec<_> = drag.offsets.iter().map(|(id, _)| id.clone()).collect();
             let nodes = drag
                 .offsets
                 .into_iter()
                 .filter_map(|(id, _)| Some((id.clone(), self.graph.nodes.get(&id)?.position)))
                 .collect();
             cx.emit(core::GraphEvent::NodesMoved { nodes });
+            if alter_groups {
+                for (group_id, node_ids) in self.update_group_memberships(&dragged) {
+                    cx.emit(core::GraphEvent::GroupMembershipChanged { group_id, node_ids });
+                }
+            }
         }
         self.box_selection = None;
         let draft_result = self.draft.as_ref().map(|draft| {
@@ -1394,6 +1485,42 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             let result_len = self.filtered_catalog_indices().len().min(8);
             if let Some(menu) = self.catalog_menu.as_mut() {
                 menu.selected = menu.selected.min(result_len.saturating_sub(1));
+            }
+            cx.notify();
+            cx.stop_propagation();
+            window.prevent_default();
+            return;
+        }
+        if self.group_editor.is_some() {
+            match key {
+                "escape" => self.group_editor = None,
+                "enter" => {
+                    if let Some(editor) = self.group_editor.take()
+                        && !editor.query.trim().is_empty()
+                        && let Some(group) =
+                            self.groups.iter_mut().find(|group| group.id == editor.id)
+                    {
+                        group.label = editor.query.trim().to_string();
+                        cx.emit(core::GraphEvent::GroupLabelChanged {
+                            group_id: group.id.clone(),
+                            label: group.label.clone(),
+                        });
+                    }
+                }
+                "backspace" => {
+                    if let Some(editor) = self.group_editor.as_mut() {
+                        editor.query.pop();
+                    }
+                }
+                _ if !command => {
+                    if let Some(character) = event.keystroke.key_char.as_ref()
+                        && !character.chars().any(char::is_control)
+                        && let Some(editor) = self.group_editor.as_mut()
+                    {
+                        editor.query.push_str(character);
+                    }
+                }
+                _ => {}
             }
             cx.notify();
             cx.stop_propagation();
@@ -1595,7 +1722,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .key_context("NodeGraph")
             .on_key_down(cx.listener(Self::handle_key_down));
 
+        let mut group_labels = Vec::new();
         for group in &self.groups {
+            let group_label = self
+                .group_editor
+                .as_ref()
+                .filter(|editor| editor.id == group.id)
+                .map_or_else(
+                    || group.label.clone(),
+                    |editor| format!("{}▏", editor.query),
+                );
             let mut members = group.nodes.iter().filter_map(|id| self.graph.nodes.get(id));
             let Some(first) = members.next() else {
                 continue;
@@ -1622,14 +1758,39 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(group.color).opacity(0.75))
-                    .bg(rgb(group.color).opacity(0.08))
-                    .text_color(rgb(group.color))
-                    .text_size(px(11.0))
-                    .p_1()
-                    .child(group.label.clone()),
+                    .bg(rgb(group.color).opacity(0.08)),
             );
+            group_labels.push((origin, group.id.clone(), group_label, group.color));
         }
         root = root.child(wire_layer);
+        for (origin, group_id, label, color) in group_labels {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(origin.x + 4.0))
+                    .top(px(origin.y + 2.0))
+                    .text_color(rgb(color))
+                    .text_size(px(11.0))
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if event.click_count >= 2
+                                && let Some(group) =
+                                    this.groups.iter().find(|group| group.id == group_id)
+                            {
+                                this.group_editor = Some(GroupEditor {
+                                    id: group.id.clone(),
+                                    query: group.label.clone(),
+                                });
+                                cx.notify();
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            }
+                        }),
+                    ),
+            );
+        }
 
         let mut node_overlays = Vec::new();
         self.active_dismissible_overlays.clear();
@@ -1775,6 +1936,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                         .map(|(id, _, position)| (id, position))
                                         .collect(),
                                     moved: false,
+                                    alter_groups: event.modifiers.alt,
                                 });
                             }
                             cx.notify();
@@ -2044,7 +2206,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 this.focus(window, cx);
                 let local = this.local_screen(event.position);
                 if event.click_count >= 2 {
-                    this.open_catalog(local, None);
+                    if let Some(group_id) = this.group_label_at(local)
+                        && let Some(group) = this.groups.iter().find(|group| group.id == group_id)
+                    {
+                        this.group_editor = Some(GroupEditor {
+                            id: group.id.clone(),
+                            query: group.label.clone(),
+                        });
+                    } else {
+                        this.open_catalog(local, None);
+                    }
                     cx.notify();
                     cx.stop_propagation();
                     window.prevent_default();
@@ -2496,6 +2667,7 @@ mod tests {
             offsets: Vec::new(),
             starts,
             moved: true,
+            alter_groups: false,
         });
         editor.cancel_gestures();
         assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
@@ -2544,6 +2716,38 @@ mod tests {
         assert_eq!(editor.filtered_catalog_indices(), vec![0]);
         editor.catalog_menu.as_mut().unwrap().query = "source".into();
         assert!(editor.filtered_catalog_indices().is_empty());
+    }
+
+    #[test]
+    fn group_label_hit_area_matches_rendered_group_origin() {
+        let editor = NodeGraph::new(interactive_graph()).with_groups(vec![GraphGroup {
+            id: "group".into(),
+            label: "Group".into(),
+            color: 0,
+            nodes: [String::from("b")].into_iter().collect(),
+        }]);
+        assert_eq!(
+            editor.group_label_at(core::Point::new(80.0, -10.0)),
+            Some(String::from("group"))
+        );
+        assert_eq!(editor.group_label_at(core::Point::new(20.0, 20.0)), None);
+    }
+
+    #[test]
+    fn alt_drag_membership_adds_inside_and_removes_outside() {
+        let mut editor = NodeGraph::new(interactive_graph()).with_groups(vec![GraphGroup {
+            id: "group".into(),
+            label: "Group".into(),
+            color: 0,
+            nodes: [String::from("b")].into_iter().collect(),
+        }]);
+        editor.graph.nodes.get_mut("a").unwrap().position = core::Point::new(80.0, 0.0);
+        let changes = editor.update_group_memberships(&[String::from("a")]);
+        assert_eq!(changes.len(), 1);
+        assert!(editor.groups[0].nodes.contains("a"));
+        editor.graph.nodes.get_mut("a").unwrap().position = core::Point::new(0.0, 0.0);
+        editor.update_group_memberships(&[String::from("a")]);
+        assert!(!editor.groups[0].nodes.contains("a"));
     }
 
     #[test]

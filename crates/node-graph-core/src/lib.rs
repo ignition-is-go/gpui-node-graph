@@ -249,6 +249,14 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
     GroupCreated {
         node_ids: Vec<N>,
     },
+    GroupMembershipChanged {
+        group_id: String,
+        node_ids: Vec<N>,
+    },
+    GroupLabelChanged {
+        group_id: String,
+        label: String,
+    },
     CreateNode {
         item_id: String,
         position: Point,
