@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/node-graph-core", "crates/gpui-node-graph", "examples/demo"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+gpui = "0.2.2"
+node-graph-core = { path = "crates/node-graph-core" }
+gpui-node-graph = { path = "crates/gpui-node-graph" }
