@@ -44,8 +44,9 @@ GPUI demo to stay alive under Xvfb rather than merely compiling it.
 
 - further transaction ergonomics; explicit uncontrolled ownership now commits previews
   locally, while controlled ownership rolls them back and emits atomic typed mutation batches;
-- further specialized-widget polish; `NodeBodyContext::isolated_control` blocks graph
-  gestures around retained controls, consumer bodies now measure node size and port anchors,
+- further specialized-widget polish; `NodeBodyContext::isolated_control` blocks pointer and
+  keyboard gestures while preserving canvas wheel zoom, with `isolated_scroll_control` for
+  controls that consume wheel input; consumer bodies measure node size and port anchors,
   and the demo exercises editable numeric/color controls, dynamic inputs, and an adaptive
   flip/clamp/Escape-dismiss panel; right-edge resize, rollback, and reset also work;
 - richer nested-group semantics; rendered groups now support inline label editing,

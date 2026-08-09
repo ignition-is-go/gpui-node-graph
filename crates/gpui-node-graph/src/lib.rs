@@ -71,8 +71,9 @@ impl<N: Eq + std::hash::Hash, P: Eq + std::hash::Hash> RenderGeometry<N, P> {
 }
 
 pub struct NodeOverlay {
-    /// Screen-pixel offset from the rendered node origin. Overlay content is not
-    /// viewport-scaled, so retained controls keep normal GPUI hit testing.
+    /// Node-relative world offset transformed with the viewport. Overlay content itself is
+    /// not scaled, so retained controls keep normal GPUI hit testing while their anchor follows
+    /// the node during pan and zoom.
     pub offset: core::Point,
     pub element: AnyElement,
     pub behavior: Option<OverlayBehavior>,
@@ -247,8 +248,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_key_down(|_, _, cx| cx.stop_propagation())
+            .into_any_element()
+    }
+
+    /// Isolate a control that consumes wheel input itself, such as a scrollable list or dial.
+    pub fn isolated_scroll_control(&self, child: impl IntoElement) -> AnyElement {
+        div()
+            .child(self.isolated_control(child))
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .into_any_element()
     }
 
@@ -261,11 +269,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
                 self.theme.port_output
             }
         });
+        let diameter = self.viewport.scale_length(14.0);
         self.port_anchor(
             id,
             div()
-                .w(px(14.0))
-                .h(px(14.0))
+                .w(px(diameter))
+                .h(px(diameter))
                 .rounded_full()
                 .border_1()
                 .border_color(rgb(self.theme.text))
@@ -483,6 +492,80 @@ struct BoxSelection<N, C> {
     baseline_nodes: HashSet<N>,
     baseline_connections: HashSet<C>,
 }
+struct NodeScaleElement {
+    child: Option<AnyElement>,
+    rem_size: Pixels,
+}
+
+impl NodeScaleElement {
+    fn new(child: AnyElement, zoom: f32) -> Self {
+        Self {
+            child: Some(child),
+            rem_size: px(16.0 * zoom),
+        }
+    }
+}
+
+impl Element for NodeScaleElement {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut child = self.child.take().expect("scaled element laid out once");
+        let layout_id = window.with_rem_size(Some(self.rem_size), |window| {
+            child.request_layout(window, cx)
+        });
+        (layout_id, child)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_rem_size(Some(self.rem_size), |window| child.prepaint(window, cx));
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_rem_size(Some(self.rem_size), |window| child.paint(window, cx));
+    }
+}
+
+impl IntoElement for NodeScaleElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 type BoundsCallback = Box<dyn FnMut(Bounds<Pixels>, &mut App)>;
 
 struct MeasuredElement {
@@ -724,19 +807,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     pub fn resolved_node_size(&self, id: &N) -> Option<core::Size> {
-        let node = self.graph.nodes.get(id)?;
-        Some(core::Size {
-            // Width is model-owned and explicitly resizable. Feeding a width measured under
-            // that same constraint back into the shell creates a destructive shrink loop.
-            width: node.size.width,
-            height: self
-                .render_geometry
-                .node_sizes
-                .get(id)
-                .map_or(node.size.height, |measured| {
-                    measured.height.max(node.size.height)
-                }),
-        })
+        // Shell dimensions are model-owned and change only through explicit resize/dynamic-port
+        // mutations. Feeding child measurements made under a zoomed constraint back into layout
+        // causes recursive shrinking and zoom-dependent wrapping. Measurements remain available
+        // through `render_geometry()` but never resize the shell implicitly.
+        self.graph.nodes.get(id).map(|node| node.size)
     }
 
     pub fn resolved_port_position(&self, id: &P) -> Option<core::Point> {
@@ -1290,13 +1365,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn connection_routes(&self) -> HashMap<C, Vec<core::Point>> {
         let fingerprint = format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.config.routing,
             self.config.route_lane_spacing,
             self.graph.nodes,
             self.graph.ports,
             self.graph.connections,
-            self.render_geometry.node_sizes,
             self.render_geometry.port_offsets,
         );
         if self.route_cache.borrow().fingerprint == fingerprint {
@@ -1397,10 +1471,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn render_bounds(&self) -> Option<core::Rect> {
-        let node_sizes = &self.render_geometry.node_sizes;
         let mut nodes = self.graph.nodes.values();
         let first = nodes.next()?;
-        let first_size = node_sizes.get(&first.id).copied().unwrap_or(first.size);
+        let first_size = first.size;
         let (mut left, mut top, mut right, mut bottom) = (
             first.position.x,
             first.position.y,
@@ -1408,7 +1481,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             first.position.y + first_size.height,
         );
         for node in nodes {
-            let size = node_sizes.get(&node.id).copied().unwrap_or(node.size);
+            let size = node.size;
             left = left.min(node.position.x);
             top = top.min(node.position.y);
             right = right.max(node.position.x + size.width);
@@ -1512,7 +1585,6 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     fn update_group_memberships(&mut self, dragged: &[N]) -> Vec<(String, Vec<N>)> {
         let dragged_set: HashSet<_> = dragged.iter().cloned().collect();
         let mut changes = Vec::new();
-        let node_sizes = &self.render_geometry.node_sizes;
         for group in &mut self.groups {
             let mut members = group
                 .nodes
@@ -1524,11 +1596,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             };
             let mut left = first.position.x;
             let mut top = first.position.y;
-            let first_size = node_sizes.get(&first.id).copied().unwrap_or(first.size);
+            let first_size = first.size;
             let mut right = first.position.x + first_size.width;
             let mut bottom = first.position.y + first_size.height;
             for node in members {
-                let size = node_sizes.get(&node.id).copied().unwrap_or(node.size);
+                let size = node.size;
                 left = left.min(node.position.x);
                 top = top.min(node.position.y);
                 right = right.max(node.position.x + size.width);
@@ -2226,8 +2298,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 body_anchored_nodes.insert(id.clone());
             }
             for overlay in body.overlays.drain(..) {
-                let mut overlay_position =
-                    core::Point::new(position.x + overlay.offset.x, position.y + overlay.offset.y);
+                let screen_offset = overlay_screen_offset(overlay.offset, viewport);
+                let mut overlay_position = position + screen_offset;
                 if let Some(behavior) = &overlay.behavior {
                     if self.dismissed_overlays.contains(&behavior.id) {
                         continue;
@@ -2239,7 +2311,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     overlay_position = resolve_overlay_position(
                         position,
                         viewport.scale_length(node.size.width),
-                        overlay.offset,
+                        screen_offset,
                         behavior,
                         core::Size {
                             width: f32::from(canvas.size.width),
@@ -2253,36 +2325,39 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let measured_node = id.clone();
             let raw_body_element = body.element;
             let body_element = if has_custom_body {
-                MeasuredElement::new(raw_body_element, move |bounds, cx| {
-                    let measured = core::Size {
-                        width: model_size.width,
-                        height: f32::from(bounds.size.height) / viewport.zoom + 16.0,
-                    };
-                    if !measured.width.is_finite()
-                        || !measured.height.is_finite()
-                        || measured.width <= 0.0
-                        || measured.height <= 0.0
-                    {
-                        return;
-                    }
-                    let graph = graph.clone();
-                    let node_id = measured_node.clone();
-                    cx.defer(move |cx| {
-                        let _ = graph.update(cx, |editor, cx| {
-                            let changed =
-                                editor.render_geometry.node_sizes.get(&node_id).is_none_or(
-                                    |current| {
-                                        (current.width - measured.width).abs() > 0.1
-                                            || (current.height - measured.height).abs() > 0.1
-                                    },
-                                );
-                            if changed {
-                                editor.render_geometry.node_sizes.insert(node_id, measured);
-                                cx.notify();
-                            }
+                MeasuredElement::new(
+                    NodeScaleElement::new(raw_body_element, viewport.zoom),
+                    move |bounds, cx| {
+                        let measured = core::Size {
+                            width: model_size.width,
+                            height: f32::from(bounds.size.height) / viewport.zoom + 16.0,
+                        };
+                        if !measured.width.is_finite()
+                            || !measured.height.is_finite()
+                            || measured.width <= 0.0
+                            || measured.height <= 0.0
+                        {
+                            return;
+                        }
+                        let graph = graph.clone();
+                        let node_id = measured_node.clone();
+                        cx.defer(move |cx| {
+                            let _ = graph.update(cx, |editor, cx| {
+                                let changed =
+                                    editor.render_geometry.node_sizes.get(&node_id).is_none_or(
+                                        |current| {
+                                            (current.width - measured.width).abs() > 0.1
+                                                || (current.height - measured.height).abs() > 0.1
+                                        },
+                                    );
+                                if changed {
+                                    editor.render_geometry.node_sizes.insert(node_id, measured);
+                                    cx.notify();
+                                }
+                            });
                         });
-                    });
-                })
+                    },
+                )
                 .into_any_element()
             } else {
                 raw_body_element
@@ -2298,18 +2373,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .left(px(position.x))
                     .top(px(position.y))
                     .w(px(viewport.scale_length(node.size.width)))
-                    .when(has_custom_body, |element| {
-                        element.min_h(px(viewport.scale_length(model_size.height)))
-                    })
-                    .when(!has_custom_body, |element| {
-                        element.h(px(viewport.scale_length(node.size.height)))
-                    })
+                    .h(px(viewport.scale_length(model_size.height)))
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(0x52525b))
                     .bg(rgb(background))
                     .text_color(rgb(self.theme.text))
-                    .text_size(px(viewport.scale_length(14.0).clamp(8.0, 24.0)))
+                    .text_size(px(viewport.scale_length(14.0)))
                     .p(px(viewport.scale_length(8.0)))
                     .child(body_element)
                     .on_mouse_down(
@@ -2816,6 +2886,13 @@ fn apply_route_lane(route: &mut Vec<core::Point>, lane: f32, mode: RoutingMode) 
     *route = separated;
 }
 
+fn overlay_screen_offset(offset: core::Point, viewport: Viewport) -> core::Point {
+    core::Point::new(
+        viewport.scale_length(offset.x),
+        viewport.scale_length(offset.y),
+    )
+}
+
 fn resolve_overlay_position(
     node_origin: core::Point,
     node_width: f32,
@@ -3255,6 +3332,18 @@ mod tests {
     }
 
     #[test]
+    fn overlay_anchor_offset_scales_with_viewport_without_scaling_content() {
+        let viewport = Viewport {
+            pan: core::Point::new(25.0, 30.0),
+            zoom: 2.0,
+        };
+        assert_eq!(
+            overlay_screen_offset(core::Point::new(192.0, 20.0), viewport),
+            core::Point::new(384.0, 40.0)
+        );
+    }
+
+    #[test]
     fn adaptive_overlay_flips_and_clamps_to_canvas() {
         let behavior = OverlayBehavior {
             id: "menu".into(),
@@ -3316,34 +3405,30 @@ mod tests {
     }
 
     #[test]
-    fn measured_node_sizes_drive_bounds_and_box_selection() {
+    fn measured_body_size_never_mutates_model_owned_shell_geometry() {
         let mut editor = NodeGraph::new(interactive_graph());
         editor.render_geometry.node_sizes.insert(
             "a".into(),
             core::Size {
-                width: 80.0,
-                height: 90.0,
+                width: 1.0,
+                height: 500.0,
             },
+        );
+        assert_eq!(
+            editor.render_geometry().node_size(&"a".into()),
+            Some(core::Size {
+                width: 1.0,
+                height: 500.0,
+            })
         );
         assert_eq!(
             editor.resolved_node_size(&"a".into()),
             Some(core::Size {
                 width: 50.0,
-                height: 90.0,
+                height: 50.0,
             })
         );
-        assert_eq!(editor.render_bounds().unwrap().size.height, 90.0);
-        assert!(
-            editor
-                .nodes_in_render_rect(core::Rect {
-                    origin: core::Point::new(10.0, 70.0),
-                    size: core::Size {
-                        width: 10.0,
-                        height: 10.0,
-                    },
-                })
-                .contains("a")
-        );
+        assert_eq!(editor.render_bounds().unwrap().size.height, 50.0);
     }
 
     #[test]

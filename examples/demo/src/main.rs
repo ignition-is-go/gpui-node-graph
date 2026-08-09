@@ -281,6 +281,7 @@ fn launch(cx: &mut App) {
                             let show_overlay =
                                 context.node.title == "Multiply" || context.node.title == "Mix";
                             let node_title = context.node.title.clone();
+                            let node_zoom = context.state.zoom;
                             let numeric_control = matches!(
                                 node_title.as_str(),
                                 "Number" | "Math" | "Multiply" | "Mix"
@@ -373,7 +374,7 @@ fn launch(cx: &mut App) {
                                     .unwrap_or_default()
                                     > 0.5;
                                 let swatch = gpui::div()
-                                    .h(gpui::px(18.0))
+                                    .h(gpui::px(18.0 * node_zoom))
                                     .rounded_sm()
                                     .bg(gpui::rgb(if active { 0xf472b6 } else { 0x38bdf8 }))
                                     .on_mouse_down(
@@ -645,7 +646,7 @@ fn browser_test_state() -> String {
             application.update(|cx| {
                 let graph = graph.read(cx);
                 format!(
-                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{}}}"#,
+                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{}}}"#,
                     graph.graph.nodes.len(),
                     graph.catalog_is_open(),
                     graph.is_overlay_dismissed("blend-controls"),
@@ -653,6 +654,9 @@ fn browser_test_state() -> String {
                     graph
                         .resolved_node_size(&String::from("source"))
                         .map_or(0.0, |size| size.width),
+                    graph
+                        .resolved_node_size(&String::from("source"))
+                        .map_or(0.0, |size| size.height),
                 )
             })
         })

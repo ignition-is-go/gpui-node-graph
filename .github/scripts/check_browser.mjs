@@ -138,6 +138,9 @@ const stable = await graphState();
 if (Math.abs(stable.sourceWidth - baseline.sourceWidth) > 0.1) {
   throw new Error(`node width changed across retained frames: ${JSON.stringify({ baseline, stable })}`);
 }
+if (Math.abs(stable.sourceHeight - baseline.sourceHeight) > 0.5) {
+  throw new Error(`node layout changed across zoom: ${JSON.stringify({ baseline, stable })}`);
+}
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
