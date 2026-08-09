@@ -313,7 +313,7 @@ fn launch(cx: &mut App) {
                                         .bg(gpui::rgb(0x18181b))
                                         .px_2()
                                         .py_1()
-                                        .text_size(gpui::px(10.0))
+                                        .text_size(gpui::px(10.0 * node_zoom))
                                         .child(format!("{port_count} typed ports"))
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
