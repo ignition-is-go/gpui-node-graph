@@ -20,6 +20,13 @@ impl PortType for Kind {
     }
 }
 
+static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+
+fn next_id(prefix: &str) -> String {
+    let value = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}_{value}")
+}
+
 fn port(id: &str, label: &str, direction: PortDirection, kind: Kind) -> CatalogPort<Kind> {
     CatalogPort {
         id: id.into(),
@@ -94,14 +101,7 @@ fn insert_connection(
     source: String,
     target: String,
 ) {
-    let mut sequence = graph.connections.len() + 1;
-    let id = loop {
-        let id = format!("connection-{sequence}");
-        if !graph.connections.contains_key(&id) {
-            break id;
-        }
-        sequence += 1;
-    };
+    let id = next_id("conn");
     graph
         .connections
         .insert(id.clone(), Connection { id, source, target });
@@ -119,17 +119,30 @@ fn instantiate_node(
     let Some(item) = catalog.iter().find(|item| item.id == item_id) else {
         return;
     };
-    let mut sequence = editor.graph.nodes.len() + 1;
-    let node_id = loop {
-        let id = format!("{}-{sequence}", item.id);
-        if !editor.graph.nodes.contains_key(&id) {
-            break id;
-        }
-        sequence += 1;
+    let node_id = next_id(&item.id);
+    let templates = if item.id == "custom" {
+        vec![
+            port("in_0", "In 0", PortDirection::Input, Kind::Any),
+            port("in_1", "In 1", PortDirection::Input, Kind::Any),
+            port("out_0", "Out 0", PortDirection::Output, Kind::Any),
+        ]
+    } else {
+        item.ports.clone()
+    };
+    let input_count = templates
+        .iter()
+        .filter(|port| port.direction == PortDirection::Input)
+        .count();
+    let output_count = templates.len() - input_count;
+    let rows = input_count.max(output_count);
+    let body_height = match item.id.as_str() {
+        "mix" => 25.0,
+        "custom" => 54.0,
+        _ => 0.0,
     };
     let node_size = Size {
-        width: 180.0,
-        height: 72.0 + item.ports.len() as f32 * 22.0,
+        width: if item.id == "mix" { 202.0 } else { 160.0 },
+        height: 39.0 + body_height + rows as f32 * 20.0,
     };
     editor.graph.nodes.insert(
         node_id.clone(),
@@ -143,7 +156,7 @@ fn instantiate_node(
     let mut input_row = 0;
     let mut output_row = 0;
     let mut auto_port = None;
-    for template in &item.ports {
+    for template in &templates {
         let row = if template.direction == PortDirection::Input {
             let row = input_row;
             input_row += 1;
@@ -165,11 +178,11 @@ fn instantiate_node(
                 position: Point::new(
                     position.x
                         + if template.direction == PortDirection::Input {
-                            0.0
+                            14.0
                         } else {
-                            node_size.width
+                            node_size.width - 14.0
                         },
-                    position.y + 52.0 + row as f32 * 22.0,
+                    position.y + 45.0 + body_height + row as f32 * 20.0,
                 ),
             },
         );
@@ -366,6 +379,67 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
         accent,
     );
 
+    if node.title == "Custom" {
+        for (row, (label, count, control)) in [
+            (
+                "Inputs",
+                context
+                    .ports
+                    .iter()
+                    .filter(|port| port.direction == PortDirection::Input)
+                    .count(),
+                "inputs-count",
+            ),
+            (
+                "Outputs",
+                context
+                    .ports
+                    .iter()
+                    .filter(|port| port.direction == PortDirection::Output)
+                    .count(),
+                "outputs-count",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let y = node.position.y + 33.0 + row as f32 * 28.0;
+            world_text(
+                &mut scene,
+                node.position.x + 10.0,
+                y + 4.0,
+                label.to_uppercase(),
+                10.0,
+                0x71717a,
+            );
+            let select = Rect {
+                origin: Point::new(node.position.x + 56.0, y),
+                size: Size {
+                    width: node.size.width - 66.0,
+                    height: 22.0,
+                },
+            };
+            scene.push(WorldPrimitive::Quad {
+                bounds: select,
+                fill: WorldColor::rgb(0x27272a),
+                corner_radius: 4.0,
+            });
+            world_text(
+                &mut scene,
+                select.origin.x + 7.0,
+                select.origin.y + 4.0,
+                count.to_string(),
+                11.0,
+                0xd4d4d8,
+            );
+            scene.push_hit_region(WorldHitRegion::new(
+                format!("{}:{control}", node.id),
+                HitRole::Control,
+                HitShape::Rect(select),
+            ));
+        }
+    }
+
     if node.title == "Mix" {
         world_text(
             &mut scene,
@@ -464,6 +538,110 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
         }
     }
     scene
+}
+
+fn cycle_custom_port_count(
+    editor: &mut NodeGraph<Kind>,
+    node_id: &str,
+    direction: PortDirection,
+    cx: &mut gpui::Context<NodeGraph<Kind>>,
+) {
+    let Some(node) = editor.graph.nodes.get(node_id).cloned() else {
+        return;
+    };
+    let prefix = if direction == PortDirection::Input {
+        "in"
+    } else {
+        "out"
+    };
+    let current = editor
+        .graph
+        .ports
+        .values()
+        .filter(|port| port.node == node_id && port.direction == direction)
+        .count();
+    let next = (current + 1) % 9;
+    if next < current {
+        let ids: Vec<_> = editor
+            .graph
+            .ports
+            .values()
+            .filter(|port| port.node == node_id && port.direction == direction)
+            .filter_map(|port| {
+                let index = port
+                    .label
+                    .split_whitespace()
+                    .last()?
+                    .parse::<usize>()
+                    .ok()?;
+                (index >= next).then(|| port.id.clone())
+            })
+            .collect();
+        for id in ids {
+            editor.remove_port_with_tombstones(&id, cx);
+        }
+    } else {
+        for index in current..next {
+            let id = format!("{node_id}_{prefix}_{index}");
+            editor.graph.ports.insert(
+                id.clone(),
+                Port {
+                    id,
+                    node: node_id.to_string(),
+                    label: format!(
+                        "{} {index}",
+                        if direction == PortDirection::Input {
+                            "In"
+                        } else {
+                            "Out"
+                        }
+                    ),
+                    direction,
+                    kind: Kind::Any,
+                    position: Point::new(0.0, 0.0),
+                },
+            );
+        }
+    }
+    let inputs = editor
+        .graph
+        .ports
+        .values()
+        .filter(|port| port.node == node_id && port.direction == PortDirection::Input)
+        .count();
+    let outputs = editor
+        .graph
+        .ports
+        .values()
+        .filter(|port| port.node == node_id && port.direction == PortDirection::Output)
+        .count();
+    let height = 39.0 + 54.0 + inputs.max(outputs) as f32 * 20.0;
+    if let Some(node) = editor.graph.nodes.get_mut(node_id) {
+        node.size.height = height;
+    }
+    for port in editor
+        .graph
+        .ports
+        .values_mut()
+        .filter(|port| port.node == node_id)
+    {
+        let index = port
+            .label
+            .split_whitespace()
+            .last()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        port.position = Point::new(
+            node.position.x
+                + if port.direction == PortDirection::Input {
+                    14.0
+                } else {
+                    node.size.width - 14.0
+                },
+            node.position.y + 99.0 + index as f32 * 20.0,
+        );
+    }
+    cx.notify();
 }
 
 fn launch(cx: &mut App) {
@@ -577,6 +755,18 @@ fn launch(cx: &mut App) {
             graph.update(cx, |_, cx| {
                 cx.subscribe(&graph, move |editor, _, event, cx| {
                     match event {
+                        GraphEvent::NodeControlActivated {
+                            node_id,
+                            control_id,
+                        } if control_id.ends_with(":inputs-count") => {
+                            cycle_custom_port_count(editor, node_id, PortDirection::Input, cx);
+                        }
+                        GraphEvent::NodeControlActivated {
+                            node_id,
+                            control_id,
+                        } if control_id.ends_with(":outputs-count") => {
+                            cycle_custom_port_count(editor, node_id, PortDirection::Output, cx);
+                        }
                         GraphEvent::NodeControlActivated {
                             node_id,
                             control_id,
