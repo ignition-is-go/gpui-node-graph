@@ -21,6 +21,10 @@ impl PortType for Kind {
 }
 
 static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+thread_local! {
+    static MIX_AMOUNTS: std::cell::RefCell<std::collections::HashMap<String, f32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 fn next_id(prefix: &str) -> String {
     let value = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -786,12 +790,6 @@ fn launch(cx: &mut App) {
                 >::new()));
             let renderer_factors = mix_factors.clone();
             let event_factors = mix_factors.clone();
-            let mix_amounts =
-                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
-                    String,
-                    f32,
-                >::new()));
-            let renderer_amounts = mix_amounts.clone();
             let graph = cx.new(move |cx| {
                 let graph = leptos_demo_graph();
                 NodeGraph::new_in(graph, cx)
@@ -828,30 +826,28 @@ fn launch(cx: &mut App) {
                                 return Vec::new();
                             }
                             let node_id = context.node.id.clone();
-                            let amount = renderer_amounts
-                                .borrow()
-                                .get(&node_id)
-                                .copied()
-                                .unwrap_or(0.5);
+                            let amount = MIX_AMOUNTS.with(|amounts| {
+                                amounts.borrow().get(&node_id).copied().unwrap_or(0.5)
+                            });
                             let slider_steps = (0..=100)
                                 .map(|step| {
-                                    let down_amounts = renderer_amounts.clone();
                                     let down_node_id = node_id.clone();
-                                    let move_amounts = renderer_amounts.clone();
                                     let move_node_id = node_id.clone();
                                     let value = step as f32 / 100.0;
                                     gpui::div()
                                         .absolute()
-                                        .left(gpui::px(2.0 + step as f32 * 1.64))
+                                        .left(gpui::px(2.0 + step as f32 * 1.72))
                                         .top_0()
                                         .w(gpui::px(2.0))
                                         .h(gpui::px(14.0))
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
                                             move |_, window, cx| {
-                                                down_amounts
-                                                    .borrow_mut()
-                                                    .insert(down_node_id.clone(), value);
+                                                MIX_AMOUNTS.with(|amounts| {
+                                                    amounts
+                                                        .borrow_mut()
+                                                        .insert(down_node_id.clone(), value);
+                                                });
                                                 cx.refresh_windows();
                                                 cx.stop_propagation();
                                                 window.prevent_default();
@@ -860,9 +856,11 @@ fn launch(cx: &mut App) {
                                         .on_mouse_move(move |event, window, cx| {
                                             if event.pressed_button == Some(gpui::MouseButton::Left)
                                             {
-                                                move_amounts
-                                                    .borrow_mut()
-                                                    .insert(move_node_id.clone(), value);
+                                                MIX_AMOUNTS.with(|amounts| {
+                                                    amounts
+                                                        .borrow_mut()
+                                                        .insert(move_node_id.clone(), value);
+                                                });
                                                 cx.refresh_windows();
                                                 cx.stop_propagation();
                                                 window.prevent_default();
@@ -1059,7 +1057,7 @@ fn browser_test_state() -> String {
             application.update(|cx| {
                 let graph = graph.read(cx);
                 format!(
-                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
+                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"mixAmount":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
                     graph.graph.nodes.len(),
                     graph.graph.connections.len(),
                     graph.catalog_is_open(),
@@ -1074,6 +1072,9 @@ fn browser_test_state() -> String {
                     graph.last_world_control().is_some(),
                     graph.last_world_control().map_or("", |(_, control)| control),
                     graph.active_overlay_count(),
+                    MIX_AMOUNTS.with(|amounts| {
+                        amounts.borrow().get("mix_1").copied().unwrap_or(0.5)
+                    }),
                     graph.graph.selected_nodes.len(),
                     graph.graph.nodes["mix_1"].position.x,
                     graph.graph.nodes["mix_1"].position.y,

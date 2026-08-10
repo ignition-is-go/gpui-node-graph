@@ -183,6 +183,8 @@ await command("Input.dispatchMouseEvent", {
 });
 await waitFor("world-space control activation", (value) => value.controlActivated);
 await saveStateScreenshot("overlay");
+await drag(left + 545, top + 121, left + 700, top + 121);
+await waitFor("Mix range dragging", (value) => value.mixAmount > 0.85);
 await key("Escape", "Escape");
 await waitFor("overlay dismissal", (value) => value.overlayDismissed);
 await click(left + 509, top + 91);
@@ -257,6 +259,7 @@ const transitions = {
   clickConnected: true,
   blendChanged: true,
   factorChanged: true,
+  rangeDragged: true,
   worldControlActivated: true,
   overlayDismissed: true,
   overlayOutsideDismissed: true,
