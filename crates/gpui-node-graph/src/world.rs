@@ -77,6 +77,13 @@ pub enum WorldPrimitive {
         fill: WorldColor,
         corner_radius: f32,
     },
+    BorderedQuad {
+        bounds: core::Rect,
+        fill: WorldColor,
+        border: WorldColor,
+        border_width: f32,
+        corner_radius: f32,
+    },
     Line {
         start: core::Point,
         end: core::Point,
@@ -290,6 +297,19 @@ impl WorldPrimitive {
                 fill: *fill,
                 corner_radius: transform.length(*corner_radius),
             },
+            Self::BorderedQuad {
+                bounds,
+                fill,
+                border,
+                border_width,
+                corner_radius,
+            } => ScreenPrimitive::BorderedQuad {
+                bounds: transform.rect(*bounds),
+                fill: *fill,
+                border: *border,
+                border_width: transform.length(*border_width),
+                corner_radius: transform.length(*corner_radius),
+            },
             Self::Line {
                 start,
                 end,
@@ -335,6 +355,13 @@ pub enum ScreenPrimitive {
     Quad {
         bounds: core::Rect,
         fill: WorldColor,
+        corner_radius: f32,
+    },
+    BorderedQuad {
+        bounds: core::Rect,
+        fill: WorldColor,
+        border: WorldColor,
+        border_width: f32,
         corner_radius: f32,
     },
     Line {

@@ -325,17 +325,34 @@ fn world_text(
     });
 }
 
-fn world_socket(scene: &mut WorldScene, port: &Port<String, String, Kind>, connected: bool) {
+fn world_socket(
+    scene: &mut WorldScene,
+    port: &Port<String, String, Kind>,
+    connected: bool,
+    style: &gpui_node_graph::style::AnchorStyle,
+    node_background: gpui_node_graph::style::Color,
+) {
     scene.push(WorldPrimitive::Circle {
         center: port.position,
-        radius: 4.0,
-        fill: WorldColor::rgb(0x71717a),
+        radius: style.dot_size * 0.5,
+        fill: WorldColor::rgba(
+            if connected {
+                style.dot_connected_color.rgb
+            } else {
+                style.dot_color.rgb
+            },
+            if connected {
+                style.dot_connected_color.alpha
+            } else {
+                style.dot_color.alpha
+            },
+        ),
     });
     if !connected {
         scene.push(WorldPrimitive::Circle {
             center: port.position,
-            radius: 2.5,
-            fill: WorldColor::rgb(0x111111),
+            radius: (style.dot_size * 0.5 - style.dot_border_width).max(0.0),
+            fill: WorldColor::rgba(node_background.rgb, node_background.alpha),
         });
     }
 }
@@ -343,6 +360,8 @@ fn world_socket(scene: &mut WorldScene, port: &Port<String, String, Kind>, conne
 fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> WorldScene {
     let mut scene = WorldScene::new();
     let node = &context.node;
+    let node_style = &context.style.node;
+    let anchor_style = &context.style.anchor;
     let (category, accent) = match node.title.as_str() {
         "Color Source" => ("INPUT", 0x22d3ee),
         "Mix" => ("COLOR", 0xf59e0b),
@@ -355,7 +374,7 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
             origin: node.position,
             size: Size {
                 width: node.size.width,
-                height: 2.0,
+                height: node_style.header_accent_height,
             },
         },
         fill: WorldColor::rgb(accent),
@@ -363,17 +382,17 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
     });
     world_text(
         &mut scene,
-        node.position.x + 10.0,
-        node.position.y + 8.0,
+        node.position.x + node_style.padding_x,
+        node.position.y + node_style.header_accent_height + node_style.header_padding_y + 2.0,
         node.title.to_uppercase(),
-        12.0,
-        0xa1a1aa,
+        node_style.header_font_size,
+        node_style.header_color.rgb,
     );
     let category_width = category.len() as f32 * 6.0;
     world_text(
         &mut scene,
-        node.position.x + node.size.width - 10.0 - category_width,
-        node.position.y + 8.0,
+        node.position.x + node.size.width - node_style.padding_x - category_width,
+        node.position.y + node_style.header_accent_height + node_style.header_padding_y + 2.0,
         category,
         10.0,
         accent,
@@ -419,9 +438,11 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
                     height: 22.0,
                 },
             };
-            scene.push(WorldPrimitive::Quad {
+            scene.push(WorldPrimitive::BorderedQuad {
                 bounds: select,
                 fill: WorldColor::rgb(0x27272a),
+                border: WorldColor::rgb(0x3f3f46),
+                border_width: 1.0,
                 corner_radius: 4.0,
             });
             world_text(
@@ -449,7 +470,7 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
             11.0,
             0xa1a1aa,
         );
-        scene.push(WorldPrimitive::Quad {
+        scene.push(WorldPrimitive::BorderedQuad {
             bounds: Rect {
                 origin: Point::new(node.position.x + 54.0, node.position.y + 30.5),
                 size: Size {
@@ -458,6 +479,8 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
                 },
             },
             fill: WorldColor::rgb(0x27272a),
+            border: WorldColor::rgb(0x3f3f46),
+            border_width: 1.0,
             corner_radius: 4.0,
         });
         world_text(
@@ -468,7 +491,7 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
             11.0,
             0xd4d4d8,
         );
-        scene.push(WorldPrimitive::Quad {
+        scene.push(WorldPrimitive::BorderedQuad {
             bounds: Rect {
                 origin: Point::new(node.position.x + 167.0, node.position.y + 29.0),
                 size: Size {
@@ -477,6 +500,8 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
                 },
             },
             fill: WorldColor::rgb(0x27272a),
+            border: WorldColor::rgb(0x3f3f46),
+            border_width: 1.0,
             corner_radius: 4.0,
         });
         scene.push(WorldPrimitive::Line {
@@ -506,7 +531,13 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
 
     let connected = ["color_source_0_color", "mix_1_b"];
     for port in context.ports.iter() {
-        world_socket(&mut scene, port, connected.contains(&port.id.as_str()));
+        world_socket(
+            &mut scene,
+            port,
+            connected.contains(&port.id.as_str()),
+            anchor_style,
+            node_style.background,
+        );
         let (x, y) = match (node.title.as_str(), port.label.as_str(), port.direction) {
             ("Color Source", "Color", _) => (node.position.x + 107.0, port.position.y - 6.0),
             ("Color Source", "Alpha", _) => (node.position.x + 107.0, port.position.y - 6.0),
@@ -514,9 +545,16 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
             (_, _, PortDirection::Input) => (port.position.x + 9.0, port.position.y - 6.0),
             (_, _, PortDirection::Output) => (port.position.x - 50.0, port.position.y - 6.0),
         };
-        world_text(&mut scene, x, y, port.label.clone(), 11.0, 0xa1a1aa);
+        world_text(
+            &mut scene,
+            x,
+            y,
+            port.label.clone(),
+            anchor_style.label_font_size,
+            anchor_style.label_color.rgb,
+        );
         if port.direction == PortDirection::Input && port.kind == Kind::Float {
-            scene.push(WorldPrimitive::Quad {
+            scene.push(WorldPrimitive::BorderedQuad {
                 bounds: Rect {
                     origin: Point::new(node.position.x + 60.0, port.position.y - 9.0),
                     size: Size {
@@ -525,6 +563,8 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
                     },
                 },
                 fill: WorldColor::rgb(0x27272a),
+                border: WorldColor::rgb(0x3f3f46),
+                border_width: 1.0,
                 corner_radius: 4.0,
             });
             world_text(

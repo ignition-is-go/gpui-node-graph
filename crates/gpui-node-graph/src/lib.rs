@@ -1,11 +1,11 @@
 mod windows;
 
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, Context, DispatchPhase, Element, ElementId, FocusHandle,
-    GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, ShapedLine,
-    SharedString, TextAlign, TextRun, WeakEntity, Window, canvas, div, point, prelude::*, px, quad,
-    rgb,
+    AnyElement, App, BorderStyle, Bounds, BoxShadow, Context, DispatchPhase, Element, ElementId,
+    FocusHandle, GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent,
+    ShapedLine, SharedString, TextAlign, TextRun, WeakEntity, Window, canvas, div, point,
+    prelude::*, px, quad, rgb,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -436,7 +436,7 @@ impl Default for EditorConfig {
             default_node_width: 180.0,
             visibility_margin: 160.0,
             route_lane_spacing: 8.0,
-            route_corner_radius: 7.0,
+            route_corner_radius: 6.0,
             mutation_mode: MutationMode::Uncontrolled,
         }
     }
@@ -637,6 +637,26 @@ pub fn world_scene_element(scene: world::WorldScene, viewport: Viewport) -> AnyE
                             rgb(fill.rgb).opacity(fill.alpha),
                             px(0.0),
                             gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
+                    }
+                    world::ScreenPrimitive::BorderedQuad {
+                        bounds: rect,
+                        fill,
+                        border,
+                        border_width,
+                        corner_radius,
+                    } => {
+                        let paint_bounds = Bounds::new(
+                            point(px(rect.origin.x + offset.x), px(rect.origin.y + offset.y)),
+                            gpui::size(px(rect.size.width), px(rect.size.height)),
+                        );
+                        window.paint_quad(quad(
+                            paint_bounds,
+                            px(*corner_radius),
+                            rgb(fill.rgb).opacity(fill.alpha),
+                            px(*border_width),
+                            rgb(border.rgb).opacity(border.alpha),
                             BorderStyle::default(),
                         ));
                     }
@@ -2842,6 +2862,27 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let node_background = self.style.node.background;
             let node_radius = self.style.node.border_radius;
             let selected_outline = self.style.node.outline_selected;
+            let node_border = self.style.node.border;
+            let dragging = self
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.starts.iter().any(|(node_id, _)| node_id == &id));
+            let node_shadows = if selected {
+                &self.style.node.shadow_selected
+            } else {
+                &self.style.node.shadow
+            }
+            .iter()
+            .map(|shadow| {
+                BoxShadow::new(
+                    px(viewport.scale_length(shadow.offset_x)),
+                    px(viewport.scale_length(shadow.offset_y)),
+                    rgb(shadow.color.rgb).opacity(shadow.color.alpha).into(),
+                )
+                .blur_radius(px(viewport.scale_length(shadow.blur)))
+                .spread_radius(px(viewport.scale_length(shadow.spread)))
+            })
+            .collect::<Vec<_>>();
             root = root.child(
                 div()
                     .absolute()
@@ -2850,7 +2891,23 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .w(px(viewport.scale_length(node.size.width)))
                     .h(px(viewport.scale_length(model_size.height)))
                     .rounded(px(viewport.scale_length(node_radius)))
+                    .shadow(node_shadows)
                     .overflow_hidden()
+                    .opacity(if dragging {
+                        self.style.node.opacity_dragging
+                    } else {
+                        1.0
+                    })
+                    .when(!selected && node_border.width > 0.0, |element| {
+                        element
+                            .border(px(viewport.scale_length(node_border.width)))
+                            .border_color(
+                                rgb(node_border.color.rgb).opacity(node_border.color.alpha),
+                            )
+                            .when(node_border.style == style::LineStyle::Dashed, |element| {
+                                element.border_dashed()
+                            })
+                    })
                     .when(selected, |element| {
                         element
                             .border(px(viewport.scale_length(selected_outline.width)))
@@ -2887,7 +2944,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 cx.notify();
                                 return;
                             }
-                            if let Some(port_id) = this.port_at_screen(local, 10.0) {
+                            if let Some(port_id) = this.port_at_screen(
+                                local,
+                                this.graph
+                                    .viewport
+                                    .scale_length(this.style.anchor.dot_size * 0.5),
+                            ) {
                                 this.start_draft(&port_id, cx);
                                 return;
                             }
@@ -3149,7 +3211,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 cx.notify();
                                 return;
                             }
-                            if let Some(port_id) = this.port_at_screen(local, 10.0) {
+                            if let Some(port_id) = this.port_at_screen(
+                                local,
+                                this.graph
+                                    .viewport
+                                    .scale_length(this.style.anchor.dot_size * 0.5),
+                            ) {
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
@@ -3164,7 +3231,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     this.graph.nodes.get(&node_id).is_some_and(|node| {
                                         let world = this.graph.viewport.screen_to_world(local);
                                         (world.x - (node.position.x + node.size.width)).abs()
-                                            <= 8.0 / this.graph.viewport.zoom
+                                            <= this.style.node.resize_handle_width
                                     });
                                 if on_resize_edge {
                                     if event.click_count >= 2 {
@@ -3387,7 +3454,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     this.graph.selected_nodes.clone(),
                     this.graph.selected_connections.clone(),
                 );
-                if let Some(connection) = this.connection_at(local, 7.0) {
+                if let Some(connection) = this.connection_at(
+                    local,
+                    this.graph
+                        .viewport
+                        .scale_length(this.style.connection.stroke_width * 0.5),
+                ) {
                     if event.modifiers.shift {
                         if !this.graph.selected_connections.remove(&connection) {
                             this.graph.selected_connections.insert(connection);
