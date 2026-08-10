@@ -2543,8 +2543,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
         if self.group_editor.is_some() {
             match key {
-                "escape" => self.group_editor = None,
-                "enter" => {
+                "escape" | "enter" => {
                     if let Some(editor) = self.group_editor.take()
                         && !editor.query.trim().is_empty()
                     {
