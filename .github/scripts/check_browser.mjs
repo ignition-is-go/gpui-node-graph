@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
+import { execFileSync } from "node:child_process";
 const [url, port = "9222", initialScreenshot] = process.argv.slice(2);
 if (!url) throw new Error("usage: check_browser.mjs URL [DEBUG_PORT]");
 const deadline = Date.now() + 60_000;
@@ -81,9 +83,11 @@ const canvasState = await command("Runtime.evaluate", {
 });
 const { left, top, x, y } = canvasState.result.value;
 const pause = (ms = 300) => new Promise((resolve) => setTimeout(resolve, ms));
-async function click(clickCount = 1) {
+async function click(atX = x, atY = y, clickCount = 1) {
   for (const type of ["mousePressed", "mouseReleased"])
-    await command("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount });
+    await command("Input.dispatchMouseEvent", {
+      type, x: atX, y: atY, button: "left", clickCount,
+    });
 }
 async function key(key, code = key, text) {
   const params = { key, code, ...(text ? { text } : {}) };
@@ -92,6 +96,28 @@ async function key(key, code = key, text) {
 }
 async function shot() {
   await pause();
+  if (process.env.NODE_GRAPH_X11_CAPTURE === "1") {
+    const geometry = await command("Runtime.evaluate", {
+      expression: `JSON.stringify({
+        screenX, screenY, outerWidth, outerHeight, innerWidth, innerHeight,
+        rect: document.querySelector("canvas").getBoundingClientRect().toJSON(),
+      })`,
+      returnByValue: true,
+    });
+    const { screenX, screenY, outerWidth, outerHeight, innerWidth, innerHeight, rect } =
+      JSON.parse(geometry.result.value);
+    const x = Math.round(screenX + (outerWidth - innerWidth) / 2 + rect.x);
+    const y = Math.round(screenY + outerHeight - innerHeight + rect.y);
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
+    const root = `${os.tmpdir()}/node-graph-root-${process.pid}.png`;
+    execFileSync("import", ["-display", process.env.DISPLAY, "-window", "root", root]);
+    const png = execFileSync("convert", [
+      root, "-crop", `${width}x${height}+${x}+${y}`, "+repage", "png:-",
+    ], { maxBuffer: 16 * 1024 * 1024 });
+    fs.rmSync(root, { force: true });
+    return png.toString("base64");
+  }
   return (await command("Page.captureScreenshot", {
     format: "png", captureBeyondViewport: false,
   })).data;
@@ -128,10 +154,7 @@ async function waitFor(label, predicate) {
 
 const baseline = await graphState();
 if (initialScreenshot) {
-  const captured = await command("Page.captureScreenshot", {
-    format: "png", captureBeyondViewport: false,
-  });
-  fs.writeFileSync(initialScreenshot, Buffer.from(captured.data, "base64"));
+  fs.writeFileSync(initialScreenshot, Buffer.from(await shot(), "base64"));
 }
 if (baseline.sourceWidth < 100) {
   throw new Error(`node width collapsed before interaction trace: ${JSON.stringify(baseline)}`);
@@ -159,6 +182,9 @@ const created = await waitFor(
   "searched node creation",
   (value) => !value.catalogOpen && value.nodes === baseline.nodes + 1,
 );
+await click(left + 195, top + 95);
+await click(left + 344, top + 120);
+await waitFor("click-to-connect ports", (value) => value.connections === baseline.connections + 1);
 await key("Escape", "Escape");
 await pause();
 await command("Input.dispatchMouseEvent", {
@@ -179,6 +205,7 @@ if (stable.worldLayout !== created.worldLayout) {
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
+  clickConnected: true,
   worldControlActivated: true,
   overlayDismissed: true,
   viewportChanged: zoomed.zoom !== created.zoom,

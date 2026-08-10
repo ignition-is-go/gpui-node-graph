@@ -890,8 +890,9 @@ fn browser_test_state() -> String {
             application.update(|cx| {
                 let graph = graph.read(cx);
                 format!(
-                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"worldLayout":"{}"}}"#,
+                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"worldLayout":"{}"}}"#,
                     graph.graph.nodes.len(),
+                    graph.graph.connections.len(),
                     graph.catalog_is_open(),
                     graph.is_overlay_dismissed("mix-amount"),
                     graph.graph.viewport.zoom,
@@ -1004,22 +1005,16 @@ mod parity_tests {
             .collect::<Vec<_>>()
             .into();
         let zooms = [0.1, 0.740818, 1.0, 1.349859, 2.0, 5.0];
-        let scenes = zooms.map(|zoom| {
-            leptos_world_node(WorldNodeBodyContext {
-                node: node.clone(),
-                ports: ports.clone(),
-                state: gpui_node_graph::NodeVisualState {
-                    selected: false,
-                    visible: true,
-                    zoom,
-                },
-                style: gpui_node_graph::style::leptos_demo(),
-            })
+        let scene = leptos_world_node(WorldNodeBodyContext {
+            node: node.clone(),
+            ports: ports.clone(),
+            state: gpui_node_graph::WorldNodeVisualState {
+                selected: false,
+                visible: true,
+            },
+            style: gpui_node_graph::style::leptos_demo(),
         });
-        for scene in &scenes[1..] {
-            assert_eq!(scene, &scenes[0], "zoom changed the authored display list");
-        }
-        let control = scenes[0]
+        let control = scene
             .hit_regions
             .iter()
             .find(|hit| hit.id.ends_with(":mix-amount"))
@@ -1029,9 +1024,7 @@ mod parity_tests {
             let center_world = Point::new(509.5, 91.5);
             let screen = transform.point(center_world);
             assert_eq!(
-                scenes[0]
-                    .hit_test_screen(screen, transform)
-                    .map(|hit| &hit.id),
+                scene.hit_test_screen(screen, transform).map(|hit| &hit.id),
                 Some(&control.id),
                 "inverse hit testing failed at zoom {zoom}",
             );

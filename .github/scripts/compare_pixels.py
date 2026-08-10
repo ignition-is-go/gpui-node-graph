@@ -11,8 +11,11 @@ width = min(reference.width, actual.width)
 height = min(reference.height, actual.height)
 if width < 1000 or height < 600:
     raise SystemExit(f"unexpected screenshot size: reference={reference.size}, actual={actual.size}")
-reference = reference.crop((0, 0, width, height))
-actual = actual.crop((0, 0, width, height))
+# X11 app-window capture includes a one-pixel compositor separator above the page.
+# Ignore the same row in both images; all authored content remains position-aligned.
+reference = reference.crop((0, 1, width, height))
+actual = actual.crop((0, 1, width, height))
+height -= 1
 difference = ImageChops.difference(reference, actual)
 stat = ImageStat.Stat(difference)
 mae = sum(stat.mean) / 3.0

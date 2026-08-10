@@ -4,8 +4,8 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, BoxShadow, Context, DispatchPhase, Element, ElementId,
     FocusHandle, FontWeight, GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render,
-    ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, WeakEntity, Window, canvas,
-    div, point, prelude::*, px, quad, rgb,
+    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, WeakEntity,
+    Window, canvas, div, point, prelude::*, px, quad, rgb,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -161,6 +161,13 @@ pub struct NodeVisualState {
     pub visible: bool,
     pub zoom: f32,
 }
+/// Viewport-independent state exposed to immutable world display-list renderers.
+/// Deliberately omits zoom and pan so world layout cannot branch on projection state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorldNodeVisualState {
+    pub selected: bool,
+    pub visible: bool,
+}
 
 pub struct NodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> {
     pub node: Node<N>,
@@ -190,7 +197,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 window.prevent_default();
-                let _ = graph_down.update(cx, |editor, cx| editor.start_draft(&down_id, cx));
+                let _ = graph_down.update(cx, |editor, cx| editor.engage_port(&down_id, cx));
             })
             .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                 cx.stop_propagation();
@@ -354,7 +361,7 @@ where
 pub struct WorldNodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId> {
     pub node: Node<N>,
     pub ports: Arc<[Port<N, P, T>]>,
-    pub state: NodeVisualState,
+    pub state: WorldNodeVisualState,
     pub style: GraphStyle,
 }
 
@@ -914,9 +921,11 @@ pub struct NodeGraph<
     drag: Option<NodeDrag<N>>,
     resize: Option<ResizeDrag<N, P>>,
     panning: Option<core::Point>,
+    last_pointer_screen: Option<core::Point>,
     draft: Option<DraftConnection<P, C>>,
     catalog: Vec<NodeCatalogItem<T>>,
     catalog_menu: Option<CatalogMenu<P>>,
+    catalog_scroll_handle: ScrollHandle,
     node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
     world_node_body_renderer: Option<Box<dyn WorldNodeBodyRenderer<T, N, P>>>,
     node_overlay_renderer: Option<Box<dyn NodeOverlayRenderer<T, N, P>>>,
@@ -966,9 +975,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             drag: None,
             resize: None,
             panning: None,
+            last_pointer_screen: None,
             draft: None,
             catalog: Vec::new(),
             catalog_menu: None,
+            catalog_scroll_handle: ScrollHandle::new(),
             node_body_renderer: None,
             world_node_body_renderer: None,
             node_overlay_renderer: None,
@@ -1281,6 +1292,70 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .collect()
     }
 
+    fn scroll_selected_catalog_item_into_view(&self) {
+        let filtered = self.filtered_catalog_entries();
+        let Some(menu) = self.catalog_menu.as_ref() else {
+            return;
+        };
+        let mut previous_category: Option<&str> = None;
+        let mut child_index = 0;
+        for (row, (item_index, _)) in filtered.into_iter().enumerate() {
+            let category = self.catalog[item_index].category.as_str();
+            if previous_category != Some(category) {
+                child_index += 1;
+                previous_category = Some(category);
+            }
+            if row == menu.selected {
+                self.catalog_scroll_handle.scroll_to_item(child_index);
+                return;
+            }
+            child_index += 1;
+        }
+    }
+
+    fn filtered_catalog_entries(&self) -> Vec<(usize, Option<usize>)> {
+        let Some(menu) = self.catalog_menu.as_ref() else {
+            return Vec::new();
+        };
+        self.filtered_catalog_indices()
+            .into_iter()
+            .flat_map(|item_index| {
+                let compatible: Vec<_> = menu
+                    .connect_from
+                    .as_ref()
+                    .map(|origin| {
+                        let origin = &self.graph.ports[origin];
+                        self.catalog[item_index]
+                            .ports
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(port_index, candidate)| {
+                                let compatible = match (origin.direction, candidate.direction) {
+                                    (PortDirection::Output, PortDirection::Input) => {
+                                        T::compatible(&origin.kind, &candidate.kind)
+                                    }
+                                    (PortDirection::Input, PortDirection::Output) => {
+                                        T::compatible(&candidate.kind, &origin.kind)
+                                    }
+                                    _ => false,
+                                };
+                                compatible.then_some(port_index)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if menu.connect_from.is_none() {
+                    vec![(item_index, None)]
+                } else {
+                    compatible
+                        .into_iter()
+                        .map(|port_index| (item_index, Some(port_index)))
+                        .collect()
+                }
+            })
+            .collect()
+    }
+
     fn open_catalog(&mut self, at_screen: core::Point, connect_from: Option<P>) {
         if self.catalog.is_empty() {
             self.catalog_menu = None;
@@ -1296,17 +1371,25 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         });
     }
 
-    fn choose_catalog(&mut self, item_index: usize, cx: &mut Context<Self>) {
+    fn choose_catalog(
+        &mut self,
+        item_index: usize,
+        port_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(menu) = self.catalog_menu.take() else {
             return;
         };
         let Some(item) = self.catalog.get(item_index) else {
             return;
         };
-        let compatible = menu
-            .connect_from
-            .as_ref()
-            .and_then(|origin| self.compatible_catalog_port(item_index, origin))
+        let compatible = port_index
+            .and_then(|port_index| item.ports.get(port_index))
+            .or_else(|| {
+                menu.connect_from
+                    .as_ref()
+                    .and_then(|origin| self.compatible_catalog_port(item_index, origin))
+            })
             .map(|port| (port.id.clone(), port.direction));
         cx.emit(core::GraphEvent::CreateNode {
             item_id: item.id.clone(),
@@ -1656,6 +1739,26 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             }
         }
         nearest.map(|(id, _)| id)
+    }
+
+    /// Preserve an in-flight click draft when another port is pressed; a compatible
+    /// target becomes the pending snap instead of replacing the source draft.
+    fn engage_port(&mut self, id: &P, cx: &mut Context<Self>) {
+        if let Some(origin) = self.draft.as_ref().map(|draft| draft.origin.clone()) {
+            let compatible = origin != *id && self.normalized_connection(&origin, id).is_some();
+            let screen = self
+                .resolved_port_position(id)
+                .map(|position| self.graph.viewport.world_to_screen(position));
+            if let Some(draft) = self.draft.as_mut() {
+                draft.snap_target = compatible.then(|| id.clone());
+                if let Some(screen) = screen {
+                    draft.current_screen = screen;
+                }
+            }
+            cx.notify();
+            return;
+        }
+        self.start_draft(id, cx);
     }
 
     fn start_draft(&mut self, id: &P, cx: &mut Context<Self>) {
@@ -2028,6 +2131,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 .filter(|id| !dragged_set.contains(*id))
                 .filter_map(|id| self.graph.nodes.get(id));
             let Some(first) = members.next() else {
+                let before = group.nodes.len();
+                group.nodes.retain(|id| !dragged_set.contains(id));
+                if group.nodes.len() != before {
+                    let mut node_ids: Vec<_> = group.nodes.iter().cloned().collect();
+                    node_ids.sort_by_cached_key(|id| format!("{id:?}"));
+                    changes.push((group.id.clone(), node_ids));
+                }
                 continue;
             };
             let mut left = first.position.x;
@@ -2094,7 +2204,60 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    fn begin_canvas_selection(&mut self, local: core::Point, shift: bool, cx: &mut Context<Self>) {
+        self.catalog_menu = None;
+        let before = (
+            self.graph.selected_nodes.clone(),
+            self.graph.selected_connections.clone(),
+        );
+        if let Some(connection) = self.connection_at(
+            local,
+            self.graph
+                .viewport
+                .scale_length(self.style.connection.stroke_width * 0.5),
+        ) {
+            if shift {
+                if !self.graph.selected_connections.remove(&connection) {
+                    self.graph.selected_connections.insert(connection);
+                }
+            } else {
+                self.graph.selected_nodes.clear();
+                self.graph.selected_connections.clear();
+                self.graph.selected_connections.insert(connection);
+            }
+            self.box_selection = None;
+        } else {
+            let start = self.graph.viewport.screen_to_world(local);
+            let (baseline_nodes, baseline_connections) = if shift {
+                (
+                    self.graph.selected_nodes.clone(),
+                    self.graph.selected_connections.clone(),
+                )
+            } else {
+                self.graph.selected_nodes.clear();
+                self.graph.selected_connections.clear();
+                (HashSet::new(), HashSet::new())
+            };
+            self.box_selection = Some(BoxSelection {
+                start,
+                current: start,
+                baseline_nodes,
+                baseline_connections,
+            });
+        }
+        if before
+            != (
+                self.graph.selected_nodes.clone(),
+                self.graph.selected_connections.clone(),
+            )
+        {
+            self.emit_selection(cx);
+        }
+        cx.notify();
+    }
+
     fn handle_pointer_move(&mut self, local: core::Point, cx: &mut Context<Self>) {
+        self.last_pointer_screen = Some(local);
         if let Some(previous) = self.panning.as_mut() {
             let old = *previous;
             *previous = local;
@@ -2285,15 +2448,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         let shift = event.keystroke.modifiers.shift;
         if self.catalog_menu.is_some() {
-            let mut before = self.filtered_catalog_indices();
-            before.truncate(8);
+            let before = self.filtered_catalog_entries();
             match key {
                 "escape" => self.catalog_menu = None,
                 "enter" => {
                     if let Some(menu) = self.catalog_menu.as_ref()
-                        && let Some(index) = before.get(menu.selected).copied()
+                        && let Some((item_index, port_index)) = before.get(menu.selected).copied()
                     {
-                        self.choose_catalog(index, cx);
+                        self.choose_catalog(item_index, port_index, cx);
                     }
                 }
                 "up" => {
@@ -2321,10 +2483,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 }
                 _ => {}
             }
-            let result_len = self.filtered_catalog_indices().len().min(8);
+            let result_len = self.filtered_catalog_entries().len();
             if let Some(menu) = self.catalog_menu.as_mut() {
                 menu.selected = menu.selected.min(result_len.saturating_sub(1));
             }
+            self.scroll_selected_catalog_item_into_view();
             cx.notify();
             cx.stop_propagation();
             window.prevent_default();
@@ -2379,13 +2542,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         match key {
             "tab" => {
                 let bounds = self.canvas_bounds.get();
-                self.open_catalog(
-                    core::Point::new(
-                        f32::from(bounds.size.width) * 0.5,
-                        f32::from(bounds.size.height) * 0.5,
-                    ),
-                    None,
+                let fallback = core::Point::new(
+                    f32::from(bounds.size.width) * 0.5,
+                    f32::from(bounds.size.height) * 0.5,
                 );
+                self.open_catalog(self.last_pointer_screen.unwrap_or(fallback), None);
                 cx.notify();
                 cx.stop_propagation();
                 window.prevent_default();
@@ -2742,11 +2903,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 let scene = renderer.render_world_node(WorldNodeBodyContext {
                     node: node.clone(),
                     ports: ports.clone().into(),
-                    state: NodeVisualState {
-                        selected,
-                        visible,
-                        zoom: viewport.zoom,
-                    },
+                    state: WorldNodeVisualState { selected, visible },
                     style: self.style.clone(),
                 });
                 frame_world_scene.primitives.extend(scene.primitives);
@@ -2779,11 +2936,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     WorldNodeBodyContext {
                         node: node.clone(),
                         ports: ports.clone().into(),
-                        state: NodeVisualState {
-                            selected,
-                            visible,
-                            zoom: viewport.zoom,
-                        },
+                        state: WorldNodeVisualState { selected, visible },
                         style: self.style.clone(),
                     },
                     window,
@@ -2950,7 +3103,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     .viewport
                                     .scale_length(this.style.anchor.dot_size * 0.5),
                             ) {
-                                this.start_draft(&port_id, cx);
+                                this.engage_port(&port_id, cx);
                                 return;
                             }
                             let cursor = this.graph.viewport.screen_to_world(local);
@@ -3158,7 +3311,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                         return;
                                     }
                                     if this.draft.is_none() {
-                                        this.start_draft(&id, cx);
+                                        this.engage_port(&id, cx);
                                     }
                                 }
                             }),
@@ -3221,7 +3374,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
-                                this.start_draft(&port_id, cx);
+                                this.engage_port(&port_id, cx);
                                 return;
                             }
                             if let Some(node_id) = this.node_at_screen(local) {
@@ -3249,6 +3402,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                         cx,
                                     );
                                 }
+                            } else {
+                                this.begin_canvas_selection(local, event.modifiers.shift, cx);
+                                window.prevent_default();
                             }
                         }),
                     ),
@@ -3307,7 +3463,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             );
             let selected = menu.selected;
             let query = menu.query.clone();
-            let filtered = self.filtered_catalog_indices();
+            let filtered = self.filtered_catalog_entries();
             let border = menu_style.border;
             let input_border = menu_style.input_border;
             let menu_element = div()
@@ -3364,6 +3520,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .id("node-graph-catalog-list")
                 .flex_1()
                 .overflow_y_scroll()
+                .track_scroll(&self.catalog_scroll_handle)
                 .py(px(4.0));
             if filtered.is_empty() {
                 list_element = list_element.child(
@@ -3377,9 +3534,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 );
             }
             let mut previous_category: Option<String> = None;
-            for (row, item_index) in filtered.into_iter().enumerate() {
+            for (row, (item_index, port_index)) in filtered.into_iter().enumerate() {
                 let item = &self.catalog[item_index];
                 let item_id = item_index;
+                let item_port_index = port_index;
+                let item_label = port_index
+                    .and_then(|port_index| item.ports.get(port_index))
+                    .map_or_else(
+                        || item.label.clone(),
+                        |port| format!("{} · {}", item.label, port.label),
+                    );
                 if previous_category.as_deref() != Some(item.category.as_str()) {
                     previous_category = Some(item.category.clone());
                     let category_color = match item.category.as_str() {
@@ -3409,7 +3573,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         .when(row == selected, |element| {
                             element.bg(rgb(hover.rgb).opacity(hover.alpha))
                         })
-                        .child(div().text_size(px(12.0)).child(item.label.clone()))
+                        .child(div().text_size(px(12.0)).child(item_label))
                         .child(
                             div()
                                 .text_size(px(10.0))
@@ -3424,7 +3588,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 window.prevent_default();
-                                this.choose_catalog(item_id, cx);
+                                this.choose_catalog(item_id, item_port_index, cx);
                             }),
                         ),
                 );
@@ -3470,54 +3634,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     window.prevent_default();
                     return;
                 }
-                let before = (
-                    this.graph.selected_nodes.clone(),
-                    this.graph.selected_connections.clone(),
-                );
-                if let Some(connection) = this.connection_at(
-                    local,
-                    this.graph
-                        .viewport
-                        .scale_length(this.style.connection.stroke_width * 0.5),
-                ) {
-                    if event.modifiers.shift {
-                        if !this.graph.selected_connections.remove(&connection) {
-                            this.graph.selected_connections.insert(connection);
-                        }
-                    } else {
-                        this.graph.selected_nodes.clear();
-                        this.graph.selected_connections.clear();
-                        this.graph.selected_connections.insert(connection);
-                    }
-                    this.box_selection = None;
-                } else {
-                    let start = this.graph.viewport.screen_to_world(local);
-                    let (baseline_nodes, baseline_connections) = if event.modifiers.shift {
-                        (
-                            this.graph.selected_nodes.clone(),
-                            this.graph.selected_connections.clone(),
-                        )
-                    } else {
-                        this.graph.selected_nodes.clear();
-                        this.graph.selected_connections.clear();
-                        (HashSet::new(), HashSet::new())
-                    };
-                    this.box_selection = Some(BoxSelection {
-                        start,
-                        current: start,
-                        baseline_nodes,
-                        baseline_connections,
-                    });
-                }
-                if before
-                    != (
-                        this.graph.selected_nodes.clone(),
-                        this.graph.selected_connections.clone(),
-                    )
-                {
-                    this.emit_selection(cx);
-                }
-                cx.notify();
+                this.begin_canvas_selection(local, event.modifiers.shift, cx);
                 window.prevent_default();
             }),
         )
@@ -3906,6 +4023,41 @@ mod tests {
     }
 
     #[test]
+    fn draft_catalog_expands_every_compatible_port() {
+        let mut editor = NodeGraph::new(interactive_graph()).with_catalog(vec![NodeCatalogItem {
+            id: "multi".into(),
+            label: "Multi Sink".into(),
+            category: "Output".into(),
+            description: String::new(),
+            keywords: Vec::new(),
+            ports: vec![
+                CatalogPort {
+                    id: "left".into(),
+                    label: "Left".into(),
+                    direction: PortDirection::Input,
+                    kind: Kind,
+                },
+                CatalogPort {
+                    id: "right".into(),
+                    label: "Right".into(),
+                    direction: PortDirection::Input,
+                    kind: Kind,
+                },
+            ],
+        }]);
+        editor.catalog_menu = Some(CatalogMenu {
+            anchor_world: core::Point::default(),
+            query: String::new(),
+            selected: 0,
+            connect_from: Some("out".into()),
+        });
+        assert_eq!(
+            editor.filtered_catalog_entries(),
+            vec![(0, Some(0)), (0, Some(1))]
+        );
+    }
+
+    #[test]
     fn selected_groups_are_deterministic_for_ungroup_transactions() {
         let mut editor = NodeGraph::new(interactive_graph()).with_groups(vec![GraphGroup {
             id: "group".into(),
@@ -3948,6 +4100,19 @@ mod tests {
         editor.graph.nodes.get_mut("a").unwrap().position = core::Point::new(0.0, 0.0);
         editor.update_group_memberships(&[String::from("a")]);
         assert!(!editor.groups[0].nodes.contains("a"));
+    }
+
+    #[test]
+    fn alt_drag_can_remove_the_last_group_member() {
+        let mut editor = NodeGraph::new(interactive_graph()).with_groups(vec![GraphGroup {
+            id: "group".into(),
+            label: "Group".into(),
+            color: 0,
+            nodes: [String::from("a")].into_iter().collect(),
+        }]);
+        let changes = editor.update_group_memberships(&[String::from("a")]);
+        assert_eq!(changes, vec![(String::from("group"), Vec::new())]);
+        assert!(editor.groups[0].nodes.is_empty());
     }
 
     #[test]
