@@ -212,6 +212,7 @@ await click(left + 344, top + 120);
 await waitFor("click-to-connect ports", (value) => value.connections === baseline.connections + 1);
 await key("Escape", "Escape");
 await pause();
+const authoredBeforeZoom = await graphState();
 await command("Input.dispatchMouseEvent", {
   type: "mouseWheel", x: left + 400, y: top + 100, deltaX: 0, deltaY: -180,
 });
@@ -224,8 +225,8 @@ if (Math.abs(stable.sourceWidth - baseline.sourceWidth) > 0.1) {
 if (Math.abs(stable.sourceHeight - baseline.sourceHeight) > 0.5) {
   throw new Error(`node layout changed across zoom: ${JSON.stringify({ baseline, stable })}`);
 }
-if (stable.worldLayout !== authored.worldLayout) {
-  throw new Error(`world display list changed across zoom: ${JSON.stringify({ authored, stable })}`);
+if (stable.worldLayout !== authoredBeforeZoom.worldLayout) {
+  throw new Error(`world display list changed across zoom: ${JSON.stringify({ authoredBeforeZoom, stable })}`);
 }
 const screenPoint = (worldX, worldY, state = stable) => ({
   x: left + worldX * state.zoom + state.panX,
