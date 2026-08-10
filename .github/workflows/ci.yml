@@ -49,7 +49,7 @@ jobs:
       - name: Install browser parity dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb mesa-vulkan-drivers python3-pil
+          sudo apt-get install -y xvfb x11-utils mesa-vulkan-drivers python3-pil
           curl -fsSLo /tmp/google-chrome.deb \
             https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y /tmp/google-chrome.deb
@@ -78,6 +78,17 @@ jobs:
             > /tmp/node-graph-xvfb.log 2>&1 &
           xvfb=$!
           export DISPLAY=:99
+          for attempt in $(seq 1 30); do
+            if xdpyinfo >/dev/null 2>&1; then
+              break
+            fi
+            if ! kill -0 "$xvfb" 2>/dev/null; then
+              cat /tmp/node-graph-xvfb.log
+              exit 1
+            fi
+            sleep 1
+          done
+          xdpyinfo >/dev/null 2>&1 || { cat /tmp/node-graph-xvfb.log; exit 1; }
           export LIBGL_ALWAYS_SOFTWARE=1
           chrome_path="$(command -v google-chrome-stable)"
           setsid "$chrome_path" \
