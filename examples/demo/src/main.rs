@@ -325,6 +325,37 @@ fn world_text(
     });
 }
 
+fn socket_polygon(
+    center: Point,
+    radius: f32,
+    shape: gpui_node_graph::style::DotShape,
+) -> std::sync::Arc<[Point]> {
+    use gpui_node_graph::style::DotShape;
+    let (count, rotation, star) = match shape {
+        DotShape::Diamond => (4, 0.0, false),
+        DotShape::Square => (4, std::f32::consts::FRAC_PI_4, false),
+        DotShape::Hexagon => (6, 0.0, false),
+        DotShape::Triangle => (3, -std::f32::consts::FRAC_PI_2, false),
+        DotShape::Star => (10, -std::f32::consts::FRAC_PI_2, true),
+        DotShape::Circle => unreachable!("circles are painted without polygon approximation"),
+    };
+    (0..count)
+        .map(|index| {
+            let angle = rotation + index as f32 * std::f32::consts::TAU / count as f32;
+            let point_radius = if star && index % 2 == 1 {
+                radius * 0.45
+            } else {
+                radius
+            };
+            Point::new(
+                center.x + angle.cos() * point_radius,
+                center.y + angle.sin() * point_radius,
+            )
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 fn world_socket(
     scene: &mut WorldScene,
     port: &Port<String, String, Kind>,
@@ -332,28 +363,37 @@ fn world_socket(
     style: &gpui_node_graph::style::AnchorStyle,
     node_background: gpui_node_graph::style::Color,
 ) {
-    scene.push(WorldPrimitive::Circle {
-        center: port.position,
-        radius: style.dot_size * 0.5,
-        fill: WorldColor::rgba(
-            if connected {
-                style.dot_connected_color.rgb
-            } else {
-                style.dot_color.rgb
-            },
-            if connected {
-                style.dot_connected_color.alpha
-            } else {
-                style.dot_color.alpha
-            },
-        ),
-    });
-    if !connected {
-        scene.push(WorldPrimitive::Circle {
+    use gpui_node_graph::style::DotShape;
+    let fill = WorldColor::rgba(
+        if connected {
+            style.dot_connected_color.rgb
+        } else {
+            style.dot_color.rgb
+        },
+        if connected {
+            style.dot_connected_color.alpha
+        } else {
+            style.dot_color.alpha
+        },
+    );
+    let radius = style.dot_size * 0.5;
+    let mut push_shape = |radius: f32, fill: WorldColor| match style.default_dot_shape {
+        DotShape::Circle => scene.push(WorldPrimitive::Circle {
             center: port.position,
-            radius: (style.dot_size * 0.5 - style.dot_border_width).max(0.0),
-            fill: WorldColor::rgba(node_background.rgb, node_background.alpha),
-        });
+            radius,
+            fill,
+        }),
+        shape => scene.push(WorldPrimitive::Polygon {
+            points: socket_polygon(port.position, radius, shape),
+            fill,
+        }),
+    };
+    push_shape(radius, fill);
+    if !connected {
+        push_shape(
+            (radius - style.dot_border_width).max(0.0),
+            WorldColor::rgba(node_background.rgb, node_background.alpha),
+        );
     }
 }
 

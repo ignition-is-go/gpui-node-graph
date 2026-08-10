@@ -702,6 +702,22 @@ pub fn world_scene_element(scene: world::WorldScene, viewport: Viewport) -> AnyE
                             BorderStyle::default(),
                         ));
                     }
+                    world::ScreenPrimitive::Polygon { points, fill } => {
+                        if let Some(first) = points.first() {
+                            let mut builder = PathBuilder::fill();
+                            builder.move_to(point(px(first.x + offset.x), px(first.y + offset.y)));
+                            for point_value in &points[1..] {
+                                builder.line_to(point(
+                                    px(point_value.x + offset.x),
+                                    px(point_value.y + offset.y),
+                                ));
+                            }
+                            builder.close();
+                            if let Ok(path) = builder.build() {
+                                window.paint_path(path, rgb(fill.rgb).opacity(fill.alpha));
+                            }
+                        }
+                    }
                     world::ScreenPrimitive::Text { .. } => {}
                 }
             }
@@ -2810,10 +2826,20 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .absolute()
         .size_full();
 
+        let focused = focus_handle.is_focused(window);
+        let focus_outline = self.style.editor.focus_outline;
+        let clips_content = self.style.editor.clip_content
+            && self.style.editor.overlay_clip_content
+            && self.style.overlay.clip_to_editor;
         let mut root = div()
             .relative()
             .size_full()
-            .overflow_hidden()
+            .when(clips_content, |element| element.overflow_hidden())
+            .when(focused && focus_outline.width > 0.0, |element| {
+                element
+                    .border(px(focus_outline.width))
+                    .border_color(rgb(focus_outline.color.rgb).opacity(focus_outline.color.alpha))
+            })
             .bg(rgb(self.style.editor.background.rgb).opacity(self.style.editor.background.alpha))
             .track_focus(&focus_handle)
             .key_context("NodeGraph")
@@ -3300,28 +3326,43 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .is_some()
             });
             let color = if is_source || is_snap || compatible {
-                self.theme.port_compatible
+                self.style.anchor.dot_compatible_color
             } else if connected {
-                self.theme.port_connected
-            } else if port.direction == PortDirection::Input {
-                self.theme.port_input
+                self.style.anchor.dot_connected_color
             } else {
-                self.theme.port_output
+                self.style.anchor.dot_color
             };
-            let label_x = if port.direction == PortDirection::Input {
-                position.x + 9.0
+            let port_opacity = if self.draft.is_some() && !(is_source || is_snap || compatible) {
+                self.style.anchor.incompatible_opacity
             } else {
-                position.x - 89.0
+                1.0
+            };
+            let dot_size = viewport.scale_length(self.style.anchor.dot_size);
+            let dot_radius = dot_size * 0.5;
+            let label_gap = viewport.scale_length(self.style.anchor.dot_inset + 5.0);
+            let label_x = if port.direction == PortDirection::Input {
+                position.x + label_gap
+            } else {
+                position.x - 80.0 - label_gap
             };
             root = root
                 .child(
                     div()
                         .absolute()
                         .left(px(label_x))
-                        .top(px(position.y - 8.0))
+                        .top(px(
+                            position.y - viewport.scale_length(self.style.anchor.row_height * 0.5)
+                        ))
                         .w(px(80.0))
-                        .text_size(px(11.0))
-                        .text_color(rgb(self.theme.text))
+                        .text_size(px(viewport.scale_length(self.style.anchor.label_font_size)))
+                        .text_color(if compatible {
+                            rgb(self.style.anchor.label_compatible_color.rgb)
+                                .opacity(self.style.anchor.label_compatible_color.alpha)
+                        } else {
+                            rgb(self.style.anchor.label_color.rgb)
+                                .opacity(self.style.anchor.label_color.alpha)
+                        })
+                        .opacity(port_opacity)
                         .when(port.direction == PortDirection::Output, |element| {
                             element.text_right()
                         })
@@ -3330,14 +3371,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .child(
                     div()
                         .absolute()
-                        .left(px(position.x - 7.0))
-                        .top(px(position.y - 7.0))
-                        .w(px(14.0))
-                        .h(px(14.0))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(rgb(self.theme.text))
-                        .bg(rgb(color))
+                        .left(px(position.x - dot_radius))
+                        .top(px(position.y - dot_radius))
+                        .w(px(dot_size))
+                        .h(px(dot_size))
+                        .when(
+                            matches!(self.style.anchor.default_dot_shape, style::DotShape::Circle),
+                            |element| element.rounded_full(),
+                        )
+                        .border(px(viewport.scale_length(self.style.anchor.dot_border_width)))
+                        .border_color(
+                            rgb(self.style.anchor.label_color.rgb)
+                                .opacity(self.style.anchor.label_color.alpha),
+                        )
+                        .bg(rgb(color.rgb).opacity(color.alpha))
+                        .opacity(port_opacity)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
@@ -3487,7 +3535,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .top_0()
                     .size_full()
                     .occlude()
-                    .bg(rgb(backdrop.rgb).opacity(backdrop.alpha))
+                    .bg(rgb(self.style.overlay.layer_background.rgb)
+                        .opacity(self.style.overlay.layer_background.alpha))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .size_full()
+                            .bg(rgb(backdrop.rgb).opacity(backdrop.alpha)),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -3502,12 +3559,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
 
         for (position, overlay) in node_overlays {
+            let panel = self.style.overlay.panel_background;
+            let panel_border = self.style.overlay.panel_border;
             root = root.child(
                 div()
                     .absolute()
                     .left(px(position.x))
                     .top(px(position.y))
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .bg(rgb(panel.rgb).opacity(panel.alpha))
+                    .border(px(panel_border.width))
+                    .border_color(rgb(panel_border.color.rgb).opacity(panel_border.color.alpha))
+                    .when(self.style.editor.overlay_isolated, |element| {
+                        element.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    })
                     .child(overlay),
             );
         }

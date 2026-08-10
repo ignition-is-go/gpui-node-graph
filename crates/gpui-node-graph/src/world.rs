@@ -6,6 +6,7 @@
 //! wrapping constraint, so changing the viewport cannot cause text reflow.
 
 use node_graph_core as core;
+use std::sync::Arc;
 
 /// A renderer-independent sRGB color.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +102,10 @@ pub enum WorldPrimitive {
     Circle {
         center: core::Point,
         radius: f32,
+        fill: WorldColor,
+    },
+    Polygon {
+        points: Arc<[core::Point]>,
         fill: WorldColor,
     },
 }
@@ -345,6 +350,14 @@ impl WorldPrimitive {
                 radius: transform.length(*radius),
                 fill: *fill,
             },
+            Self::Polygon { points, fill } => ScreenPrimitive::Polygon {
+                points: points
+                    .iter()
+                    .map(|point| transform.point(*point))
+                    .collect::<Vec<_>>()
+                    .into(),
+                fill: *fill,
+            },
         }
     }
 }
@@ -381,6 +394,10 @@ pub enum ScreenPrimitive {
     Circle {
         center: core::Point,
         radius: f32,
+        fill: WorldColor,
+    },
+    Polygon {
+        points: Arc<[core::Point]>,
         fill: WorldColor,
     },
 }
@@ -607,6 +624,22 @@ mod tests {
                 }
                 _ => panic!(),
             }
+        }
+    }
+
+    #[test]
+    fn polygon_projection_scales_every_authored_vertex() {
+        let points: Arc<[core::Point]> = vec![p(1.0, 2.0), p(4.0, 2.0), p(2.5, 5.0)].into();
+        let primitive = WorldPrimitive::Polygon {
+            points: points.clone(),
+            fill: WorldColor::rgb(0xff00ff),
+        };
+        let transform = Transform::new(p(7.0, -3.0), 1.349859);
+        let ScreenPrimitive::Polygon { points: screen, .. } = primitive.project(transform) else {
+            panic!();
+        };
+        for (actual, expected) in screen.iter().zip(points.iter()) {
+            close_point(*actual, transform.point(*expected));
         }
     }
 
