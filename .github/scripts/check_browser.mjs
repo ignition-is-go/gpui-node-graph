@@ -71,6 +71,7 @@ if (softwareReadback) {
       const sourceCanvas = context?.canvas;
       if (!texture || !sourceCanvas?.width || !sourceCanvas?.height) return result;
       const current = ++sequence;
+      globalThis.__gpuiSoftwareSequence = current;
       const width = sourceCanvas.width;
       const height = sourceCanvas.height;
       const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
@@ -231,8 +232,27 @@ async function key(key, code = key, text) {
   await command("Input.dispatchKeyEvent", { type: "keyDown", ...params });
   await command("Input.dispatchKeyEvent", { type: "keyUp", ...params });
 }
+let lastSoftwareFrame = 0;
 async function shot() {
   await pause();
+  if (softwareReadback) {
+    const until = Date.now() + 8_000;
+    let matched = false;
+    while (Date.now() < until) {
+      const status = await command("Runtime.evaluate", {
+        expression: `[globalThis.__gpuiSoftwareFrame || 0, globalThis.__gpuiSoftwareSequence || 0]`,
+        returnByValue: true,
+      });
+      const [frame, sequence] = status.result?.value || [0, 0];
+      if (frame > lastSoftwareFrame && frame === sequence) {
+        lastSoftwareFrame = frame;
+        matched = true;
+        break;
+      }
+      await pause(50);
+    }
+    if (!matched) throw new Error("software WebGPU readback did not reach the latest submitted frame");
+  }
   if (process.env.NODE_GRAPH_X11_CAPTURE === "1") {
     const geometry = await command("Runtime.evaluate", {
       expression: `JSON.stringify({
