@@ -1,6 +1,7 @@
 # Final world-space and Leptos-demo parity validation
 
-Validated implementation base: current exact head (see repository history and CI link below).
+Validated implementation base: `09470228f04a2e002bdffb5e1bbda650e9f77e4f`.
+Green cross-platform CI: https://github.com/ignition-is-go/gpui-node-graph/actions/runs/31357521105.
 Reference: `leptos-node-graph@87658950fccfeeea123285c706820ffea4ab55d1`.
 
 ## Rendering contract
