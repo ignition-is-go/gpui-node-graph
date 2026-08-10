@@ -28,7 +28,7 @@ curl -sSI http://127.0.0.1:8181/ | grep -Ei 'cross-origin-(opener|embedder)-poli
 ## Architecture
 
 - `node-graph-core`: canonical serializable model and deterministic logic. Persist `GraphSnapshot`; `GraphUiState` (selection and viewport) is session-only. `GraphState` still accepts the former top-level domain JSON shape, but deliberately skips transient fields when serialized. Call `validate`, `canonicalize_ids`, or `GraphState::from_snapshot` at trust boundaries. `NodeGraph::try_new` rejects invalid editor state; `NodeGraph::new` is the convenience constructor for already-trusted state and panics with the validation error rather than silently rendering a corrupt graph.
-- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` retained-mode view and input adapter. The adapter and core share one `GraphEvent` vocabulary (`EditorEvent` is a compatibility alias). Consumers may reconcile domain data, supply arbitrary `NodeBodyRenderer` GPUI element trees with shell-interactive measured port anchors and unscaled overlays, and handle connection/create/history hooks while the view owns transient gestures. Measured node/body geometry stays transient and node-relative, preserving strict snapshots while driving anchors, routing, fit, groups, culling, and box selection immediately. Dynamic-port removal uses transient wire tombstones and can restore the original strict connection when the same stable port ID returns.
+- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` view and input adapter. `WorldNodeBodyRenderer` is the compositor-style path: it authors an immutable world-unit display list without access to zoom/pan, GPUI projects the completed primitives at paint time, and pointer input is inverse-transformed before hit testing, dragging, resizing, marquee selection, or port gestures. Pane-space menus and overlays remain unscaled while their anchors follow the projection. The older `NodeBodyRenderer` remains as a compatibility path for arbitrary retained GPUI controls. The adapter and core share one `GraphEvent` vocabulary (`EditorEvent` is a compatibility alias). Measured geometry stays transient and node-relative, preserving strict snapshots. Dynamic-port removal uses transient wire tombstones and can restore the original strict connection when the same stable port ID returns.
 
 `EditorConfig::mutation_mode` makes ownership explicit. `Uncontrolled` commits move/resize/delete/group previews locally and emits compatibility events. `Controlled` rolls persistent previews back and emits one atomic `GraphEvent::MutationRequested` batch of `GraphMutation` operations for the host to reconcile. Selection and viewport remain transient editor state in either mode; connection creation always remains a request because generic consumer IDs cannot be synthesized safely by the view.
 - `examples/demo`: shared GPUI application with thin target-specific desktop/browser packaging. `gpui_platform::application()` selects the backend.
@@ -45,11 +45,11 @@ The evidence-backed Leptos parity audit and phased acceptance plan are in
 - [x] node drag event and middle-button pan
 - [x] wheel zoom around cursor, grid snap, box/connection selection, fit view
 - [x] typed draft connections, snapping and remove/create events
-- [ ] obstacle-aware subway router and incremental cache migration
-- [ ] dynamic port/node catalog, searchable creation menu
-- [ ] groups, resizing, overlays, culling and keyboard actions
+- [x] obstacle-aware subway router and incremental route cache
+- [x] dynamic ports and searchable, keyboard-navigable node catalog
+- [x] groups, resizing, overlays, culling and keyboard actions
 - [ ] Rship persisted-graph fixtures and full interaction replay tests
-- [ ] visual regression/performance suite
+- [x] audited multi-state visual regression suite and stateful browser interaction trace
 - [x] one-window browser architecture and native-only detached-window capability boundary
 
 ## Platform support
