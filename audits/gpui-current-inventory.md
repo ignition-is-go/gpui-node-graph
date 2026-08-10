@@ -128,7 +128,7 @@ The persistence contract is well-defined at the DTO layer but no persistence wor
 * Restore through `from_snapshot` to canonicalize/validate (`crates/node-graph-core/src/lib.rs:337-349`).
 * Reconcile an updated application-owned snapshot while keeping viable UI state (`crates/node-graph-core/src/lib.rs:350-386`; view adapter at `crates/gpui-node-graph/src/lib.rs:98-117`).
 
-There are no version/schema tags, migrations, checked-in persisted JSON fixtures, import/export UI, autosave, filesystem APIs, browser storage APIs, or history stack. The README mandates migration fixture tests but the roadmap admits Rship fixtures are still absent (`README.md:26`, `README.md:38`). The only “fixture” test serializes a value produced in memory and immediately round-trips it; it is not a checked-in legacy/production fixture (`crates/node-graph-core/src/lib.rs:763-787`).
+There are no version/schema tags, migrations, checked-in persisted JSON fixtures, import/export UI, autosave, filesystem APIs, browser storage APIs, or history stack. The README mandates migration fixture tests but the roadmap admits persisted-graph fixtures are still absent (`README.md:26`, `README.md:38`). The only “fixture” test serializes a value produced in memory and immediately round-trips it; it is not a checked-in legacy/production fixture (`crates/node-graph-core/src/lib.rs:763-787`).
 
 ## 6. Demo and host behavior
 

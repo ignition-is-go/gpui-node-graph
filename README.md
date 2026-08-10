@@ -1,6 +1,6 @@
 # gpui-node-graph
 
-Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries/zed@08827f9208b4848d62f3faf86ffa15155966d63c`. This is the standalone replacement for the Leptos graph used during the Rship migration. One shared GPUI view runs on desktop and WebAssembly without Leptos or DOM rendering.
+Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries/zed@08827f9208b4848d62f3faf86ffa15155966d63c`. This is the standalone GPUI port of the audited Leptos graph. One shared GPUI view runs on desktop and WebAssembly without Leptos or DOM rendering.
 
 ## Status
 
@@ -48,7 +48,7 @@ The evidence-backed Leptos parity audit and phased acceptance plan are in
 - [x] obstacle-aware subway router and incremental route cache
 - [x] dynamic ports and searchable, keyboard-navigable node catalog
 - [x] groups, resizing, overlays, culling and keyboard actions
-- [ ] Rship persisted-graph fixtures and full interaction replay tests
+- [ ] persisted-graph fixtures and full interaction replay tests
 - [x] audited multi-state visual regression suite and stateful browser interaction trace
 - [x] one-window browser architecture and native-only detached-window capability boundary
 
