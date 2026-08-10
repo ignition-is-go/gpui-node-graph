@@ -1249,6 +1249,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     pub fn catalog_is_open(&self) -> bool {
         self.catalog_menu.is_some()
     }
+    pub fn catalog_connects_draft(&self) -> bool {
+        self.catalog_menu
+            .as_ref()
+            .is_some_and(|menu| menu.connect_from.is_some())
+    }
+
+    pub fn catalog_entry_count(&self) -> usize {
+        self.filtered_catalog_entries().len()
+    }
 
     pub fn reopen_overlay(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.dismissed_overlays.remove(id) {
@@ -1269,21 +1278,37 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.notify();
     }
 
-    fn compatible_catalog_port(&self, item_index: usize, origin: &P) -> Option<&CatalogPort<T>> {
-        let origin = self.graph.ports.get(origin)?;
-        self.catalog
-            .get(item_index)?
-            .ports
+    fn compatible_catalog_port_indices(&self, item_index: usize, origin: &P) -> Vec<usize> {
+        let Some(origin) = self.graph.ports.get(origin) else {
+            return Vec::new();
+        };
+        let Some(item) = self.catalog.get(item_index) else {
+            return Vec::new();
+        };
+        item.ports
             .iter()
-            .find(|candidate| match (origin.direction, candidate.direction) {
-                (PortDirection::Output, PortDirection::Input) => {
-                    T::compatible(&origin.kind, &candidate.kind)
-                }
-                (PortDirection::Input, PortDirection::Output) => {
-                    T::compatible(&candidate.kind, &origin.kind)
-                }
-                _ => false,
+            .enumerate()
+            .filter_map(|(port_index, candidate)| {
+                let compatible = match (origin.direction, candidate.direction) {
+                    (PortDirection::Output, PortDirection::Input) => {
+                        T::compatible(&origin.kind, &candidate.kind)
+                    }
+                    (PortDirection::Input, PortDirection::Output) => {
+                        T::compatible(&candidate.kind, &origin.kind)
+                    }
+                    _ => false,
+                };
+                compatible.then_some(port_index)
             })
+            .collect()
+    }
+
+    fn compatible_catalog_port(&self, item_index: usize, origin: &P) -> Option<&CatalogPort<T>> {
+        let port_index = self
+            .compatible_catalog_port_indices(item_index, origin)
+            .into_iter()
+            .next()?;
+        self.catalog.get(item_index)?.ports.get(port_index)
     }
 
     fn filtered_catalog_indices(&self) -> Vec<usize> {
@@ -1312,22 +1337,30 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn scroll_selected_catalog_item_into_view(&self) {
-        let filtered = self.filtered_catalog_entries();
         let Some(menu) = self.catalog_menu.as_ref() else {
             return;
         };
+        let filtered = self.filtered_catalog_indices();
         let mut previous_category: Option<&str> = None;
         let mut child_index = 0;
-        for (row, (item_index, _)) in filtered.into_iter().enumerate() {
+        let mut entry_index = 0;
+        for item_index in filtered {
             let category = self.catalog[item_index].category.as_str();
             if previous_category != Some(category) {
                 child_index += 1;
                 previous_category = Some(category);
             }
-            if row == menu.selected {
+            let compatible = menu
+                .connect_from
+                .as_ref()
+                .map(|origin| self.compatible_catalog_port_indices(item_index, origin))
+                .unwrap_or_default();
+            let consumed = compatible.len().max(1);
+            if menu.selected >= entry_index && menu.selected < entry_index + consumed {
                 self.catalog_scroll_handle.scroll_to_item(child_index);
                 return;
             }
+            entry_index += consumed;
             child_index += 1;
         }
     }
@@ -1339,37 +1372,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.filtered_catalog_indices()
             .into_iter()
             .flat_map(|item_index| {
-                let compatible: Vec<_> = menu
-                    .connect_from
-                    .as_ref()
-                    .map(|origin| {
-                        let origin = &self.graph.ports[origin];
-                        self.catalog[item_index]
-                            .ports
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(port_index, candidate)| {
-                                let compatible = match (origin.direction, candidate.direction) {
-                                    (PortDirection::Output, PortDirection::Input) => {
-                                        T::compatible(&origin.kind, &candidate.kind)
-                                    }
-                                    (PortDirection::Input, PortDirection::Output) => {
-                                        T::compatible(&candidate.kind, &origin.kind)
-                                    }
-                                    _ => false,
-                                };
-                                compatible.then_some(port_index)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if menu.connect_from.is_none() {
-                    vec![(item_index, None)]
-                } else {
-                    compatible
+                if let Some(origin) = menu.connect_from.as_ref() {
+                    self.compatible_catalog_port_indices(item_index, origin)
                         .into_iter()
                         .map(|port_index| (item_index, Some(port_index)))
                         .collect()
+                } else {
+                    vec![(item_index, None)]
                 }
             })
             .collect()
@@ -3582,7 +3591,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             );
             let selected = menu.selected;
             let query = menu.query.clone();
-            let filtered = self.filtered_catalog_entries();
+            let filtered = self.filtered_catalog_indices();
+            let connect_from = menu.connect_from.clone();
             let border = menu_style.border;
             let input_border = menu_style.input_border;
             let menu_element = div()
@@ -3653,16 +3663,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 );
             }
             let mut previous_category: Option<String> = None;
-            for (row, (item_index, port_index)) in filtered.into_iter().enumerate() {
+            let mut entry_index = 0usize;
+            for item_index in filtered {
                 let item = &self.catalog[item_index];
-                let item_id = item_index;
-                let item_port_index = port_index;
-                let item_label = port_index
-                    .and_then(|port_index| item.ports.get(port_index))
-                    .map_or_else(
-                        || item.label.clone(),
-                        |port| format!("{} · {}", item.label, port.label),
-                    );
+                let compatible = connect_from
+                    .as_ref()
+                    .map(|origin| self.compatible_catalog_port_indices(item_index, origin))
+                    .unwrap_or_default();
+                let has_multiple_ports = compatible.len() > 1;
+                let consumed = compatible.len().max(1);
+                let base_entry = entry_index;
+                entry_index += consumed;
                 if previous_category.as_deref() != Some(item.category.as_str()) {
                     previous_category = Some(item.category.clone());
                     let category_color = match item.category.as_str() {
@@ -3685,32 +3696,75 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     );
                 }
                 let hover = menu_style.hover_background;
-                list_element = list_element.child(
-                    div()
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .when(row == selected, |element| {
-                            element.bg(rgb(hover.rgb).opacity(hover.alpha))
-                        })
-                        .child(div().text_size(px(12.0)).child(item_label))
-                        .child(
+                let item_id = item_index;
+                let auto_port = if compatible.len() == 1 {
+                    compatible.first().copied()
+                } else {
+                    None
+                };
+                let mut item_element = div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .when(!has_multiple_ports && base_entry == selected, |element| {
+                        element.bg(rgb(hover.rgb).opacity(hover.alpha))
+                    })
+                    .child(div().text_size(px(12.0)).child(item.label.clone()))
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .text_size(px(10.0))
+                            .text_color(
+                                rgb(menu_style.description_color.rgb)
+                                    .opacity(menu_style.description_color.alpha),
+                            )
+                            .child(item.description.clone()),
+                    );
+                if !has_multiple_ports {
+                    item_element = item_element.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            this.choose_catalog(item_id, auto_port, cx);
+                        }),
+                    );
+                } else {
+                    for (port_offset, port_index) in compatible.into_iter().enumerate() {
+                        let entry = base_entry + port_offset;
+                        let port = &item.ports[port_index];
+                        let direction = match port.direction {
+                            PortDirection::Input => "› ",
+                            PortDirection::Output => "‹ ",
+                        };
+                        let label = format!("{direction}{}", port.label);
+                        item_element = item_element.child(
                             div()
-                                .text_size(px(10.0))
+                                .ml(px(8.0))
+                                .mr(px(-8.0))
+                                .px(px(4.0))
+                                .pl(px(12.0))
+                                .py(px(3.0))
+                                .text_size(px(11.0))
                                 .text_color(
-                                    rgb(menu_style.description_color.rgb)
-                                        .opacity(menu_style.description_color.alpha),
+                                    rgb(menu_style.port_color.rgb)
+                                        .opacity(menu_style.port_color.alpha),
                                 )
-                                .child(item.description.clone()),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                window.prevent_default();
-                                this.choose_catalog(item_id, item_port_index, cx);
-                            }),
-                        ),
-                );
+                                .when(entry == selected, |element| {
+                                    element.bg(rgb(hover.rgb).opacity(hover.alpha))
+                                })
+                                .child(label)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        window.prevent_default();
+                                        this.choose_catalog(item_id, Some(port_index), cx);
+                                    }),
+                                ),
+                        );
+                    }
+                }
+                list_element = list_element.child(item_element);
             }
             root = root.child(menu_element.child(list_element));
         }

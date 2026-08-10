@@ -207,6 +207,7 @@ await click(left + 800, top + 200);
 await waitFor("outside-click overlay dismissal", (value) => value.overlayDismissed);
 await click();
 await key("Tab", "Tab");
+await pause();
 await waitFor("catalog opening", (value) => value.catalogOpen);
 await saveStateScreenshot("menu");
 for (const character of "Math") await key(character, `Key${character.toUpperCase()}`, character);
@@ -225,6 +226,23 @@ const authored = await waitFor(
 await click(left + 195, top + 95);
 await click(left + 344, top + 120);
 await waitFor("click-to-connect ports", (value) => value.connections === baseline.connections + 1);
+await drag(left + 195, top + 95, left + 750, top + 250);
+await pause();
+await waitFor(
+  "draft connection catalog",
+  (value) => value.catalogOpen && value.catalogDraft && value.catalogEntries >= 2,
+);
+for (const character of "Mix") await key(character, `Key${character.toUpperCase()}`, character);
+await waitFor("draft catalog filtering", (value) => value.catalogEntries === 2);
+await saveStateScreenshot("draft-menu");
+await key("ArrowDown", "ArrowDown");
+await key("Enter", "Enter");
+await waitFor(
+  "draft catalog create-and-connect",
+  (value) => !value.catalogOpen
+    && value.nodes === baseline.nodes + 2
+    && value.connections === baseline.connections + 2,
+);
 await key("Escape", "Escape");
 await pause();
 const authoredBeforeZoom = await graphState();
@@ -277,6 +295,7 @@ const transitions = {
   menuOpened: true,
   nodeCreated: true,
   clickConnected: true,
+  draftMenuConnected: true,
   blendChanged: true,
   factorChanged: true,
   rangeDragged: true,
