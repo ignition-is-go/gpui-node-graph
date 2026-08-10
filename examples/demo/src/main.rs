@@ -357,7 +357,16 @@ fn world_socket(
     }
 }
 
+#[cfg(test)]
 fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> WorldScene {
+    leptos_world_node_with_values(context, "Normal", 0.0)
+}
+
+fn leptos_world_node_with_values(
+    context: WorldNodeBodyContext<Kind, String, String>,
+    blend: &str,
+    factor: f32,
+) -> WorldScene {
     let mut scene = WorldScene::new();
     let node = &context.node;
     let node_style = &context.style.node;
@@ -470,14 +479,15 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
             11.0,
             0xa1a1aa,
         );
-        scene.push(WorldPrimitive::BorderedQuad {
-            bounds: Rect {
-                origin: Point::new(node.position.x + 54.0, node.position.y + 30.5),
-                size: Size {
-                    width: 107.0,
-                    height: 22.0,
-                },
+        let blend_select = Rect {
+            origin: Point::new(node.position.x + 54.0, node.position.y + 30.5),
+            size: Size {
+                width: 107.0,
+                height: 22.0,
             },
+        };
+        scene.push(WorldPrimitive::BorderedQuad {
+            bounds: blend_select,
             fill: WorldColor::rgb(0x27272a),
             border: WorldColor::rgb(0x3f3f46),
             border_width: 1.0,
@@ -487,10 +497,15 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
             &mut scene,
             node.position.x + 64.0,
             node.position.y + 34.0,
-            "Normal",
+            blend,
             11.0,
             0xd4d4d8,
         );
+        scene.push_hit_region(WorldHitRegion::new(
+            format!("{}:blend-select", node.id),
+            HitRole::Control,
+            HitShape::Rect(blend_select),
+        ));
         scene.push(WorldPrimitive::BorderedQuad {
             bounds: Rect {
                 origin: Point::new(node.position.x + 167.0, node.position.y + 29.0),
@@ -571,10 +586,21 @@ fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> Wor
                 &mut scene,
                 node.position.x + 103.0,
                 port.position.y - 6.0,
-                "0.0",
+                format!("{factor:.1}"),
                 11.0,
                 0xd4d4d8,
             );
+            scene.push_hit_region(WorldHitRegion::new(
+                format!("{}:factor-value", node.id),
+                HitRole::Control,
+                HitShape::Rect(Rect {
+                    origin: Point::new(node.position.x + 60.0, port.position.y - 9.0),
+                    size: Size {
+                        width: 66.0,
+                        height: 18.0,
+                    },
+                }),
+            ));
         }
     }
     scene
@@ -706,11 +732,51 @@ fn launch(cx: &mut App) {
             ));
             let renderer_overlays = open_overlays.clone();
             let event_overlays = open_overlays.clone();
+            let mix_blends =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
+                    String,
+                    usize,
+                >::new()));
+            let renderer_blends = mix_blends.clone();
+            let event_blends = mix_blends.clone();
+            let mix_factors =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
+                    String,
+                    f32,
+                >::new()));
+            let renderer_factors = mix_factors.clone();
+            let event_factors = mix_factors.clone();
+            let mix_amounts =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
+                    String,
+                    f32,
+                >::new()));
+            let renderer_amounts = mix_amounts.clone();
             let graph = cx.new(move |cx| {
                 let graph = leptos_demo_graph();
                 NodeGraph::new_in(graph, cx)
                     .with_style(gpui_node_graph::style::leptos_demo())
-                    .with_world_node_body_renderer(leptos_world_node)
+                    .with_world_node_body_renderer(
+                        move |context: WorldNodeBodyContext<Kind, String, String>| {
+                            const BLENDS: [&str; 5] =
+                                ["Normal", "Multiply", "Screen", "Overlay", "Add"];
+                            let blend = renderer_blends
+                                .borrow()
+                                .get(&context.node.id)
+                                .copied()
+                                .unwrap_or(0);
+                            let factor = renderer_factors
+                                .borrow()
+                                .get(&context.node.id)
+                                .copied()
+                                .unwrap_or(0.0);
+                            leptos_world_node_with_values(
+                                context,
+                                BLENDS[blend % BLENDS.len()],
+                                factor,
+                            )
+                        },
+                    )
                     .with_catalog(editor_catalog)
                     .with_node_overlay_renderer(
                         move |context: WorldNodeBodyContext<Kind, String, String>,
@@ -721,6 +787,14 @@ fn launch(cx: &mut App) {
                             {
                                 return Vec::new();
                             }
+                            let node_id = context.node.id.clone();
+                            let amount = renderer_amounts
+                                .borrow()
+                                .get(&node_id)
+                                .copied()
+                                .unwrap_or(0.5);
+                            let slider_amounts = renderer_amounts.clone();
+                            let slider_node_id = node_id.clone();
                             vec![
                                 NodeOverlay::new(
                                     Point::new(context.node.size.width - 10.0, 29.0),
@@ -745,6 +819,22 @@ fn launch(cx: &mut App) {
                                             gpui::div()
                                                 .relative()
                                                 .h(gpui::px(14.0))
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    move |_, window, cx| {
+                                                        let mut amounts =
+                                                            slider_amounts.borrow_mut();
+                                                        let value = amounts
+                                                            .entry(slider_node_id.clone())
+                                                            .or_insert(0.5);
+                                                        *value = ((*value * 10.0).round() + 1.0)
+                                                            .rem_euclid(11.0)
+                                                            / 10.0;
+                                                        cx.refresh_windows();
+                                                        cx.stop_propagation();
+                                                        window.prevent_default();
+                                                    },
+                                                )
                                                 .child(
                                                     gpui::div()
                                                         .absolute()
@@ -758,7 +848,7 @@ fn launch(cx: &mut App) {
                                                 .child(
                                                     gpui::div()
                                                         .absolute()
-                                                        .left(gpui::px(82.0))
+                                                        .left(gpui::px(2.0 + amount * 164.0))
                                                         .top(gpui::px(0.0))
                                                         .w(gpui::px(14.0))
                                                         .h(gpui::px(14.0))
@@ -766,7 +856,7 @@ fn launch(cx: &mut App) {
                                                         .bg(gpui::rgb(0x93c5fd)),
                                                 ),
                                         )
-                                        .child("0.50")
+                                        .child(format!("{amount:.2}"))
                                         .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
                                             cx.stop_propagation();
                                             window.prevent_default();
@@ -798,6 +888,22 @@ fn launch(cx: &mut App) {
                         GraphEvent::NodeControlActivated {
                             node_id,
                             control_id,
+                        } if control_id.ends_with(":blend-select") => {
+                            let mut blends = event_blends.borrow_mut();
+                            let blend = blends.entry(node_id.clone()).or_insert(0);
+                            *blend = (*blend + 1) % 5;
+                        }
+                        GraphEvent::NodeControlActivated {
+                            node_id,
+                            control_id,
+                        } if control_id.ends_with(":factor-value") => {
+                            let mut factors = event_factors.borrow_mut();
+                            let factor = factors.entry(node_id.clone()).or_insert(0.0);
+                            *factor = ((*factor * 10.0).round() + 1.0).rem_euclid(11.0) / 10.0;
+                        }
+                        GraphEvent::NodeControlActivated {
+                            node_id,
+                            control_id,
                         } if control_id.ends_with(":inputs-count") => {
                             cycle_custom_port_count(editor, node_id, PortDirection::Input, cx);
                         }
@@ -812,7 +918,10 @@ fn launch(cx: &mut App) {
                             control_id,
                         } if control_id.ends_with(":mix-amount") => {
                             let mut overlays = event_overlays.borrow_mut();
-                            if !overlays.remove(node_id) {
+                            if editor.is_overlay_dismissed("mix-amount") {
+                                overlays.insert(node_id.clone());
+                                editor.reopen_overlay("mix-amount", cx);
+                            } else if !overlays.remove(node_id) {
                                 overlays.insert(node_id.clone());
                             }
                         }
@@ -890,7 +999,7 @@ fn browser_test_state() -> String {
             application.update(|cx| {
                 let graph = graph.read(cx);
                 format!(
-                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"worldLayout":"{}"}}"#,
+                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
                     graph.graph.nodes.len(),
                     graph.graph.connections.len(),
                     graph.catalog_is_open(),
@@ -903,6 +1012,14 @@ fn browser_test_state() -> String {
                         .resolved_node_size(&String::from("color_source_0"))
                         .map_or(0.0, |size| size.height),
                     graph.last_world_control().is_some(),
+                    graph.last_world_control().map_or("", |(_, control)| control),
+                    graph.active_overlay_count(),
+                    graph.graph.selected_nodes.len(),
+                    graph.graph.nodes["mix_1"].position.x,
+                    graph.graph.nodes["mix_1"].position.y,
+                    graph.graph.nodes["mix_1"].size.width,
+                    graph.graph.viewport.pan.x,
+                    graph.graph.viewport.pan.y,
                     graph.world_layout_fingerprint(),
                 )
             })

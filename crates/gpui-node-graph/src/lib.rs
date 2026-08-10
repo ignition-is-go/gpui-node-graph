@@ -1226,6 +1226,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     pub fn is_overlay_dismissed(&self, id: &str) -> bool {
         self.dismissed_overlays.contains(id)
     }
+    pub fn active_overlay_count(&self) -> usize {
+        self.active_dismissible_overlays.len()
+    }
 
     pub fn catalog_is_open(&self) -> bool {
         self.catalog_menu.is_some()
@@ -1459,6 +1462,22 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         Ok(())
     }
 
+    fn node_resize_bounds(&self) -> (f32, f32) {
+        let minimum = self
+            .config
+            .min_node_width
+            .max(self.style.node.min_width)
+            .max(self.style.node.resize_min_width);
+        let maximum = self
+            .style
+            .node
+            .resize_max_width
+            .unwrap_or(self.config.max_node_width)
+            .min(self.config.max_node_width)
+            .max(minimum);
+        (minimum, maximum)
+    }
+
     fn resize_node_width(&mut self, id: &N, width: f32) -> bool {
         if !width.is_finite() || width <= 0.0 {
             return false;
@@ -1597,10 +1616,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn reset_node_width(&mut self, id: &N, cx: &mut Context<Self>) {
+        if !self.style.node.resizable {
+            return;
+        }
+        let (minimum, maximum) = self.node_resize_bounds();
         let width = self
-            .config
-            .default_node_width
-            .clamp(self.config.min_node_width, self.config.max_node_width);
+            .style
+            .node
+            .width
+            .unwrap_or(self.config.default_node_width)
+            .clamp(minimum, maximum);
         let previous_width = self.graph.nodes.get(id).map(|node| node.size.width);
         if self.resize_node_width(id, width)
             && let Some(size) = self.graph.nodes.get(id).map(|node| node.size)
@@ -1626,6 +1651,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn begin_node_resize(&mut self, id: &N, screen_x: f32) {
+        if !self.style.node.resizable {
+            return;
+        }
         let Some(node) = self.graph.nodes.get(id) else {
             return;
         };
@@ -2206,6 +2234,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn begin_canvas_selection(&mut self, local: core::Point, shift: bool, cx: &mut Context<Self>) {
         self.catalog_menu = None;
+        if !self.active_dismissible_overlays.is_empty() {
+            self.dismissed_overlays
+                .extend(self.active_dismissible_overlays.drain());
+        }
         let before = (
             self.graph.selected_nodes.clone(),
             self.graph.selected_connections.clone(),
@@ -2272,7 +2304,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         if let Some(resize) = self.resize.clone() {
             let delta = (local.x - resize.start_screen_x) / self.graph.viewport.zoom;
             let width = (resize.start_size.width + delta)
-                .clamp(self.config.min_node_width, self.config.max_node_width);
+                .clamp(self.node_resize_bounds().0, self.node_resize_bounds().1);
             if self.resize_node_width(&resize.id, width) {
                 if let Some(active) = self.resize.as_mut() {
                     active.moved |= (width - active.start_size.width).abs() > f32::EPSILON;
@@ -3161,74 +3193,83 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         }),
                     ),
             );
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(px(position.x + viewport.scale_length(node.size.width) - 4.0))
-                    .top(px(position.y))
-                    .w(px(8.0))
-                    .h(px(viewport.scale_length(node.size.height)))
-                    .cursor_col_resize()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            window.prevent_default();
-                            this.focus(window, cx);
-                            if event.click_count >= 2 {
-                                let width = this
-                                    .config
-                                    .default_node_width
-                                    .clamp(this.config.min_node_width, this.config.max_node_width);
-                                let previous_width =
-                                    this.graph.nodes.get(&resize_id).map(|node| node.size.width);
-                                if this.resize_node_width(&resize_id, width)
-                                    && let Some(size) =
-                                        this.graph.nodes.get(&resize_id).map(|node| node.size)
-                                {
-                                    if this.config.mutation_mode == MutationMode::Controlled {
-                                        if let Some(previous_width) = previous_width {
-                                            let _ =
-                                                this.resize_node_width(&resize_id, previous_width);
-                                        }
-                                        cx.emit(core::GraphEvent::MutationRequested {
-                                            mutations: vec![core::GraphMutation::ResizeNode {
+            if self.style.node.resizable {
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left(px(position.x + viewport.scale_length(node.size.width)
+                            - viewport
+                                .scale_length(self.style.node.resize_handle_width * 0.5)))
+                        .top(px(position.y))
+                        .w(px(
+                            viewport.scale_length(self.style.node.resize_handle_width)
+                        ))
+                        .h(px(viewport.scale_length(node.size.height)))
+                        .cursor_col_resize()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.focus(window, cx);
+                                if event.click_count >= 2 {
+                                    let width = this.config.default_node_width.clamp(
+                                        this.config.min_node_width,
+                                        this.config.max_node_width,
+                                    );
+                                    let previous_width = this
+                                        .graph
+                                        .nodes
+                                        .get(&resize_id)
+                                        .map(|node| node.size.width);
+                                    if this.resize_node_width(&resize_id, width)
+                                        && let Some(size) =
+                                            this.graph.nodes.get(&resize_id).map(|node| node.size)
+                                    {
+                                        if this.config.mutation_mode == MutationMode::Controlled {
+                                            if let Some(previous_width) = previous_width {
+                                                let _ = this
+                                                    .resize_node_width(&resize_id, previous_width);
+                                            }
+                                            cx.emit(core::GraphEvent::MutationRequested {
+                                                mutations: vec![core::GraphMutation::ResizeNode {
+                                                    id: resize_id.clone(),
+                                                    size,
+                                                }],
+                                            });
+                                        } else {
+                                            cx.emit(core::GraphEvent::NodeResized {
                                                 id: resize_id.clone(),
                                                 size,
-                                            }],
-                                        });
-                                    } else {
-                                        cx.emit(core::GraphEvent::NodeResized {
-                                            id: resize_id.clone(),
-                                            size,
-                                        });
+                                            });
+                                        }
+                                        cx.notify();
                                     }
-                                    cx.notify();
+                                    return;
                                 }
-                                return;
-                            }
-                            let Some(node) = this.graph.nodes.get(&resize_id) else {
-                                return;
-                            };
-                            let start_size = node.size;
-                            let start_ports = this
-                                .graph
-                                .ports
-                                .iter()
-                                .filter(|(_, port)| port.node == resize_id)
-                                .map(|(id, port)| (id.clone(), port.position))
-                                .collect();
-                            this.drag = None;
-                            this.resize = Some(ResizeDrag {
-                                id: resize_id.clone(),
-                                start_screen_x: this.local_screen(event.position).x,
-                                start_size,
-                                start_ports,
-                                moved: false,
-                            });
-                        }),
-                    ),
-            );
+                                let Some(node) = this.graph.nodes.get(&resize_id) else {
+                                    return;
+                                };
+                                let start_size = node.size;
+                                let start_ports = this
+                                    .graph
+                                    .ports
+                                    .iter()
+                                    .filter(|(_, port)| port.node == resize_id)
+                                    .map(|(id, port)| (id.clone(), port.position))
+                                    .collect();
+                                this.drag = None;
+                                this.resize = Some(ResizeDrag {
+                                    id: resize_id.clone(),
+                                    start_screen_x: this.local_screen(event.position).x,
+                                    start_size,
+                                    start_ports,
+                                    moved: false,
+                                });
+                            }),
+                        ),
+                );
+            }
         }
 
         for port in self.graph.ports.values() {
@@ -3339,6 +3380,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .size_full()
                     .occlude()
                     .child(world_scene_element(frame_world_scene, viewport))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        let local = this.local_screen(event.position);
+                        this.handle_pointer_move(local, cx);
+                    }))
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
                         this.handle_scroll_wheel(event, window, cx);
                     }))
@@ -3381,8 +3426,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
-                                let on_resize_edge =
-                                    this.graph.nodes.get(&node_id).is_some_and(|node| {
+                                let on_resize_edge = this.style.node.resizable
+                                    && this.graph.nodes.get(&node_id).is_some_and(|node| {
                                         let world = this.graph.viewport.screen_to_world(local);
                                         (world.x - (node.position.x + node.size.width)).abs()
                                             <= this.style.node.resize_handle_width
@@ -3428,6 +3473,31 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     )
                     .bg(rgb(self.style.selection_box.background.rgb)
                         .opacity(self.style.selection_box.background.alpha)),
+            );
+        }
+
+        if !self.active_dismissible_overlays.is_empty()
+            && self.style.overlay.backdrop_pointer_events
+        {
+            let backdrop = self.style.overlay.backdrop_background;
+            root = root.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .size_full()
+                    .occlude()
+                    .bg(rgb(backdrop.rgb).opacity(backdrop.alpha))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.dismissed_overlays
+                                .extend(this.active_dismissible_overlays.drain());
+                            cx.notify();
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        }),
+                    ),
             );
         }
 

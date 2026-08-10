@@ -89,6 +89,19 @@ async function click(atX = x, atY = y, clickCount = 1) {
       type, x: atX, y: atY, button: "left", clickCount,
     });
 }
+async function drag(fromX, fromY, toX, toY) {
+  await command("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: fromX, y: fromY, button: "left", clickCount: 1,
+  });
+  await pause(75);
+  await command("Input.dispatchMouseEvent", {
+    type: "mouseMoved", x: toX, y: toY, button: "left", buttons: 1,
+  });
+  await pause(75);
+  await command("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: toX, y: toY, button: "left", clickCount: 1,
+  });
+}
 async function key(key, code = key, text) {
   const params = { key, code, ...(text ? { text } : {}) };
   await command("Input.dispatchKeyEvent", { type: "keyDown", ...params });
@@ -172,6 +185,11 @@ await waitFor("world-space control activation", (value) => value.controlActivate
 await saveStateScreenshot("overlay");
 await key("Escape", "Escape");
 await waitFor("overlay dismissal", (value) => value.overlayDismissed);
+await click(left + 509, top + 91);
+await waitFor("overlay reopening", (value) => !value.overlayDismissed);
+await pause();
+await click(left + 800, top + 200);
+await waitFor("outside-click overlay dismissal", (value) => value.overlayDismissed);
 await click();
 await key("Tab", "Tab");
 await waitFor("catalog opening", (value) => value.catalogOpen);
@@ -182,13 +200,20 @@ const created = await waitFor(
   "searched node creation",
   (value) => !value.catalogOpen && value.nodes === baseline.nodes + 1,
 );
+await click(left + 430, top + 91);
+await waitFor("blend selection", (value) => value.lastControl.endsWith(":blend-select"));
+await click(left + 420, top + 160);
+const authored = await waitFor(
+  "factor input",
+  (value) => value.lastControl.endsWith(":factor-value") && value.worldLayout !== created.worldLayout,
+);
 await click(left + 195, top + 95);
 await click(left + 344, top + 120);
 await waitFor("click-to-connect ports", (value) => value.connections === baseline.connections + 1);
 await key("Escape", "Escape");
 await pause();
 await command("Input.dispatchMouseEvent", {
-  type: "mouseWheel", x, y, deltaX: 0, deltaY: -180,
+  type: "mouseWheel", x: left + 400, y: top + 100, deltaX: 0, deltaY: -180,
 });
 const zoomed = await waitFor("pointer zoom", (value) => value.zoom !== created.zoom);
 await pause(1_000);
@@ -199,16 +224,45 @@ if (Math.abs(stable.sourceWidth - baseline.sourceWidth) > 0.1) {
 if (Math.abs(stable.sourceHeight - baseline.sourceHeight) > 0.5) {
   throw new Error(`node layout changed across zoom: ${JSON.stringify({ baseline, stable })}`);
 }
-if (stable.worldLayout !== created.worldLayout) {
-  throw new Error(`world display list changed across zoom: ${JSON.stringify({ created, stable })}`);
+if (stable.worldLayout !== authored.worldLayout) {
+  throw new Error(`world display list changed across zoom: ${JSON.stringify({ authored, stable })}`);
 }
+const screenPoint = (worldX, worldY, state = stable) => ({
+  x: left + worldX * state.zoom + state.panX,
+  y: top + worldY * state.zoom + state.panY,
+});
+const dragStart = screenPoint(stable.mixX + 70, stable.mixY + 15);
+await drag(dragStart.x, dragStart.y, dragStart.x + stable.zoom * 20, dragStart.y + stable.zoom * 20);
+const dragged = await waitFor(
+  "inverse node drag",
+  (value) => value.mixX - stable.mixX > 15
+    && value.mixX - stable.mixX < 22
+    && Math.abs((value.mixX - stable.mixX) - (value.mixY - stable.mixY)) < 0.5,
+);
+const resizeStart = screenPoint(dragged.mixX + dragged.mixWidth, dragged.mixY + 60, dragged);
+await drag(resizeStart.x, resizeStart.y, resizeStart.x + dragged.zoom * 20, resizeStart.y);
+const resized = await waitFor(
+  "inverse node resize",
+  (value) => value.mixWidth - dragged.mixWidth > 15
+    && value.mixWidth - dragged.mixWidth < 22,
+);
+const marqueeStart = screenPoint(250, 35, resized);
+const marqueeEnd = screenPoint(610, 240, resized);
+await drag(marqueeStart.x, marqueeStart.y, marqueeEnd.x, marqueeEnd.y);
+await waitFor("inverse marquee selection", (value) => value.selectedNodes > 0);
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
   clickConnected: true,
+  blendChanged: true,
+  factorChanged: true,
   worldControlActivated: true,
   overlayDismissed: true,
+  overlayOutsideDismissed: true,
   viewportChanged: zoomed.zoom !== created.zoom,
+  inverseDrag: true,
+  inverseResize: true,
+  inverseMarquee: true,
 };
 await shot();
 
