@@ -2,10 +2,10 @@ mod windows;
 
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, BoxShadow, Context, DispatchPhase, Element, ElementId,
-    FocusHandle, GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent,
-    ShapedLine, SharedString, TextAlign, TextRun, WeakEntity, Window, canvas, div, point,
-    prelude::*, px, quad, rgb,
+    FocusHandle, FontWeight, GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render,
+    ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, WeakEntity, Window, canvas,
+    div, point, prelude::*, px, quad, rgb,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -3192,6 +3192,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.focus(window, cx);
                             let local = this.local_screen(event.position);
                             if let Some(hit) = this
                                 .world_scene
@@ -3309,45 +3310,63 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let filtered = self.filtered_catalog_indices();
             let border = menu_style.border;
             let input_border = menu_style.input_border;
-            let mut menu_element = div()
+            let menu_element = div()
                 .absolute()
                 .left(px(anchor.x))
                 .top(px(anchor.y))
-                .w(px(menu_width))
-                .max_h(px(menu_style.max_height))
+                .w(px(menu_width + border.width * 2.0))
+                .max_h(px(menu_style.max_height + border.width * 2.0))
                 .overflow_hidden()
                 .rounded(px(menu_style.border_radius))
                 .border(px(border.width))
                 .border_color(rgb(border.color.rgb).opacity(border.color.alpha))
                 .bg(rgb(menu_style.background.rgb).opacity(menu_style.background.alpha))
                 .text_color(rgb(menu_style.item_color.rgb).opacity(menu_style.item_color.alpha))
-                .p(px(menu_style.search_padding))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(
                     div()
-                        .rounded(px(menu_style.input_border_radius))
-                        .border(px(input_border.width))
-                        .border_color(rgb(input_border.color.rgb).opacity(input_border.color.alpha))
-                        .bg(rgb(menu_style.input_background.rgb)
-                            .opacity(menu_style.input_background.alpha))
-                        .px(px(menu_style.input_padding_x))
-                        .py(px(menu_style.input_padding_y))
-                        .text_size(px(menu_style.input_font_size))
-                        .text_color(if query.is_empty() {
-                            rgb(menu_style.placeholder_color.rgb)
-                                .opacity(menu_style.placeholder_color.alpha)
-                        } else {
-                            rgb(menu_style.input_color.rgb).opacity(menu_style.input_color.alpha)
-                        })
-                        .child(if query.is_empty() {
-                            "Search nodes...".to_string()
-                        } else {
-                            query.clone()
-                        }),
+                        .p(px(menu_style.search_padding))
+                        .border_b(px(menu_style.divider.width))
+                        .border_color(
+                            rgb(menu_style.divider.color.rgb)
+                                .opacity(menu_style.divider.color.alpha),
+                        )
+                        .child(
+                            div()
+                                .h(px(28.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(menu_style.input_border_radius))
+                                .border(px(input_border.width))
+                                .border_color(
+                                    rgb(input_border.color.rgb).opacity(input_border.color.alpha),
+                                )
+                                .bg(rgb(menu_style.input_background.rgb)
+                                    .opacity(menu_style.input_background.alpha))
+                                .px(px(menu_style.input_padding_x))
+                                .text_size(px(menu_style.input_font_size))
+                                .text_color(if query.is_empty() {
+                                    rgb(menu_style.placeholder_color.rgb)
+                                        .opacity(menu_style.placeholder_color.alpha)
+                                } else {
+                                    rgb(menu_style.input_color.rgb)
+                                        .opacity(menu_style.input_color.alpha)
+                                })
+                                .child(if query.is_empty() {
+                                    "Search nodes...".to_string()
+                                } else {
+                                    query.clone()
+                                }),
+                        ),
                 );
+            let mut list_element = div()
+                .id("node-graph-catalog-list")
+                .flex_1()
+                .overflow_y_scroll()
+                .py(px(4.0));
             if filtered.is_empty() {
-                menu_element = menu_element.child(
+                list_element = list_element.child(
                     div()
                         .p_2()
                         .text_size(px(12.0))
@@ -3371,21 +3390,22 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         "Utility" => 0x10b981,
                         _ => menu_style.category_color.rgb,
                     };
-                    menu_element = menu_element.child(
+                    list_element = list_element.child(
                         div()
-                            .pt_2()
-                            .px_2()
+                            .pt(px(4.0))
+                            .pb(px(2.0))
+                            .px(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(9.0))
                             .text_color(rgb(category_color))
                             .child(item.category.to_uppercase()),
                     );
                 }
                 let hover = menu_style.hover_background;
-                menu_element = menu_element.child(
+                list_element = list_element.child(
                     div()
-                        .rounded_sm()
-                        .px_2()
-                        .py_1()
+                        .px(px(12.0))
+                        .py(px(6.0))
                         .when(row == selected, |element| {
                             element.bg(rgb(hover.rgb).opacity(hover.alpha))
                         })
@@ -3409,7 +3429,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         ),
                 );
             }
-            root = root.child(menu_element);
+            root = root.child(menu_element.child(list_element));
         }
 
         root.on_mouse_down(

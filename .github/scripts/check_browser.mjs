@@ -96,6 +96,17 @@ async function shot() {
     format: "png", captureBeyondViewport: false,
   })).data;
 }
+function screenshotPath(suffix) {
+  if (!initialScreenshot) return undefined;
+  const dot = initialScreenshot.lastIndexOf(".");
+  return dot < 0
+    ? `${initialScreenshot}-${suffix}`
+    : `${initialScreenshot.slice(0, dot)}-${suffix}${initialScreenshot.slice(dot)}`;
+}
+async function saveStateScreenshot(suffix) {
+  const output = screenshotPath(suffix);
+  if (output) fs.writeFileSync(output, Buffer.from(await shot(), "base64"));
+}
 
 async function graphState() {
   const result = await command("Runtime.evaluate", {
@@ -125,6 +136,9 @@ if (initialScreenshot) {
 if (baseline.sourceWidth < 100) {
   throw new Error(`node width collapsed before interaction trace: ${JSON.stringify(baseline)}`);
 }
+await click(left + 100, top + 65);
+await saveStateScreenshot("selected");
+await click();
 await command("Input.dispatchMouseEvent", {
   type: "mousePressed", x: left + 509, y: top + 91, button: "left", clickCount: 1,
 });
@@ -132,11 +146,13 @@ await command("Input.dispatchMouseEvent", {
   type: "mouseReleased", x: left + 509, y: top + 91, button: "left", clickCount: 1,
 });
 await waitFor("world-space control activation", (value) => value.controlActivated);
+await saveStateScreenshot("overlay");
 await key("Escape", "Escape");
 await waitFor("overlay dismissal", (value) => value.overlayDismissed);
 await click();
 await key("Tab", "Tab");
 await waitFor("catalog opening", (value) => value.catalogOpen);
+await saveStateScreenshot("menu");
 for (const character of "Math") await key(character, `Key${character.toUpperCase()}`, character);
 await key("Enter", "Enter");
 const created = await waitFor(

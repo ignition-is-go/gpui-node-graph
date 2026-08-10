@@ -90,8 +90,14 @@ jobs:
           fi
           python3 .github/scripts/compare_pixels.py \
             audits/goldens/leptos-initial-1200x661.png /tmp/gpui-initial.png
+          python3 .github/scripts/compare_pixels.py \
+            audits/goldens/leptos-selected-1200x661.png /tmp/gpui-initial-selected.png
+          python3 .github/scripts/compare_pixels.py \
+            audits/goldens/leptos-overlay-1200x661.png /tmp/gpui-initial-overlay.png
+          python3 .github/scripts/compare_pixels.py \
+            audits/goldens/leptos-menu-1200x661.png /tmp/gpui-initial-menu.png
       - name: Upload browser parity frame
         uses: actions/upload-artifact@v4
         with:
           name: gpui-node-graph-initial-frame
-          path: /tmp/gpui-initial.png
+          path: /tmp/gpui-initial*.png
