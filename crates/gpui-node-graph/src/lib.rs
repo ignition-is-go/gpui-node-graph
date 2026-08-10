@@ -3397,10 +3397,34 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         this.handle_scroll_wheel(event, window, cx);
                     }))
                     .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.focus(window, cx);
+                            this.panning = Some(this.local_screen(event.position));
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Middle,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
+                    )
+                    .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             this.focus(window, cx);
                             let local = this.local_screen(event.position);
+                            if event.modifiers.control {
+                                this.panning = Some(local);
+                                this.box_selection = None;
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             if let Some(hit) = this
                                 .world_scene
                                 .hit_test_screen(local, this.graph.viewport)

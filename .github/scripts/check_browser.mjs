@@ -102,6 +102,19 @@ async function drag(fromX, fromY, toX, toY) {
     type: "mouseReleased", x: toX, y: toY, button: "left", clickCount: 1,
   });
 }
+async function middleDrag(fromX, fromY, toX, toY) {
+  await command("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: fromX, y: fromY, button: "middle", clickCount: 1,
+  });
+  await pause(75);
+  await command("Input.dispatchMouseEvent", {
+    type: "mouseMoved", x: toX, y: toY, button: "middle", buttons: 4,
+  });
+  await pause(75);
+  await command("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: toX, y: toY, button: "middle", clickCount: 1,
+  });
+}
 async function key(key, code = key, text) {
   const params = { key, code, ...(text ? { text } : {}) };
   await command("Input.dispatchKeyEvent", { type: "keyDown", ...params });
@@ -253,6 +266,13 @@ const marqueeStart = screenPoint(250, 35, resized);
 const marqueeEnd = screenPoint(610, 240, resized);
 await drag(marqueeStart.x, marqueeStart.y, marqueeEnd.x, marqueeEnd.y);
 await waitFor("inverse marquee selection", (value) => value.selectedNodes > 0);
+const beforeMiddlePan = await graphState();
+await middleDrag(left + 900, top + 400, left + 925, top + 420);
+await waitFor(
+  "middle-button panning",
+  (value) => value.panX - beforeMiddlePan.panX > 20
+    && value.panY - beforeMiddlePan.panY > 15,
+);
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
@@ -267,6 +287,7 @@ const transitions = {
   inverseDrag: true,
   inverseResize: true,
   inverseMarquee: true,
+  middlePan: true,
 };
 await shot();
 
