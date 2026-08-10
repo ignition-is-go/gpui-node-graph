@@ -1,8 +1,11 @@
 use gpui::prelude::*;
-use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{App, WindowOptions};
+#[cfg(not(target_arch = "wasm32"))]
+use gpui::{Bounds, WindowBounds, px, size};
 use gpui_node_graph::{
-    CatalogPort, GraphGroup, NodeBody, NodeBodyContext, NodeCatalogItem, NodeGraph, NodeOverlay,
-    PortPresentation, core::*,
+    CatalogPort, GraphGroup, NodeCatalogItem, NodeGraph, NodeOverlay, WorldNodeBodyContext,
+    core::*,
+    world::{HitRole, HitShape, TextLines, WorldColor, WorldHitRegion, WorldPrimitive, WorldScene},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,6 +294,178 @@ fn leptos_demo_graph() -> GraphState<String, String, String, Kind> {
     graph
 }
 
+fn world_text(
+    scene: &mut WorldScene,
+    x: f32,
+    y: f32,
+    text: impl Into<String>,
+    size: f32,
+    color: u32,
+) {
+    scene.push(WorldPrimitive::Text {
+        origin: Point::new(x, y),
+        lines: TextLines::new([text.into()]),
+        color: WorldColor::rgb(color),
+        font_size: size,
+        font_weight: if size >= 12.0 { 600 } else { 400 },
+        line_height: size + 3.0,
+    });
+}
+
+fn world_socket(scene: &mut WorldScene, port: &Port<String, String, Kind>, connected: bool) {
+    scene.push(WorldPrimitive::Circle {
+        center: port.position,
+        radius: 4.0,
+        fill: WorldColor::rgb(0x71717a),
+    });
+    if !connected {
+        scene.push(WorldPrimitive::Circle {
+            center: port.position,
+            radius: 2.5,
+            fill: WorldColor::rgb(0x111111),
+        });
+    }
+}
+
+fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> WorldScene {
+    let mut scene = WorldScene::new();
+    let node = &context.node;
+    let (category, accent) = match node.title.as_str() {
+        "Color Source" => ("INPUT", 0x22d3ee),
+        "Mix" => ("COLOR", 0xf59e0b),
+        "Math" => ("MATH", 0x8b5cf6),
+        "Output" => ("OUTPUT", 0xef4444),
+        _ => ("UTILITY", 0x10b981),
+    };
+    scene.push(WorldPrimitive::Quad {
+        bounds: Rect {
+            origin: node.position,
+            size: Size {
+                width: node.size.width,
+                height: 2.0,
+            },
+        },
+        fill: WorldColor::rgb(accent),
+        corner_radius: 0.0,
+    });
+    world_text(
+        &mut scene,
+        node.position.x + 10.0,
+        node.position.y + 8.0,
+        node.title.to_uppercase(),
+        12.0,
+        0xa1a1aa,
+    );
+    let category_width = category.len() as f32 * 6.0;
+    world_text(
+        &mut scene,
+        node.position.x + node.size.width - 10.0 - category_width,
+        node.position.y + 8.0,
+        category,
+        10.0,
+        accent,
+    );
+
+    if node.title == "Mix" {
+        world_text(
+            &mut scene,
+            node.position.x + 10.0,
+            node.position.y + 34.0,
+            "Blend",
+            11.0,
+            0xa1a1aa,
+        );
+        scene.push(WorldPrimitive::Quad {
+            bounds: Rect {
+                origin: Point::new(node.position.x + 54.0, node.position.y + 30.5),
+                size: Size {
+                    width: 107.0,
+                    height: 22.0,
+                },
+            },
+            fill: WorldColor::rgb(0x27272a),
+            corner_radius: 4.0,
+        });
+        world_text(
+            &mut scene,
+            node.position.x + 64.0,
+            node.position.y + 34.0,
+            "Normal",
+            11.0,
+            0xd4d4d8,
+        );
+        scene.push(WorldPrimitive::Quad {
+            bounds: Rect {
+                origin: Point::new(node.position.x + 167.0, node.position.y + 29.0),
+                size: Size {
+                    width: 25.0,
+                    height: 25.0,
+                },
+            },
+            fill: WorldColor::rgb(0x27272a),
+            corner_radius: 4.0,
+        });
+        scene.push(WorldPrimitive::Line {
+            start: Point::new(node.position.x + 175.0, node.position.y + 46.0),
+            end: Point::new(node.position.x + 184.0, node.position.y + 37.0),
+            color: WorldColor::rgb(0xd4d4d8),
+            width: 1.5,
+        });
+        scene.push(WorldPrimitive::Line {
+            start: Point::new(node.position.x + 174.0, node.position.y + 47.0),
+            end: Point::new(node.position.x + 177.0, node.position.y + 46.0),
+            color: WorldColor::rgb(0xd4d4d8),
+            width: 1.5,
+        });
+        scene.push_hit_region(WorldHitRegion::new(
+            format!("{}:mix-amount", node.id),
+            HitRole::Control,
+            HitShape::Rect(Rect {
+                origin: Point::new(node.position.x + 167.0, node.position.y + 29.0),
+                size: Size {
+                    width: 25.0,
+                    height: 25.0,
+                },
+            }),
+        ));
+    }
+
+    let connected = ["color_source_0_color", "mix_1_b"];
+    for port in context.ports.iter() {
+        world_socket(&mut scene, port, connected.contains(&port.id.as_str()));
+        let (x, y) = match (node.title.as_str(), port.label.as_str(), port.direction) {
+            ("Color Source", "Color", _) => (node.position.x + 107.0, port.position.y - 6.0),
+            ("Color Source", "Alpha", _) => (node.position.x + 107.0, port.position.y - 6.0),
+            ("Mix", "Result", _) => (node.position.x + 148.0, port.position.y - 6.0),
+            (_, _, PortDirection::Input) => (port.position.x + 9.0, port.position.y - 6.0),
+            (_, _, PortDirection::Output) => (port.position.x - 50.0, port.position.y - 6.0),
+        };
+        world_text(&mut scene, x, y, port.label.clone(), 11.0, 0xa1a1aa);
+        if port.direction == PortDirection::Input && port.kind == Kind::Float {
+            scene.push(WorldPrimitive::Quad {
+                bounds: Rect {
+                    origin: Point::new(node.position.x + 60.0, port.position.y - 9.0),
+                    size: Size {
+                        width: 66.0,
+                        height: 18.0,
+                    },
+                },
+                fill: WorldColor::rgb(0x27272a),
+                corner_radius: 4.0,
+            });
+            world_text(
+                &mut scene,
+                node.position.x + 103.0,
+                port.position.y - 6.0,
+                "0.0",
+                11.0,
+                0xd4d4d8,
+            );
+        }
+    }
+    scene
+}
+
 fn launch(cx: &mut App) {
     #[cfg(not(target_arch = "wasm32"))]
     let window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
@@ -308,403 +483,31 @@ fn launch(cx: &mut App) {
         |_, cx| {
             let catalog = catalog();
             let editor_catalog = catalog.clone();
-            let graph = cx.new(|cx| {
+            let open_overlays = std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::<String>::new(),
+            ));
+            let renderer_overlays = open_overlays.clone();
+            let event_overlays = open_overlays.clone();
+            let graph = cx.new(move |cx| {
                 let graph = leptos_demo_graph();
-                let control_values = std::rc::Rc::new(std::cell::RefCell::new(
-                    std::collections::HashMap::<String, f32>::new(),
-                ));
-                let renderer_values = control_values.clone();
-                let open_overlays = std::rc::Rc::new(std::cell::RefCell::new(
-                    std::collections::HashSet::<String>::new(),
-                ));
-                let renderer_overlays = open_overlays.clone();
                 NodeGraph::new_in(graph, cx)
                     .with_style(gpui_node_graph::style::leptos_demo())
+                    .with_world_node_body_renderer(leptos_world_node)
                     .with_catalog(editor_catalog)
-                    .with_node_body_renderer(
-                        move |context: NodeBodyContext<Kind, String, String, String>,
-                         _: &mut gpui::Window,
-                         _: &mut App| {
-                            let mut input_rows = Vec::new();
-                            let mut output_rows = Vec::new();
-                            let mut ordered_ports = context.ports.iter().collect::<Vec<_>>();
-                            ordered_ports.sort_by_key(|port| match port.label.as_str() {
-                                "Color" | "A" | "Result" => 0,
-                                "Alpha" | "B" => 1,
-                                "Factor" => 2,
-                                _ => 3,
-                            });
-                            for port in ordered_ports {
-                                let anchor = context.default_port_anchor(port.id.clone());
-                                let row = if port.direction == PortDirection::Input {
-                                    let mut row = gpui::div()
-                                        .h(gpui::px(20.0 * context.state.zoom))
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_size(gpui::px(11.0 * context.state.zoom))
-                                        .child(anchor)
-                                        .child(port.label.clone());
-                                    if port.kind == Kind::Float {
-                                        row = row.child(
-                                            gpui::div()
-                                                .ml_auto()
-                                                .w(gpui::px(52.0 * context.state.zoom))
-                                                .rounded(gpui::px(4.0 * context.state.zoom))
-                                                .border(gpui::px(context.state.zoom))
-                                                .border_color(gpui::rgb(0x3f3f46))
-                                                .bg(gpui::rgb(0x27272a))
-                                                .text_size(gpui::px(11.0 * context.state.zoom))
-                                                .text_center()
-                                                .child("0.0"),
-                                        );
-                                    }
-                                    row
-                                } else {
+                    .with_node_overlay_renderer(
+                        move |context: WorldNodeBodyContext<Kind, String, String>,
+                              _: &mut gpui::Window,
+                              _: &mut App| {
+                            if context.node.title != "Mix"
+                                || !renderer_overlays.borrow().contains(&context.node.id)
+                            {
+                                return Vec::new();
+                            }
+                            vec![
+                                NodeOverlay::new(
+                                    Point::new(context.node.size.width - 10.0, 29.0),
                                     gpui::div()
-                                        .h(gpui::px(20.0 * context.state.zoom))
-                                        .flex()
-                                        .items_center()
-                                        .justify_end()
-                                        .gap_1()
-                                        .text_size(gpui::px(11.0 * context.state.zoom))
-                                        .child(port.label.clone())
-                                        .child(anchor)
-                                };
-                                if port.direction == PortDirection::Input {
-                                    input_rows.push(row);
-                                } else {
-                                    output_rows.push(row);
-                                }
-                            }
-                            let is_custom = context.node.title == "Custom";
-                            let overlay_eligible =
-                                context.node.title == "Multiply" || context.node.title == "Mix";
-                            let show_overlay = overlay_eligible
-                                && renderer_overlays.borrow().contains(&context.node.id);
-                            let node_title = context.node.title.clone();
-                            let node_zoom = context.state.zoom;
-                            let numeric_control = matches!(
-                                node_title.as_str(),
-                                "Math"
-                            );
-                            let color_control = false;
-                            let overlay_x = context.node.size.width + 12.0;
-                            let node_id = context.node.id.clone();
-                            let add_graph = context.graph();
-                            let remove_graph = context.graph();
-                            let (category, accent) = match node_title.as_str() {
-                                "Color Source" => ("INPUT", 0x22d3ee),
-                                "Mix" => ("COLOR", 0xf59e0b),
-                                "Math" => ("MATH", 0x8b5cf6),
-                                "Output" => ("OUTPUT", 0xef4444),
-                                _ => ("UTILITY", 0x10b981),
-                            };
-                            let header = gpui::div()
-                                .h(gpui::px(29.0 * node_zoom))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px_2()
-                                .text_size(gpui::px(12.0 * node_zoom))
-                                .text_color(gpui::rgb(0xa1a1aa))
-                                .child(node_title.to_uppercase())
-                                .child(
-                                    gpui::div()
-                                        .text_size(gpui::px(10.0 * node_zoom))
-                                        .text_color(gpui::rgb(accent))
-                                        .child(category),
-                                );
-                            let ports_element = gpui::div()
-                                .w_full()
-                                .flex()
-                                .justify_between()
-                                .px_2()
-                                .py_1()
-                                .child(gpui::div().flex().flex_col().children(input_rows))
-                                .child(gpui::div().flex().flex_col().children(output_rows));
-                            let mut body = gpui::div()
-                                .w_full()
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    gpui::div()
-                                        .w_full()
-                                        .h(gpui::px(2.0 * node_zoom))
-                                        .bg(gpui::rgb(accent)),
-                                )
-                                .child(header);
-                            if numeric_control {
-                                let value = *renderer_values
-                                    .borrow()
-                                    .get(&node_id)
-                                    .unwrap_or(&0.5);
-                                let values = renderer_values.clone();
-                                let graph = context.graph();
-                                let value_node = node_id.clone();
-                                let control = gpui::div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .rounded_sm()
-                                    .bg(gpui::rgb(0x27272a))
-                                    .px_2()
-                                    .child(format!("Value {value:.2}"))
-                                    .child(
-                                        gpui::div()
-                                            .rounded_sm()
-                                            .bg(gpui::rgb(0x3f3f46))
-                                            .px_2()
-                                            .child("+")
-                                            .on_mouse_down(
-                                                gpui::MouseButton::Left,
-                                                move |_, window, cx| {
-                                                    cx.stop_propagation();
-                                                    window.prevent_default();
-                                                    let next = (values
-                                                        .borrow()
-                                                        .get(&value_node)
-                                                        .copied()
-                                                        .unwrap_or(0.5)
-                                                        + 0.1)
-                                                        .min(1.0);
-                                                    values
-                                                        .borrow_mut()
-                                                        .insert(value_node.clone(), next);
-                                                    let _ = graph.update(cx, |_, cx| cx.notify());
-                                                },
-                                            ),
-                                    );
-                                body = body.child(context.isolated_control(control));
-                            }
-                            if overlay_eligible {
-                                let overlays = renderer_overlays.clone();
-                                let graph = context.graph();
-                                let overlay_node = node_id.clone();
-                                let trigger = gpui::div()
-                                    .h(gpui::px(25.0 * node_zoom))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px_2()
-                                    .text_size(gpui::px(11.0 * node_zoom))
-                                    .child("Blend")
-                                    .child(
-                                        gpui::div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                gpui::div()
-                                                    .w(gpui::px(106.0 * node_zoom))
-                                                    .rounded(gpui::px(4.0 * node_zoom))
-                                                    .border(gpui::px(node_zoom))
-                                                    .border_color(gpui::rgb(0x3f3f46))
-                                                    .bg(gpui::rgb(0x27272a))
-                                                    .px_2()
-                                                    .child("Normal"),
-                                            )
-                                            .child(
-                                                gpui::div()
-                                                    .rounded(gpui::px(4.0 * node_zoom))
-                                                    .border(gpui::px(node_zoom))
-                                                    .border_color(gpui::rgb(0x3f3f46))
-                                                    .bg(gpui::rgb(0x27272a))
-                                                    .px_2()
-                                                    .child("✎")
-                                                    .on_mouse_down(
-                                                        gpui::MouseButton::Left,
-                                                        move |_, window, cx| {
-                                                            cx.stop_propagation();
-                                                            window.prevent_default();
-                                                            let mut overlays = overlays.borrow_mut();
-                                                            if !overlays.remove(&overlay_node) {
-                                                                overlays.insert(overlay_node.clone());
-                                                            }
-                                                            drop(overlays);
-                                                            let _ = graph.update(cx, |_, cx| cx.notify());
-                                                        },
-                                                    ),
-                                            ),
-                                    );
-                                body = body.child(context.isolated_control(trigger));
-                            }
-                            if color_control {
-                                let values = renderer_values.clone();
-                                let graph = context.graph();
-                                let value_node = node_id.clone();
-                                let active = renderer_values
-                                    .borrow()
-                                    .get(&node_id)
-                                    .copied()
-                                    .unwrap_or_default()
-                                    > 0.5;
-                                let swatch = gpui::div()
-                                    .h(gpui::px(18.0 * node_zoom))
-                                    .rounded_sm()
-                                    .bg(gpui::rgb(if active { 0xf472b6 } else { 0x38bdf8 }))
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            window.prevent_default();
-                                            let next = if values
-                                                .borrow()
-                                                .get(&value_node)
-                                                .copied()
-                                                .unwrap_or_default()
-                                                > 0.5
-                                            {
-                                                0.0
-                                            } else {
-                                                1.0
-                                            };
-                                            values.borrow_mut().insert(value_node.clone(), next);
-                                            let _ = graph.update(cx, |_, cx| cx.notify());
-                                        },
-                                    );
-                                body = body.child(context.isolated_control(swatch));
-                            }
-                            if is_custom {
-                                let add_node = node_id.clone();
-                                let remove_node = node_id;
-                                body = body.child(
-                                    gpui::div()
-                                        .flex()
-                                        .gap_1()
-                                        .child(
-                                            gpui::div()
-                                                .rounded_sm()
-                                                .bg(gpui::rgb(0x334155))
-                                                .px_2()
-                                                .child("+ input")
-                                                .on_mouse_down(
-                                                    gpui::MouseButton::Left,
-                                                    move |_, window, cx| {
-                                                        cx.stop_propagation();
-                                                        window.prevent_default();
-                                                        let _ = add_graph.update(cx, |editor, cx| {
-                                                            let Some(node) = editor
-                                                                .graph
-                                                                .nodes
-                                                                .get(&add_node)
-                                                                .cloned()
-                                                            else {
-                                                                return;
-                                                            };
-                                                            let mut sequence = 1;
-                                                            let port_id = loop {
-                                                                let id = format!(
-                                                                    "{}.dynamic-{sequence}",
-                                                                    add_node
-                                                                );
-                                                                if !editor
-                                                                    .graph
-                                                                    .ports
-                                                                    .contains_key(&id)
-                                                                {
-                                                                    break id;
-                                                                }
-                                                                sequence += 1;
-                                                            };
-                                                            let row = editor
-                                                                .graph
-                                                                .ports
-                                                                .values()
-                                                                .filter(|port| {
-                                                                    port.node == add_node
-                                                                        && port.direction
-                                                                            == PortDirection::Input
-                                                                })
-                                                                .count();
-                                                            editor.graph.ports.insert(
-                                                                port_id.clone(),
-                                                                Port {
-                                                                    id: port_id.clone(),
-                                                                    node: add_node.clone(),
-                                                                    label: format!(
-                                                                        "Dynamic {}",
-                                                                        row + 1
-                                                                    ),
-                                                                    direction: PortDirection::Input,
-                                                                    kind: Kind::Float,
-                                                                    position: Point::new(
-                                                                        node.position.x,
-                                                                        node.position.y
-                                                                            + 52.0
-                                                                            + row as f32 * 22.0,
-                                                                    ),
-                                                                },
-                                                            );
-                                                            editor.restore_tombstoned_connections(&port_id, cx);
-                                                            if let Some(node) = editor
-                                                                .graph
-                                                                .nodes
-                                                                .get_mut(&add_node)
-                                                            {
-                                                                node.size.height += 22.0;
-                                                            }
-                                                            cx.notify();
-                                                        });
-                                                    },
-                                                ),
-                                        )
-                                        .child(
-                                            gpui::div()
-                                                .rounded_sm()
-                                                .bg(gpui::rgb(0x3f2a2a))
-                                                .px_2()
-                                                .child("− input")
-                                                .on_mouse_down(
-                                                    gpui::MouseButton::Left,
-                                                    move |_, window, cx| {
-                                                        cx.stop_propagation();
-                                                        window.prevent_default();
-                                                        let _ = remove_graph.update(
-                                                            cx,
-                                                            |editor, cx| {
-                                                                let mut candidates: Vec<_> = editor
-                                                                    .graph
-                                                                    .ports
-                                                                    .iter()
-                                                                    .filter(|(id, port)| {
-                                                                        port.node == remove_node
-                                                                            && id.contains(
-                                                                                ".dynamic-",
-                                                                            )
-                                                                    })
-                                                                    .map(|(id, _)| id.clone())
-                                                                    .collect();
-                                                                candidates.sort();
-                                                                if let Some(id) = candidates.pop() {
-                                                                    editor.remove_port_with_tombstones(&id, cx);
-                                                                    if let Some(node) = editor
-                                                                        .graph
-                                                                        .nodes
-                                                                        .get_mut(&remove_node)
-                                                                    {
-                                                                        node.size.height =
-                                                                            (node.size.height - 22.0)
-                                                                                .max(110.0);
-                                                                    }
-                                                                    cx.notify();
-                                                                }
-                                                            },
-                                                        );
-                                                    },
-                                                ),
-                                        ),
-                                );
-                            }
-                            body = body.child(ports_element);
-                            let body = NodeBody::new(body).with_ports(PortPresentation::BodyAnchors);
-                            if show_overlay {
-                                body.with_overlay(NodeOverlay::new(
-                                    Point::new(overlay_x, 20.0),
-                                    context.isolated_control(
-                                        gpui::div()
-                                            .w(gpui::px(200.0))
+                                        .w(gpui::px(200.0))
                                         .flex()
                                         .flex_col()
                                         .gap_2()
@@ -722,24 +525,44 @@ fn launch(cx: &mut App) {
                                         )
                                         .child(
                                             gpui::div()
-                                                .h(gpui::px(4.0))
-                                                .rounded_full()
-                                                .bg(gpui::rgb(0x71717a)),
+                                                .relative()
+                                                .h(gpui::px(14.0))
+                                                .child(
+                                                    gpui::div()
+                                                        .absolute()
+                                                        .left(gpui::px(2.0))
+                                                        .right(gpui::px(2.0))
+                                                        .top(gpui::px(5.0))
+                                                        .h(gpui::px(4.0))
+                                                        .rounded_full()
+                                                        .bg(gpui::rgb(0x71717a)),
+                                                )
+                                                .child(
+                                                    gpui::div()
+                                                        .absolute()
+                                                        .left(gpui::px(82.0))
+                                                        .top(gpui::px(0.0))
+                                                        .w(gpui::px(14.0))
+                                                        .h(gpui::px(14.0))
+                                                        .rounded_full()
+                                                        .bg(gpui::rgb(0x93c5fd)),
+                                                ),
                                         )
                                         .child("0.50")
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            |_, window, cx| {
-                                                cx.stop_propagation();
-                                                window.prevent_default();
-                                            },
-                                        ),
-                                    ),
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                                            cx.stop_propagation();
+                                            window.prevent_default();
+                                        }),
                                 )
-                                .adaptive("blend-controls", Size { width: 200.0, height: 86.0 }))
-                            } else {
-                                body
-                            }
+                                .with_screen_offset(Point::new(8.0, 0.0))
+                                .adaptive(
+                                    "mix-amount",
+                                    Size {
+                                        width: 200.0,
+                                        height: 86.0,
+                                    },
+                                ),
+                            ]
                         },
                     )
                     .with_groups(vec![GraphGroup {
@@ -754,6 +577,15 @@ fn launch(cx: &mut App) {
             graph.update(cx, |_, cx| {
                 cx.subscribe(&graph, move |editor, _, event, cx| {
                     match event {
+                        GraphEvent::NodeControlActivated {
+                            node_id,
+                            control_id,
+                        } if control_id.ends_with(":mix-amount") => {
+                            let mut overlays = event_overlays.borrow_mut();
+                            if !overlays.remove(node_id) {
+                                overlays.insert(node_id.clone());
+                            }
+                        }
                         GraphEvent::ConnectionRequested { source, target } => {
                             insert_connection(&mut editor.graph, source.clone(), target.clone());
                         }
@@ -828,10 +660,10 @@ fn browser_test_state() -> String {
             application.update(|cx| {
                 let graph = graph.read(cx);
                 format!(
-                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{}}}"#,
+                    r#"{{"nodes":{},"catalogOpen":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"worldLayout":"{}"}}"#,
                     graph.graph.nodes.len(),
                     graph.catalog_is_open(),
-                    graph.is_overlay_dismissed("blend-controls"),
+                    graph.is_overlay_dismissed("mix-amount"),
                     graph.graph.viewport.zoom,
                     graph
                         .resolved_node_size(&String::from("color_source_0"))
@@ -839,6 +671,8 @@ fn browser_test_state() -> String {
                     graph
                         .resolved_node_size(&String::from("color_source_0"))
                         .map_or(0.0, |size| size.height),
+                    graph.last_world_control().is_some(),
+                    graph.world_layout_fingerprint(),
                 )
             })
         })
@@ -927,5 +761,50 @@ mod parity_tests {
         );
         assert_eq!(graph.connections["conn_1"].source, "color_source_0_color");
         assert_eq!(graph.connections["conn_1"].target, "mix_1_b");
+    }
+    #[test]
+    fn world_node_layout_is_immutable_across_all_reference_zoom_levels() {
+        let graph = leptos_demo_graph();
+        let node = graph.nodes["mix_1"].clone();
+        let ports: std::sync::Arc<[_]> = graph
+            .ports
+            .values()
+            .filter(|port| port.node == node.id)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        let zooms = [0.1, 0.740818, 1.0, 1.349859, 2.0, 5.0];
+        let scenes = zooms.map(|zoom| {
+            leptos_world_node(WorldNodeBodyContext {
+                node: node.clone(),
+                ports: ports.clone(),
+                state: gpui_node_graph::NodeVisualState {
+                    selected: false,
+                    visible: true,
+                    zoom,
+                },
+                style: gpui_node_graph::style::leptos_demo(),
+            })
+        });
+        for scene in &scenes[1..] {
+            assert_eq!(scene, &scenes[0], "zoom changed the authored display list");
+        }
+        let control = scenes[0]
+            .hit_regions
+            .iter()
+            .find(|hit| hit.id.ends_with(":mix-amount"))
+            .unwrap();
+        for zoom in zooms {
+            let transform = gpui_node_graph::world::Transform::new(Point::new(17.25, -9.5), zoom);
+            let center_world = Point::new(509.5, 91.5);
+            let screen = transform.point(center_world);
+            assert_eq!(
+                scenes[0]
+                    .hit_test_screen(screen, transform)
+                    .map(|hit| &hit.id),
+                Some(&control.id),
+                "inverse hit testing failed at zoom {zoom}",
+            );
+        }
     }
 }

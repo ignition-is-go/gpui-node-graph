@@ -1,20 +1,23 @@
 mod windows;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, FocusHandle,
+    AnyElement, App, BorderStyle, Bounds, Context, DispatchPhase, Element, ElementId, FocusHandle,
     GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, WeakEntity,
-    Window, canvas, div, point, prelude::*, px, rgb,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollWheelEvent, ShapedLine,
+    SharedString, TextAlign, TextRun, WeakEntity, Window, canvas, div, point, prelude::*, px, quad,
+    rgb,
 };
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     rc::Rc,
     sync::Arc,
 };
 
 pub use node_graph_core as core;
 pub mod style;
+pub mod world;
 pub use node_graph_core::*;
 pub use style::GraphStyle;
 pub use windows::*;
@@ -77,6 +80,8 @@ pub struct NodeOverlay {
     /// not scaled, so retained controls keep normal GPUI hit testing while their anchor follows
     /// the node during pan and zoom.
     pub offset: core::Point,
+    /// Additional unscaled pane-space offset, matching CSS overlay gaps.
+    pub screen_offset: core::Point,
     pub element: AnyElement,
     pub behavior: Option<OverlayBehavior>,
 }
@@ -94,9 +99,15 @@ impl NodeOverlay {
     pub fn new(offset: core::Point, element: impl IntoElement) -> Self {
         Self {
             offset,
+            screen_offset: core::Point::new(0.0, 0.0),
             element: element.into_any_element(),
             behavior: None,
         }
+    }
+
+    pub fn with_screen_offset(mut self, offset: core::Point) -> Self {
+        self.screen_offset = offset;
+        self
     }
 
     pub fn adaptive(mut self, id: impl Into<String>, estimated_size: core::Size) -> Self {
@@ -156,6 +167,7 @@ pub struct NodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId, C: cor
     pub ports: Arc<[Port<N, P, T>]>,
     pub state: NodeVisualState,
     pub theme: Theme,
+    pub style: GraphStyle,
     graph: WeakEntity<NodeGraph<T, N, P, C>>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     viewport: Viewport,
@@ -264,23 +276,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
 
     pub fn default_port_anchor(&self, id: P) -> AnyElement {
         let port = self.ports.iter().find(|port| port.id == id);
-        let color = port.map_or(self.theme.port_connected, |port| {
-            if port.direction == PortDirection::Input {
-                self.theme.port_input
-            } else {
-                self.theme.port_output
-            }
+        let color = port.map_or(self.style.anchor.dot_connected_color, |_| {
+            self.style.anchor.dot_color
         });
-        let diameter = self.viewport.scale_length(8.0);
+        let diameter = self.viewport.scale_length(self.style.anchor.dot_size);
         self.port_anchor(
             id,
             div()
                 .w(px(diameter))
                 .h(px(diameter))
                 .rounded_full()
-                .border_1()
-                .border_color(rgb(self.theme.text))
-                .bg(rgb(color)),
+                .border(px(self
+                    .viewport
+                    .scale_length(self.style.anchor.dot_border_width)))
+                .border_color(rgb(color.rgb).opacity(color.alpha))
+                .bg(rgb(color.rgb).opacity(if port.is_some() { 0.0 } else { color.alpha })),
         )
     }
 }
@@ -311,6 +321,58 @@ where
         cx: &mut App,
     ) -> NodeBody {
         self(context, window, cx)
+    }
+}
+
+pub trait NodeOverlayRenderer<T: PortType, N: core::NodeId, P: core::PortId>: 'static {
+    fn render_node_overlays(
+        &mut self,
+        context: WorldNodeBodyContext<T, N, P>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<NodeOverlay>;
+}
+
+impl<T, N, P, F> NodeOverlayRenderer<T, N, P> for F
+where
+    T: PortType,
+    N: core::NodeId,
+    P: core::PortId,
+    F: FnMut(WorldNodeBodyContext<T, N, P>, &mut Window, &mut App) -> Vec<NodeOverlay> + 'static,
+{
+    fn render_node_overlays(
+        &mut self,
+        context: WorldNodeBodyContext<T, N, P>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<NodeOverlay> {
+        self(context, window, cx)
+    }
+}
+
+#[derive(Clone)]
+pub struct WorldNodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId> {
+    pub node: Node<N>,
+    pub ports: Arc<[Port<N, P, T>]>,
+    pub state: NodeVisualState,
+    pub style: GraphStyle,
+}
+
+/// Produces an immutable world-space display list. Layout happens in world units once; viewport
+/// changes only project the list for painting and inverse hit testing.
+pub trait WorldNodeBodyRenderer<T: PortType, N: core::NodeId, P: core::PortId>: 'static {
+    fn render_world_node(&mut self, context: WorldNodeBodyContext<T, N, P>) -> world::WorldScene;
+}
+
+impl<T, N, P, F> WorldNodeBodyRenderer<T, N, P> for F
+where
+    T: PortType,
+    N: core::NodeId,
+    P: core::PortId,
+    F: FnMut(WorldNodeBodyContext<T, N, P>) -> world::WorldScene + 'static,
+{
+    fn render_world_node(&mut self, context: WorldNodeBodyContext<T, N, P>) -> world::WorldScene {
+        self(context)
     }
 }
 
@@ -494,6 +556,145 @@ struct BoxSelection<N, C> {
     baseline_nodes: HashSet<N>,
     baseline_connections: HashSet<C>,
 }
+struct WorldTextPaint {
+    origin: core::Point,
+    line_height: f32,
+    line: ShapedLine,
+}
+
+struct WorldPaintState {
+    scene: world::ScreenScene,
+    text: Vec<WorldTextPaint>,
+}
+
+/// Paint a world-space display list through one deterministic viewport projection.
+///
+/// Text line breaks and primitive geometry are authored once in [`world::WorldScene`]. Zoom only
+/// projects that immutable display list; it never asks GPUI flex layout to reflow the content.
+pub fn world_scene_element(scene: world::WorldScene, viewport: Viewport) -> AnyElement {
+    let projected = scene.project(viewport);
+    canvas(
+        move |_bounds, window, _cx| {
+            let mut text = Vec::new();
+            let text_style = window.text_style();
+            for primitive in &projected.primitives {
+                if let world::ScreenPrimitive::Text {
+                    origin,
+                    lines,
+                    color,
+                    font_size,
+                    font_weight,
+                    line_height,
+                } = primitive
+                {
+                    for (index, value) in lines.as_slice().iter().enumerate() {
+                        let value: SharedString = value.clone().into();
+                        let mut font = text_style.font();
+                        font.weight = gpui::FontWeight(*font_weight as f32);
+                        let run = TextRun {
+                            len: value.len(),
+                            font,
+                            color: rgb(color.rgb).opacity(color.alpha).into(),
+                            ..Default::default()
+                        };
+                        text.push(WorldTextPaint {
+                            origin: core::Point::new(
+                                origin.x,
+                                origin.y + *line_height * index as f32,
+                            ),
+                            line_height: *line_height,
+                            line: window.text_system().shape_line(
+                                value,
+                                px(*font_size),
+                                &[run],
+                                None,
+                            ),
+                        });
+                    }
+                }
+            }
+            WorldPaintState {
+                scene: projected,
+                text,
+            }
+        },
+        move |bounds, state, window, cx| {
+            let offset = core::Point::new(f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+            for primitive in &state.scene.primitives {
+                match primitive {
+                    world::ScreenPrimitive::Quad {
+                        bounds: rect,
+                        fill,
+                        corner_radius,
+                    } => {
+                        let paint_bounds = Bounds::new(
+                            point(px(rect.origin.x + offset.x), px(rect.origin.y + offset.y)),
+                            gpui::size(px(rect.size.width), px(rect.size.height)),
+                        );
+                        window.paint_quad(quad(
+                            paint_bounds,
+                            px(*corner_radius),
+                            rgb(fill.rgb).opacity(fill.alpha),
+                            px(0.0),
+                            gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
+                    }
+                    world::ScreenPrimitive::Line {
+                        start,
+                        end,
+                        color,
+                        width,
+                    } => {
+                        let mut builder = PathBuilder::stroke(px(*width));
+                        builder.move_to(point(px(start.x + offset.x), px(start.y + offset.y)));
+                        builder.line_to(point(px(end.x + offset.x), px(end.y + offset.y)));
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, rgb(color.rgb).opacity(color.alpha));
+                        }
+                    }
+                    world::ScreenPrimitive::Circle {
+                        center,
+                        radius,
+                        fill,
+                    } => {
+                        let diameter = radius * 2.0;
+                        let paint_bounds = Bounds::new(
+                            point(
+                                px(center.x - radius + offset.x),
+                                px(center.y - radius + offset.y),
+                            ),
+                            gpui::size(px(diameter), px(diameter)),
+                        );
+                        window.paint_quad(quad(
+                            paint_bounds,
+                            px(*radius),
+                            rgb(fill.rgb).opacity(fill.alpha),
+                            px(0.0),
+                            gpui::transparent_black(),
+                            BorderStyle::default(),
+                        ));
+                    }
+                    world::ScreenPrimitive::Text { .. } => {}
+                }
+            }
+            for text in &state.text {
+                let _ = text.line.paint(
+                    point(px(text.origin.x + offset.x), px(text.origin.y + offset.y)),
+                    px(text.line_height),
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
+}
+
 struct NodeScaleElement {
     child: Option<AnyElement>,
     rem_size: Pixels,
@@ -697,6 +898,10 @@ pub struct NodeGraph<
     catalog: Vec<NodeCatalogItem<T>>,
     catalog_menu: Option<CatalogMenu<P>>,
     node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
+    world_node_body_renderer: Option<Box<dyn WorldNodeBodyRenderer<T, N, P>>>,
+    node_overlay_renderer: Option<Box<dyn NodeOverlayRenderer<T, N, P>>>,
+    world_scene: world::WorldScene,
+    last_world_control: Option<(N, String)>,
     groups: Vec<GraphGroup<N>>,
     render_geometry: RenderGeometry<N, P>,
     dangling_connections: Vec<DanglingConnection<P, C>>,
@@ -745,6 +950,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             catalog: Vec::new(),
             catalog_menu: None,
             node_body_renderer: None,
+            world_node_body_renderer: None,
+            node_overlay_renderer: None,
+            world_scene: world::WorldScene::new(),
+            last_world_control: None,
             groups: Vec::new(),
             render_geometry: RenderGeometry::default(),
             dangling_connections: Vec::new(),
@@ -776,6 +985,22 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.catalog = catalog;
         self.catalog_menu = None;
         cx.notify();
+    }
+
+    pub fn with_node_overlay_renderer(
+        mut self,
+        renderer: impl NodeOverlayRenderer<T, N, P>,
+    ) -> Self {
+        self.node_overlay_renderer = Some(Box::new(renderer));
+        self
+    }
+
+    pub fn with_world_node_body_renderer(
+        mut self,
+        renderer: impl WorldNodeBodyRenderer<T, N, P>,
+    ) -> Self {
+        self.world_node_body_renderer = Some(Box::new(renderer));
+        self
     }
 
     pub fn with_node_body_renderer<R>(mut self, renderer: R) -> Self
@@ -811,6 +1036,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     pub fn groups(&self) -> &[GraphGroup<N>] {
         &self.groups
+    }
+
+    pub fn world_layout_fingerprint(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.world_scene.primitives).hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    pub fn last_world_control(&self) -> Option<(&N, &str)> {
+        self.last_world_control
+            .as_ref()
+            .map(|(node, control)| (node, control.as_str()))
     }
 
     pub fn render_geometry(&self) -> &RenderGeometry<N, P> {
@@ -1191,6 +1428,37 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         )
     }
 
+    fn handle_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let delta_y = f32::from(delta.y);
+        if delta_y.abs() <= f32::EPSILON {
+            return;
+        }
+        let factor = if delta_y < 0.0 {
+            self.config.zoom_step.exp()
+        } else {
+            (-self.config.zoom_step).exp()
+        };
+        let local = self.local_screen(event.position);
+        let previous = self.graph.viewport;
+        self.graph
+            .viewport
+            .zoom_at(local, factor, self.config.min_zoom, self.config.max_zoom);
+        if self.graph.viewport != previous {
+            cx.emit(core::GraphEvent::ViewportChanged {
+                viewport: self.graph.viewport,
+            });
+            cx.notify();
+        }
+        cx.stop_propagation();
+        window.prevent_default();
+    }
+
     fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(handle) = &self.focus_handle {
             handle.focus(window, cx);
@@ -1209,6 +1477,143 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             (b, a)
         };
         (T::compatible(&source.kind, &target.kind)).then(|| (source.id.clone(), target.id.clone()))
+    }
+
+    fn node_at_screen(&self, screen: core::Point) -> Option<N> {
+        let world = self.graph.viewport.screen_to_world(screen);
+        let mut nodes: Vec<_> = self.graph.nodes.values().collect();
+        nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
+        nodes.into_iter().rev().find_map(|node| {
+            core::Rect {
+                origin: node.position,
+                size: node.size,
+            }
+            .contains(world)
+            .then(|| node.id.clone())
+        })
+    }
+
+    fn reset_node_width(&mut self, id: &N, cx: &mut Context<Self>) {
+        let width = self
+            .config
+            .default_node_width
+            .clamp(self.config.min_node_width, self.config.max_node_width);
+        let previous_width = self.graph.nodes.get(id).map(|node| node.size.width);
+        if self.resize_node_width(id, width)
+            && let Some(size) = self.graph.nodes.get(id).map(|node| node.size)
+        {
+            if self.config.mutation_mode == MutationMode::Controlled {
+                if let Some(previous_width) = previous_width {
+                    let _ = self.resize_node_width(id, previous_width);
+                }
+                cx.emit(core::GraphEvent::MutationRequested {
+                    mutations: vec![core::GraphMutation::ResizeNode {
+                        id: id.clone(),
+                        size,
+                    }],
+                });
+            } else {
+                cx.emit(core::GraphEvent::NodeResized {
+                    id: id.clone(),
+                    size,
+                });
+            }
+            cx.notify();
+        }
+    }
+
+    fn begin_node_resize(&mut self, id: &N, screen_x: f32) {
+        let Some(node) = self.graph.nodes.get(id) else {
+            return;
+        };
+        let start_size = node.size;
+        let start_ports = self
+            .graph
+            .ports
+            .iter()
+            .filter(|(_, port)| port.node == *id)
+            .map(|(id, port)| (id.clone(), port.position))
+            .collect();
+        self.drag = None;
+        self.resize = Some(ResizeDrag {
+            id: id.clone(),
+            start_screen_x: screen_x,
+            start_size,
+            start_ports,
+            moved: false,
+        });
+    }
+
+    fn begin_node_drag(
+        &mut self,
+        id: &N,
+        local: core::Point,
+        shift: bool,
+        alt: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let cursor = self.graph.viewport.screen_to_world(local);
+        let before = (
+            self.graph.selected_nodes.clone(),
+            self.graph.selected_connections.clone(),
+        );
+        if shift {
+            if !self.graph.selected_nodes.remove(id) {
+                self.graph.selected_nodes.insert(id.clone());
+            }
+        } else if !self.graph.selected_nodes.contains(id) {
+            self.graph.selected_nodes.clear();
+            self.graph.selected_connections.clear();
+            self.graph.selected_nodes.insert(id.clone());
+        } else {
+            self.graph.selected_connections.clear();
+        }
+        if before
+            != (
+                self.graph.selected_nodes.clone(),
+                self.graph.selected_connections.clone(),
+            )
+        {
+            self.emit_selection(cx);
+        }
+        if self.graph.selected_nodes.contains(id) {
+            let selected: Vec<_> = self
+                .graph
+                .selected_nodes
+                .iter()
+                .filter_map(|selected_id| {
+                    let node = self.graph.nodes.get(selected_id)?;
+                    Some((selected_id.clone(), cursor - node.position, node.position))
+                })
+                .collect();
+            self.drag = Some(NodeDrag {
+                offsets: selected
+                    .iter()
+                    .map(|(id, offset, _)| (id.clone(), *offset))
+                    .collect(),
+                starts: selected
+                    .into_iter()
+                    .map(|(id, _, position)| (id, position))
+                    .collect(),
+                moved: false,
+                alter_groups: alt,
+            });
+        }
+        cx.notify();
+    }
+
+    fn port_at_screen(&self, screen: core::Point, radius: f32) -> Option<P> {
+        self.graph
+            .ports
+            .keys()
+            .filter_map(|id| {
+                let position = self.resolved_port_position(id)?;
+                let screen_position = self.graph.viewport.world_to_screen(position);
+                let distance = screen_position.distance(screen);
+                (distance <= radius).then(|| (id.clone(), distance))
+            })
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(id, _)| id)
     }
 
     fn nearest_compatible_port(&self, origin: &P, cursor: core::Point) -> Option<P> {
@@ -2096,9 +2501,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .unwrap_or(draft.current_screen);
             Some((source, end))
         });
-        let wire_color: gpui::Hsla = rgb(self.theme.wire).into();
-        let selected_wire_color: gpui::Hsla = rgb(self.theme.wire_selected).into();
-        let draft_color: gpui::Hsla = rgb(self.theme.wire_draft).into();
+        let wire_color: gpui::Hsla = rgb(self.style.connection.stroke.rgb)
+            .opacity(self.style.connection.stroke.alpha)
+            .into();
+        let selected_wire_color: gpui::Hsla = rgb(self.style.connection.stroke_selected.rgb)
+            .opacity(self.style.connection.stroke_selected.alpha)
+            .into();
+        let draft_color: gpui::Hsla = rgb(self.style.connection.stroke_draft.rgb)
+            .opacity(self.style.connection.stroke_draft.alpha)
+            .into();
+        let wire_width = viewport.scale_length(self.style.connection.stroke_width);
+        let selected_wire_width =
+            viewport.scale_length(self.style.connection.stroke_width_selected);
         let dangling_color: gpui::Hsla = rgb(0xef4444).into();
         let canvas_bounds = self.canvas_bounds.clone();
         let captured_graph = cx.weak_entity();
@@ -2160,7 +2574,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         } else {
                             wire_color
                         },
-                        if *selected || *dangling { 3.0 } else { 2.0 },
+                        if *selected || *dangling {
+                            selected_wire_width
+                        } else {
+                            wire_width
+                        },
                         corner_radius,
                     );
                 }
@@ -2171,7 +2589,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         viewport.world_to_screen(source),
                         end,
                         draft_color,
-                        2.0,
+                        wire_width,
                     );
                 }
             },
@@ -2183,7 +2601,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(self.theme.background))
+            .bg(rgb(self.style.editor.background.rgb).opacity(self.style.editor.background.alpha))
             .track_focus(&focus_handle)
             .key_context("NodeGraph")
             .on_key_down(cx.listener(Self::handle_key_down));
@@ -2232,11 +2650,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .h(px(
                         viewport.scale_length(bottom - top + top_padding + bottom_padding)
                     ))
-                    .rounded(px(viewport.scale_length(8.0)))
-                    .border(px(viewport.scale_length(1.0)))
+                    .rounded(px(viewport.scale_length(self.style.group.border_radius)))
+                    .border(px(viewport.scale_length(self.style.group.border_width)))
                     .border_dashed()
-                    .border_color(rgb(group.color).opacity(0.5))
-                    .bg(rgb(group.color).opacity(0.1)),
+                    .border_color(rgb(group.color).opacity(self.style.group.border_opacity))
+                    .bg(rgb(group.color).opacity(self.style.group.background_opacity)),
             );
             group_labels.push((origin, group.id.clone(), group_label, group.color));
         }
@@ -2245,10 +2663,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             root = root.child(
                 div()
                     .absolute()
-                    .left(px(origin.x + viewport.scale_length(10.0)))
-                    .top(px(origin.y + viewport.scale_length(6.0)))
+                    .left(px(
+                        origin.x + viewport.scale_length(self.style.group.label_left)
+                    ))
+                    .top(px(
+                        origin.y + viewport.scale_length(self.style.group.label_top)
+                    ))
                     .text_color(rgb(color))
-                    .text_size(px(viewport.scale_length(10.0)))
+                    .text_size(px(viewport.scale_length(self.style.group.label_font_size)))
                     .child(label.to_uppercase())
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2273,6 +2695,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let mut node_overlays = Vec::new();
         self.active_dismissible_overlays.clear();
         let mut body_anchored_nodes = HashSet::new();
+        let mut frame_world_scene = world::WorldScene::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
         for mut node in nodes {
@@ -2285,26 +2708,42 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let selected = self.graph.selected_nodes.contains(&id);
             let visible = self.node_is_visible(&node);
             let resize_id = id.clone();
-            let has_custom_body = self.node_body_renderer.is_some();
-            let mut body = if let Some(renderer) = self.node_body_renderer.as_mut() {
-                let mut ports: Vec<_> = self
-                    .graph
-                    .ports
-                    .values()
-                    .filter(|port| port.node == id)
-                    .cloned()
-                    .collect();
-                ports.sort_by_cached_key(|port| format!("{:?}", port.id));
+            let has_custom_body =
+                self.node_body_renderer.is_some() || self.world_node_body_renderer.is_some();
+            let mut ports: Vec<_> = self
+                .graph
+                .ports
+                .values()
+                .filter(|port| port.node == id)
+                .cloned()
+                .collect();
+            ports.sort_by_cached_key(|port| format!("{:?}", port.id));
+            let mut body = if let Some(renderer) = self.world_node_body_renderer.as_mut() {
+                let scene = renderer.render_world_node(WorldNodeBodyContext {
+                    node: node.clone(),
+                    ports: ports.clone().into(),
+                    state: NodeVisualState {
+                        selected,
+                        visible,
+                        zoom: viewport.zoom,
+                    },
+                    style: self.style.clone(),
+                });
+                frame_world_scene.primitives.extend(scene.primitives);
+                frame_world_scene.hit_regions.extend(scene.hit_regions);
+                NodeBody::new(div()).with_ports(PortPresentation::BodyAnchors)
+            } else if let Some(renderer) = self.node_body_renderer.as_mut() {
                 renderer.render_node(
                     NodeBodyContext {
                         node: node.clone(),
-                        ports: ports.into(),
+                        ports: ports.clone().into(),
                         state: NodeVisualState {
                             selected,
                             visible,
                             zoom: viewport.zoom,
                         },
                         theme: self.theme.clone(),
+                        style: self.style.clone(),
                         graph: cx.weak_entity(),
                         canvas_bounds: self.canvas_bounds.clone(),
                         viewport,
@@ -2315,11 +2754,28 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             } else {
                 NodeBody::new(div().child(node.title.clone()))
             };
+            if let Some(renderer) = self.node_overlay_renderer.as_mut() {
+                body.overlays.extend(renderer.render_node_overlays(
+                    WorldNodeBodyContext {
+                        node: node.clone(),
+                        ports: ports.clone().into(),
+                        state: NodeVisualState {
+                            selected,
+                            visible,
+                            zoom: viewport.zoom,
+                        },
+                        style: self.style.clone(),
+                    },
+                    window,
+                    cx,
+                ));
+            }
             if body.ports == PortPresentation::BodyAnchors {
                 body_anchored_nodes.insert(id.clone());
             }
             for overlay in body.overlays.drain(..) {
-                let screen_offset = overlay_screen_offset(overlay.offset, viewport);
+                let screen_offset =
+                    overlay_screen_offset(overlay.offset, viewport) + overlay.screen_offset;
                 let mut overlay_position = position + screen_offset;
                 if let Some(behavior) = &overlay.behavior {
                     if self.dismissed_overlays.contains(&behavior.id) {
@@ -2383,11 +2839,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             } else {
                 raw_body_element
             };
-            let background = if selected {
-                self.theme.node_selected
-            } else {
-                self.theme.node
-            };
+            let node_background = self.style.node.background;
+            let node_radius = self.style.node.border_radius;
+            let selected_outline = self.style.node.outline_selected;
             root = root.child(
                 div()
                     .absolute()
@@ -2395,14 +2849,22 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .top(px(position.y))
                     .w(px(viewport.scale_length(node.size.width)))
                     .h(px(viewport.scale_length(model_size.height)))
-                    .rounded(px(viewport.scale_length(2.0)))
+                    .rounded(px(viewport.scale_length(node_radius)))
                     .overflow_hidden()
                     .when(selected, |element| {
-                        element.border_1().border_color(rgb(0xff0000))
+                        element
+                            .border(px(viewport.scale_length(selected_outline.width)))
+                            .border_color(
+                                rgb(selected_outline.color.rgb)
+                                    .opacity(selected_outline.color.alpha),
+                            )
                     })
-                    .bg(rgb(background))
-                    .text_color(rgb(self.theme.text))
-                    .text_size(px(viewport.scale_length(13.0)))
+                    .bg(rgb(node_background.rgb).opacity(node_background.alpha))
+                    .text_color(
+                        rgb(self.style.node.header_color.rgb)
+                            .opacity(self.style.node.header_color.alpha),
+                    )
+                    .text_size(px(viewport.scale_length(self.style.node.header_font_size)))
                     .child(body_element)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2410,10 +2872,26 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             cx.stop_propagation();
                             window.prevent_default();
                             this.focus(window, cx);
-                            let cursor = this
-                                .graph
-                                .viewport
-                                .screen_to_world(this.local_screen(event.position));
+                            let local = this.local_screen(event.position);
+                            if let Some(hit) = this
+                                .world_scene
+                                .hit_test_screen(local, this.graph.viewport)
+                                .cloned()
+                                && matches!(hit.role, world::HitRole::Control)
+                            {
+                                this.last_world_control = Some((id.clone(), hit.id.clone()));
+                                cx.emit(core::GraphEvent::NodeControlActivated {
+                                    node_id: id.clone(),
+                                    control_id: hit.id,
+                                });
+                                cx.notify();
+                                return;
+                            }
+                            if let Some(port_id) = this.port_at_screen(local, 10.0) {
+                                this.start_draft(&port_id, cx);
+                                return;
+                            }
+                            let cursor = this.graph.viewport.screen_to_world(local);
                             let before = (
                                 this.graph.selected_nodes.clone(),
                                 this.graph.selected_connections.clone(),
@@ -2638,6 +3116,77 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 );
         }
 
+        self.world_scene = frame_world_scene.clone();
+        if !frame_world_scene.primitives.is_empty() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .occlude()
+                    .child(world_scene_element(frame_world_scene, viewport))
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                        this.handle_scroll_wheel(event, window, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            let local = this.local_screen(event.position);
+                            if let Some(hit) = this
+                                .world_scene
+                                .hit_test_screen(local, this.graph.viewport)
+                                .cloned()
+                                && matches!(hit.role, world::HitRole::Control)
+                                && let Some(node_id) = this.node_at_screen(local)
+                            {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.focus(window, cx);
+                                this.last_world_control = Some((node_id.clone(), hit.id.clone()));
+                                cx.emit(core::GraphEvent::NodeControlActivated {
+                                    node_id,
+                                    control_id: hit.id,
+                                });
+                                cx.notify();
+                                return;
+                            }
+                            if let Some(port_id) = this.port_at_screen(local, 10.0) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.focus(window, cx);
+                                this.start_draft(&port_id, cx);
+                                return;
+                            }
+                            if let Some(node_id) = this.node_at_screen(local) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.focus(window, cx);
+                                let on_resize_edge =
+                                    this.graph.nodes.get(&node_id).is_some_and(|node| {
+                                        let world = this.graph.viewport.screen_to_world(local);
+                                        (world.x - (node.position.x + node.size.width)).abs()
+                                            <= 8.0 / this.graph.viewport.zoom
+                                    });
+                                if on_resize_edge {
+                                    if event.click_count >= 2 {
+                                        this.reset_node_width(&node_id, cx);
+                                    } else {
+                                        this.begin_node_resize(&node_id, local.x);
+                                    }
+                                } else {
+                                    this.begin_node_drag(
+                                        &node_id,
+                                        local,
+                                        event.modifiers.shift,
+                                        event.modifiers.alt,
+                                        cx,
+                                    );
+                                }
+                            }
+                        }),
+                    ),
+            );
+        }
+
         if let Some(selection) = &self.box_selection {
             let rect = selection.rect();
             let top_left = viewport.world_to_screen(rect.origin);
@@ -2648,9 +3197,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .top(px(top_left.y))
                     .w(px(viewport.scale_length(rect.size.width)))
                     .h(px(viewport.scale_length(rect.size.height)))
-                    .border_1()
-                    .border_color(rgb(self.theme.selection_border).opacity(0.1))
-                    .bg(rgb(self.theme.selection_fill).opacity(0.025)),
+                    .border(px(self.style.selection_box.border.width))
+                    .border_color(
+                        rgb(self.style.selection_box.border.color.rgb)
+                            .opacity(self.style.selection_box.border.color.alpha),
+                    )
+                    .bg(rgb(self.style.selection_box.background.rgb)
+                        .opacity(self.style.selection_box.background.alpha)),
             );
         }
 
@@ -2660,64 +3213,124 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .absolute()
                     .left(px(position.x))
                     .top(px(position.y))
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(overlay),
             );
         }
 
         if let Some(menu) = self.catalog_menu.as_ref() {
-            let anchor = viewport.world_to_screen(menu.anchor_world);
+            let menu_style = &self.style.menu;
+            let raw_anchor = viewport.world_to_screen(menu.anchor_world);
+            let canvas = self.canvas_bounds.get();
+            let menu_width = menu_style.min_width;
+            let anchor = core::Point::new(
+                raw_anchor.x.clamp(
+                    menu_style.viewport_margin,
+                    (f32::from(canvas.size.width) - menu_width - menu_style.viewport_margin)
+                        .max(menu_style.viewport_margin),
+                ),
+                raw_anchor.y.clamp(
+                    menu_style.viewport_margin,
+                    (f32::from(canvas.size.height)
+                        - menu_style.max_height
+                        - menu_style.viewport_margin)
+                        .max(menu_style.viewport_margin),
+                ),
+            );
             let selected = menu.selected;
             let query = menu.query.clone();
             let filtered = self.filtered_catalog_indices();
+            let border = menu_style.border;
+            let input_border = menu_style.input_border;
             let mut menu_element = div()
                 .absolute()
                 .left(px(anchor.x))
                 .top(px(anchor.y))
-                .w(px(280.0))
-                .max_h(px(360.0))
+                .w(px(menu_width))
+                .max_h(px(menu_style.max_height))
                 .overflow_hidden()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(0x52525b))
-                .bg(rgb(0x202023))
-                .text_color(rgb(self.theme.text))
-                .p_2()
+                .rounded(px(menu_style.border_radius))
+                .border(px(border.width))
+                .border_color(rgb(border.color.rgb).opacity(border.color.alpha))
+                .bg(rgb(menu_style.background.rgb).opacity(menu_style.background.alpha))
+                .text_color(rgb(menu_style.item_color.rgb).opacity(menu_style.item_color.alpha))
+                .p(px(menu_style.search_padding))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(
                     div()
-                        .pb_2()
-                        .text_size(px(12.0))
-                        .text_color(rgb(0xa1a1aa))
-                        .child(if query.is_empty() {
-                            "Create node · type to search".to_string()
+                        .rounded(px(menu_style.input_border_radius))
+                        .border(px(input_border.width))
+                        .border_color(rgb(input_border.color.rgb).opacity(input_border.color.alpha))
+                        .bg(rgb(menu_style.input_background.rgb)
+                            .opacity(menu_style.input_background.alpha))
+                        .px(px(menu_style.input_padding_x))
+                        .py(px(menu_style.input_padding_y))
+                        .text_size(px(menu_style.input_font_size))
+                        .text_color(if query.is_empty() {
+                            rgb(menu_style.placeholder_color.rgb)
+                                .opacity(menu_style.placeholder_color.alpha)
                         } else {
-                            format!("Search: {query}")
+                            rgb(menu_style.input_color.rgb).opacity(menu_style.input_color.alpha)
+                        })
+                        .child(if query.is_empty() {
+                            "Search nodes...".to_string()
+                        } else {
+                            query.clone()
                         }),
                 );
             if filtered.is_empty() {
-                menu_element = menu_element
-                    .child(div().p_2().text_size(px(12.0)).child("No compatible nodes"));
+                menu_element = menu_element.child(
+                    div()
+                        .p_2()
+                        .text_size(px(12.0))
+                        .text_color(
+                            rgb(menu_style.empty_color.rgb).opacity(menu_style.empty_color.alpha),
+                        )
+                        .child("No nodes found"),
+                );
             }
-            for (row, item_index) in filtered.into_iter().take(8).enumerate() {
+            let mut previous_category: Option<String> = None;
+            for (row, item_index) in filtered.into_iter().enumerate() {
                 let item = &self.catalog[item_index];
                 let item_id = item_index;
-                let subtitle = if item.description.is_empty() {
-                    item.category.clone()
-                } else {
-                    format!("{} · {}", item.category, item.description)
-                };
+                if previous_category.as_deref() != Some(item.category.as_str()) {
+                    previous_category = Some(item.category.clone());
+                    let category_color = match item.category.as_str() {
+                        "Input" => 0x22d3ee,
+                        "Color" => 0xf59e0b,
+                        "Math" => 0x8b5cf6,
+                        "Output" => 0xef4444,
+                        "Utility" => 0x10b981,
+                        _ => menu_style.category_color.rgb,
+                    };
+                    menu_element = menu_element.child(
+                        div()
+                            .pt_2()
+                            .px_2()
+                            .text_size(px(9.0))
+                            .text_color(rgb(category_color))
+                            .child(item.category.to_uppercase()),
+                    );
+                }
+                let hover = menu_style.hover_background;
                 menu_element = menu_element.child(
                     div()
                         .rounded_sm()
                         .px_2()
                         .py_1()
-                        .when(row == selected, |element| element.bg(rgb(0x3f3f46)))
-                        .child(div().text_size(px(13.0)).child(item.label.clone()))
+                        .when(row == selected, |element| {
+                            element.bg(rgb(hover.rgb).opacity(hover.alpha))
+                        })
+                        .child(div().text_size(px(12.0)).child(item.label.clone()))
                         .child(
                             div()
                                 .text_size(px(10.0))
-                                .text_color(rgb(0xa1a1aa))
-                                .child(subtitle),
+                                .text_color(
+                                    rgb(menu_style.description_color.rgb)
+                                        .opacity(menu_style.description_color.alpha),
+                                )
+                                .child(item.description.clone()),
                         )
                         .on_mouse_down(
                             MouseButton::Left,
@@ -2837,29 +3450,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
         )
         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-            let delta = event.delta.pixel_delta(window.line_height());
-            let delta_y = f32::from(delta.y);
-            if delta_y.abs() <= f32::EPSILON {
-                return;
-            }
-            let factor = if delta_y < 0.0 {
-                this.config.zoom_step.exp()
-            } else {
-                (-this.config.zoom_step).exp()
-            };
-            let local = this.local_screen(event.position);
-            let previous = this.graph.viewport;
-            this.graph
-                .viewport
-                .zoom_at(local, factor, this.config.min_zoom, this.config.max_zoom);
-            if this.graph.viewport != previous {
-                cx.emit(core::GraphEvent::ViewportChanged {
-                    viewport: this.graph.viewport,
-                });
-                cx.notify();
-            }
-            cx.stop_propagation();
-            window.prevent_default();
+            this.handle_scroll_wheel(event, window, cx);
         }))
     }
 }

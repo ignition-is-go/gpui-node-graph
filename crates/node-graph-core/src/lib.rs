@@ -239,6 +239,10 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
         id: N,
         size: Size,
     },
+    NodeControlActivated {
+        node_id: N,
+        control_id: String,
+    },
     ConnectionRequested {
         source: P,
         target: P,

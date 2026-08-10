@@ -75,10 +75,10 @@ if (!(state?.started && state?.isolated && state?.canvas && state?.bridge)) {
 
 const canvasState = await command("Runtime.evaluate", {
   expression: `(() => { const r = document.querySelector("canvas").getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
+    return { left: r.x, top: r.y, x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
   returnByValue: true,
 });
-const { x, y } = canvasState.result.value;
+const { left, top, x, y } = canvasState.result.value;
 const pause = (ms = 300) => new Promise((resolve) => setTimeout(resolve, ms));
 async function click(clickCount = 1) {
   for (const type of ["mousePressed", "mouseReleased"])
@@ -118,6 +118,15 @@ const baseline = await graphState();
 if (baseline.sourceWidth < 100) {
   throw new Error(`node width collapsed before interaction trace: ${JSON.stringify(baseline)}`);
 }
+await command("Input.dispatchMouseEvent", {
+  type: "mousePressed", x: left + 509, y: top + 91, button: "left", clickCount: 1,
+});
+await command("Input.dispatchMouseEvent", {
+  type: "mouseReleased", x: left + 509, y: top + 91, button: "left", clickCount: 1,
+});
+await waitFor("world-space control activation", (value) => value.controlActivated);
+await key("Escape", "Escape");
+await waitFor("overlay dismissal", (value) => value.overlayDismissed);
 await click();
 await key("Tab", "Tab");
 await waitFor("catalog opening", (value) => value.catalogOpen);
@@ -141,9 +150,14 @@ if (Math.abs(stable.sourceWidth - baseline.sourceWidth) > 0.1) {
 if (Math.abs(stable.sourceHeight - baseline.sourceHeight) > 0.5) {
   throw new Error(`node layout changed across zoom: ${JSON.stringify({ baseline, stable })}`);
 }
+if (stable.worldLayout !== created.worldLayout) {
+  throw new Error(`world display list changed across zoom: ${JSON.stringify({ created, stable })}`);
+}
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
+  worldControlActivated: true,
+  overlayDismissed: true,
   viewportChanged: zoomed.zoom !== created.zoom,
 };
 await shot();
