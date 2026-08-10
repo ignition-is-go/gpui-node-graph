@@ -5,11 +5,13 @@ import { execFileSync } from "node:child_process";
 const [url, port = "9222", initialScreenshot] = process.argv.slice(2);
 if (!url) throw new Error("usage: check_browser.mjs URL [DEBUG_PORT]");
 const deadline = Date.now() + 60_000;
+const softwareReadback = process.env.NODE_GRAPH_SOFTWARE_READBACK === "1";
 let page;
 while (Date.now() < deadline) {
   try {
     const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
     page = pages.find((entry) => entry.type === "page" && entry.url.startsWith(url));
+    if (!page && softwareReadback) page = pages.find((entry) => entry.type === "page");
     if (page) break;
   } catch {}
   await new Promise((resolve) => setTimeout(resolve, 250));
@@ -38,6 +40,105 @@ function command(method, params = {}) {
 }
 await command("Page.enable");
 await command("Runtime.enable");
+if (softwareReadback) {
+  const source = `(() => {
+    const contexts = new Set();
+    const originalConfigure = GPUCanvasContext.prototype.configure;
+    const originalGetCurrentTexture = GPUCanvasContext.prototype.getCurrentTexture;
+    const originalSubmit = GPUQueue.prototype.submit;
+    GPUCanvasContext.prototype.configure = function(config) {
+      this.__gpuiDevice = config.device;
+      this.__gpuiFormat = config.format;
+      contexts.add(this);
+      return originalConfigure.call(this, {
+        ...config,
+        usage: (config.usage || GPUTextureUsage.RENDER_ATTACHMENT) | GPUTextureUsage.COPY_SRC,
+      });
+    };
+    GPUCanvasContext.prototype.getCurrentTexture = function() {
+      const texture = originalGetCurrentTexture.call(this);
+      this.__gpuiTexture = texture;
+      return texture;
+    };
+    let sequence = 0;
+    let painted = 0;
+    let copying = false;
+    GPUQueue.prototype.submit = function(commands) {
+      const result = originalSubmit.call(this, commands);
+      if (copying) return result;
+      const context = [...contexts].find((candidate) => candidate.__gpuiDevice?.queue === this);
+      const texture = context?.__gpuiTexture;
+      const sourceCanvas = context?.canvas;
+      if (!texture || !sourceCanvas?.width || !sourceCanvas?.height) return result;
+      const current = ++sequence;
+      const width = sourceCanvas.width;
+      const height = sourceCanvas.height;
+      const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
+      try {
+        const device = context.__gpuiDevice;
+        const buffer = device.createBuffer({
+          size: bytesPerRow * height,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        const encoder = device.createCommandEncoder();
+        encoder.copyTextureToBuffer(
+          { texture },
+          { buffer, bytesPerRow, rowsPerImage: height },
+          { width, height, depthOrArrayLayers: 1 },
+        );
+        copying = true;
+        originalSubmit.call(this, [encoder.finish()]);
+        copying = false;
+        buffer.mapAsync(GPUMapMode.READ).then(() => {
+          if (current < painted) { buffer.destroy(); return; }
+          const raw = new Uint8Array(buffer.getMappedRange());
+          const pixels = new Uint8ClampedArray(width * height * 4);
+          const bgra = String(context.__gpuiFormat).startsWith("bgra");
+          for (let y = 0; y < height; y++) {
+            const row = raw.subarray(y * bytesPerRow, y * bytesPerRow + width * 4);
+            pixels.set(row, y * width * 4);
+          }
+          if (bgra) {
+            for (let offset = 0; offset < pixels.length; offset += 4) {
+              const red = pixels[offset];
+              pixels[offset] = pixels[offset + 2];
+              pixels[offset + 2] = red;
+            }
+          }
+          let mirror = document.getElementById("gpui-software-readback");
+          if (!mirror) {
+            mirror = document.createElement("canvas");
+            mirror.id = "gpui-software-readback";
+            Object.assign(mirror.style, {
+              position: "fixed", pointerEvents: "none", zIndex: "2147483647",
+            });
+            document.documentElement.appendChild(mirror);
+          }
+          const rect = sourceCanvas.getBoundingClientRect();
+          mirror.width = width;
+          mirror.height = height;
+          Object.assign(mirror.style, {
+            left: rect.left + "px", top: rect.top + "px",
+            width: rect.width + "px", height: rect.height + "px",
+          });
+          mirror.getContext("2d").putImageData(new ImageData(pixels, width, height), 0, 0);
+          painted = current;
+          globalThis.__gpuiSoftwareFrame = painted;
+          buffer.destroy();
+        }).catch(() => { copying = false; buffer.destroy(); });
+      } catch (_) { copying = false; }
+      return result;
+    };
+  })();`;
+  await command("Page.addScriptToEvaluateOnNewDocument", { source });
+  await command("Emulation.setDeviceMetricsOverride", {
+    width: 1200,
+    height: 661,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await command("Page.navigate", { url });
+}
 let state;
 let readySince;
 while (Date.now() < deadline) {
@@ -89,6 +190,16 @@ async function click(atX = x, atY = y, clickCount = 1) {
       type, x: atX, y: atY, button: "left", clickCount,
     });
 }
+async function move(toX, toY) {
+  await command("Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: toX,
+    y: toY,
+    button: "none",
+  });
+  await pause();
+}
+
 async function drag(fromX, fromY, toX, toY) {
   await command("Input.dispatchMouseEvent", {
     type: "mousePressed", x: fromX, y: fromY, button: "left", clickCount: 1,
@@ -209,6 +320,11 @@ await click();
 await key("Tab", "Tab");
 await pause();
 await waitFor("catalog opening", (value) => value.catalogOpen);
+await key("Tab", "Tab");
+await waitFor("catalog Tab cancellation", (value) => !value.catalogOpen);
+await key("Tab", "Tab");
+await pause();
+await waitFor("catalog reopening", (value) => value.catalogOpen);
 await saveStateScreenshot("menu");
 for (const character of "Math") await key(character, `Key${character.toUpperCase()}`, character);
 await key("Enter", "Enter");
@@ -233,9 +349,17 @@ await waitFor(
   (value) => value.catalogOpen && value.catalogDraft && value.catalogEntries >= 2,
 );
 for (const character of "Mix") await key(character, `Key${character.toUpperCase()}`, character);
-await waitFor("draft catalog filtering", (value) => value.catalogEntries === 2);
+await waitFor(
+  "draft catalog filtering",
+  (value) => value.catalogEntries === 2 && value.catalogSelected === 0,
+);
 await saveStateScreenshot("draft-menu");
+await move(left + 800, top + 401);
+await waitFor("draft pin mouse selection", (value) => value.catalogSelected === 1);
+await move(left + 800, top + 377);
+await waitFor("draft pin mouse reselection", (value) => value.catalogSelected === 0);
 await key("ArrowDown", "ArrowDown");
+await waitFor("draft pin keyboard selection", (value) => value.catalogSelected === 1);
 await key("Enter", "Enter");
 await waitFor(
   "draft catalog create-and-connect",

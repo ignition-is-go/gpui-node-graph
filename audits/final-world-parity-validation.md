@@ -44,3 +44,5 @@ Unit coverage additionally exercises all reference zoom levels (`0.1`, `0.740818
 ## Validation commands
 
 The acceptance run used `cargo fmt --check`, workspace tests, strict workspace/all-target Clippy, native checks, `wasm32-unknown-unknown` checks, release Trunk build, the stateful X11/Vulkan browser trace, four golden comparisons, and `git diff --check`. CI repeats Linux browser/WASM validation plus Linux/macOS/Windows native checks using the official GPUI pin.
+
+Hosted Linux uses Dawn SwiftShader and an early CDP-injected readback mirror. The hook adds `COPY_SRC` to GPUI's actual WebGPU canvas configuration, copies each presented texture through a mapped GPU buffer, and displays those exact bytes in a screenshot-visible Canvas2D plane. This preserves strict pixel validation on software-only runners whose compositor otherwise omits direct-present WebGPU surfaces; a background-only or stale capture still fails the comparison. The same recipe was reproduced in a clean Ubuntu 24.04 container before enabling it in CI.

@@ -1057,12 +1057,13 @@ fn browser_test_state() -> String {
             application.update(|cx| {
                 let graph = graph.read(cx);
                 format!(
-                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"catalogDraft":{},"catalogEntries":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"mixAmount":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
+                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"catalogDraft":{},"catalogEntries":{},"catalogSelected":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"mixAmount":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
                     graph.graph.nodes.len(),
                     graph.graph.connections.len(),
                     graph.catalog_is_open(),
                     graph.catalog_connects_draft(),
                     graph.catalog_entry_count(),
+                    graph.catalog_selected_entry().unwrap_or(0),
                     graph.is_overlay_dismissed("mix-amount"),
                     graph.graph.viewport.zoom,
                     graph

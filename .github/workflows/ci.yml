@@ -95,14 +95,14 @@ jobs:
             --ozone-platform=x11 --no-sandbox --no-first-run --no-default-browser-check \
             --disable-dev-shm-usage --enable-unsafe-webgpu \
             --enable-features=Vulkan --disable-features=UseSkiaRenderer \
-            --use-angle=vulkan --use-webgpu-adapter=swiftshader \
+            --use-angle=vulkan --use-webgpu-adapter=swiftshader --disable-vulkan-surface \
             --window-position=0,0 --window-size=1200,800 \
             --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
-            --user-data-dir=/tmp/node-graph-chrome http://127.0.0.1:8181/ \
+            --user-data-dir=/tmp/node-graph-chrome about:blank \
             > /tmp/node-graph-chrome.log 2>&1 &
           chrome=$!
           trap 'kill -TERM -- -"$chrome" 2>/dev/null || true; kill "$xvfb" "$server" 2>/dev/null || true' EXIT
-          if ! timeout 75 node .github/scripts/check_browser.mjs \
+          if ! NODE_GRAPH_SOFTWARE_READBACK=1 timeout 75 node .github/scripts/check_browser.mjs \
             http://127.0.0.1:8181/ 9222 /tmp/gpui-initial.png; then
             cat /tmp/node-graph-chrome.log
             exit 1

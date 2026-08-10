@@ -946,6 +946,7 @@ pub struct NodeGraph<
     world_node_body_renderer: Option<Box<dyn WorldNodeBodyRenderer<T, N, P>>>,
     node_overlay_renderer: Option<Box<dyn NodeOverlayRenderer<T, N, P>>>,
     world_scene: world::WorldScene,
+    world_control_owners: HashMap<String, N>,
     last_world_control: Option<(N, String)>,
     groups: Vec<GraphGroup<N>>,
     render_geometry: RenderGeometry<N, P>,
@@ -1000,6 +1001,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             world_node_body_renderer: None,
             node_overlay_renderer: None,
             world_scene: world::WorldScene::new(),
+            world_control_owners: HashMap::new(),
             last_world_control: None,
             groups: Vec::new(),
             render_geometry: RenderGeometry::default(),
@@ -1258,6 +1260,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     pub fn catalog_entry_count(&self) -> usize {
         self.filtered_catalog_entries().len()
     }
+    pub fn catalog_selected_entry(&self) -> Option<usize> {
+        self.catalog_menu.as_ref().map(|menu| menu.selected)
+    }
 
     pub fn reopen_overlay(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.dismissed_overlays.remove(id) {
@@ -1357,11 +1362,20 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 .unwrap_or_default();
             let consumed = compatible.len().max(1);
             if menu.selected >= entry_index && menu.selected < entry_index + consumed {
-                self.catalog_scroll_handle.scroll_to_item(child_index);
+                let selected_child = if compatible.len() > 1 {
+                    child_index + 1 + (menu.selected - entry_index)
+                } else {
+                    child_index
+                };
+                self.catalog_scroll_handle.scroll_to_item(selected_child);
                 return;
             }
             entry_index += consumed;
-            child_index += 1;
+            child_index += if compatible.len() > 1 {
+                1 + compatible.len()
+            } else {
+                1
+            };
         }
     }
 
@@ -2507,7 +2521,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         if self.catalog_menu.is_some() {
             let before = self.filtered_catalog_entries();
             match key {
-                "escape" => self.catalog_menu = None,
+                "escape" | "tab" => self.catalog_menu = None,
                 "enter" => {
                     if let Some(menu) = self.catalog_menu.as_ref()
                         && let Some((item_index, port_index)) = before.get(menu.selected).copied()
@@ -2943,6 +2957,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         self.active_dismissible_overlays.clear();
         let mut body_anchored_nodes = HashSet::new();
         let mut frame_world_scene = world::WorldScene::new();
+        let mut frame_world_control_owners = HashMap::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
         for mut node in nodes {
@@ -2972,6 +2987,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     state: WorldNodeVisualState { selected, visible },
                     style: self.style.clone(),
                 });
+                for hit in &scene.hit_regions {
+                    if matches!(hit.role, world::HitRole::Control) {
+                        frame_world_control_owners.insert(hit.id.clone(), id.clone());
+                    }
+                }
                 frame_world_scene.primitives.extend(scene.primitives);
                 frame_world_scene.hit_regions.extend(scene.hit_regions);
                 NodeBody::new(div()).with_ports(PortPresentation::BodyAnchors)
@@ -3391,6 +3411,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
 
         self.world_scene = frame_world_scene.clone();
+        self.world_control_owners = frame_world_control_owners;
         if !frame_world_scene.primitives.is_empty() {
             root = root.child(
                 div()
@@ -3440,6 +3461,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 .cloned()
                                 && matches!(hit.role, world::HitRole::Control)
                                 && let Some(node_id) = this.node_at_screen(local)
+                                && this.world_control_owners.get(&hit.id) == Some(&node_id)
                             {
                                 cx.stop_propagation();
                                 window.prevent_default();
@@ -3597,6 +3619,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let input_border = menu_style.input_border;
             let menu_element = div()
                 .absolute()
+                .flex()
+                .flex_col()
                 .left(px(anchor.x))
                 .top(px(anchor.y))
                 .w(px(menu_width + border.width * 2.0))
@@ -3703,6 +3727,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     None
                 };
                 let mut item_element = div()
+                    .id(("catalog-item", item_index))
                     .px(px(12.0))
                     .py(px(6.0))
                     .when(!has_multiple_ports && base_entry == selected, |element| {
@@ -3720,15 +3745,26 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             .child(item.description.clone()),
                     );
                 if !has_multiple_ports {
-                    item_element = item_element.on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            window.prevent_default();
-                            this.choose_catalog(item_id, auto_port, cx);
-                        }),
-                    );
+                    item_element = item_element
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered
+                                && let Some(menu) = this.catalog_menu.as_mut()
+                                && menu.selected != base_entry
+                            {
+                                menu.selected = base_entry;
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.choose_catalog(item_id, auto_port, cx);
+                            }),
+                        );
                 } else {
+                    list_element = list_element.child(item_element);
                     for (port_offset, port_index) in compatible.into_iter().enumerate() {
                         let entry = base_entry + port_offset;
                         let port = &item.ports[port_index];
@@ -3737,12 +3773,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             PortDirection::Output => "‹ ",
                         };
                         let label = format!("{direction}{}", port.label);
-                        item_element = item_element.child(
+                        list_element = list_element.child(
                             div()
-                                .ml(px(8.0))
-                                .mr(px(-8.0))
-                                .px(px(4.0))
+                                .id(format!("catalog-port-{item_id}-{port_index}"))
+                                .ml(px(20.0))
+                                .mr(px(4.0))
                                 .pl(px(12.0))
+                                .pr(px(4.0))
                                 .py(px(3.0))
                                 .text_size(px(11.0))
                                 .text_color(
@@ -3753,6 +3790,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     element.bg(rgb(hover.rgb).opacity(hover.alpha))
                                 })
                                 .child(label)
+                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                    if *hovered
+                                        && let Some(menu) = this.catalog_menu.as_mut()
+                                        && menu.selected != entry
+                                    {
+                                        menu.selected = entry;
+                                        cx.notify();
+                                    }
+                                }))
                                 .on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, window, cx| {
@@ -3763,6 +3809,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 ),
                         );
                     }
+                    continue;
                 }
                 list_element = list_element.child(item_element);
             }
