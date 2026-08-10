@@ -227,8 +227,8 @@ async function middleDrag(fromX, fromY, toX, toY) {
     type: "mouseReleased", x: toX, y: toY, button: "middle", clickCount: 1,
   });
 }
-async function key(key, code = key, text) {
-  const params = { key, code, ...(text ? { text } : {}) };
+async function key(key, code = key, text, modifiers = 0) {
+  const params = { key, code, modifiers, ...(text ? { text } : {}) };
   await command("Input.dispatchKeyEvent", { type: "keyDown", ...params });
   await command("Input.dispatchKeyEvent", { type: "keyUp", ...params });
 }
@@ -334,8 +334,15 @@ await waitFor("overlay dismissal", (value) => value.overlayDismissed);
 await click(left + 509, top + 91);
 await waitFor("overlay reopening", (value) => !value.overlayDismissed);
 await pause();
-await click(left + 800, top + 200);
-await waitFor("outside-click overlay dismissal", (value) => value.overlayDismissed);
+await click(left + 430, top + 91);
+await waitFor(
+  "click-through overlay dismissal",
+  (value) => value.overlayDismissed
+    && value.selectOpen
+    && value.lastControl.endsWith(":blend-select"),
+);
+await key("Escape", "Escape");
+await waitFor("click-through target cleanup", (value) => !value.selectOpen);
 await click();
 await key("Tab", "Tab");
 await pause();
@@ -353,11 +360,36 @@ const created = await waitFor(
   (value) => !value.catalogOpen && value.nodes === baseline.nodes + 1,
 );
 await click(left + 430, top + 91);
-await waitFor("blend selection", (value) => value.lastControl.endsWith(":blend-select"));
+await waitFor(
+  "blend dropdown opening",
+  (value) => value.lastControl.endsWith(":blend-select") && value.selectOpen,
+);
+await pause();
 await click(left + 420, top + 160);
+await waitFor(
+  "blend option selection",
+  (value) => value.blend === "Screen" && !value.selectOpen,
+);
+await click(left + 420, top + 160);
+await waitFor("factor focus", (value) => value.lastControl.endsWith(":factor-value"));
+await key("a", "KeyA", undefined, 2);
+for (const [character, code] of [["0", "Digit0"], [".", "Period"], ["7", "Digit7"], ["5", "Digit5"]]) {
+  await key(character, code, character);
+}
+await key("Enter", "Enter");
+await key("Tab", "Tab", undefined, 8);
+await waitFor(
+  "reverse control focus traversal",
+  (value) => value.lastControl.endsWith(":mix-amount"),
+);
+await key("Tab", "Tab");
+await waitFor(
+  "forward control focus traversal",
+  (value) => value.lastControl.endsWith(":factor-value"),
+);
 const authored = await waitFor(
-  "factor input",
-  (value) => value.lastControl.endsWith(":factor-value") && value.worldLayout !== created.worldLayout,
+  "factor text editing",
+  (value) => value.factorText === "0.75" && value.worldLayout !== created.worldLayout,
 );
 await click(left + 195, top + 95);
 await click(left + 344, top + 120);
@@ -389,6 +421,28 @@ await waitFor(
 );
 await key("Escape", "Escape");
 await pause();
+await click(left + 900, top + 100);
+await key("Tab", "Tab");
+await pause();
+await waitFor("custom catalog opening", (value) => value.catalogOpen);
+for (const character of "Custom") await key(character, `Key${character.toUpperCase()}`, character);
+await key("Enter", "Enter");
+await waitFor(
+  "custom node creation",
+  (value) => !value.catalogOpen && value.nodes === baseline.nodes + 3 && value.customInputs === 2,
+);
+const beforeCustomSelect = await graphState();
+await click(left + 870, top + 421);
+await waitFor(
+  "custom count dropdown opening",
+  (value) => value.selectOpen && value.worldLayout === beforeCustomSelect.worldLayout,
+);
+await pause();
+await click(left + 870, top + 531);
+await waitFor(
+  "custom count option selection",
+  (value) => !value.selectOpen && value.customInputs === 4,
+);
 const authoredBeforeZoom = await graphState();
 await command("Input.dispatchMouseEvent", {
   type: "mouseWheel", x: left + 400, y: top + 100, deltaX: 0, deltaY: -180,
@@ -442,6 +496,8 @@ const transitions = {
   draftMenuConnected: true,
   blendChanged: true,
   factorChanged: true,
+  controlFocusTraversal: true,
+  customSelectChanged: true,
   rangeDragged: true,
   worldControlActivated: true,
   overlayDismissed: true,

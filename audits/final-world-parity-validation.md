@@ -34,10 +34,14 @@ The remaining differing pixels are principally GPUI-versus-DOM glyph/subpixel an
 - Mix overlay open, Escape dismiss, reopen, and outside-click dismiss;
 - catalog open/search/keyboard creation and menu visual state;
 - click-to-connect source/target ports;
-- Blend and Factor mutations plus Mix overlay control activation;
+- retained pane-space Blend and Custom option selection by mouse and keyboard;
+- editable Factor text with Ctrl/Cmd+A, caret traversal, commit/restore, and control Tab order;
+- Mix range dragging plus measured selector-style overlay placement and click-through dismissal;
 - pointer-anchored fractional zoom with an unchanged authored world layout;
 - post-zoom inverse node dragging, right-edge resizing, and marquee selection;
 - stable fixture dimensions across retained frames.
+
+Overlay placement now measures retained panel bounds after layout, supports Top/Right/Bottom/Left with Start/Center/End alignment through `OverlayPlacement`, flips only when the opposite side fits, and clamps to the pane. The demo's selector trigger remains in immutable world space while its dropdown and overlay content remain unscaled in pane space. Outside dismissal runs before the underlying world interaction, so the dismissing click still activates its intended target.
 
 Unit coverage additionally exercises all reference zoom levels (`0.1`, `0.740818`, `1`, `1.349859`, `2`, `5`), fractional pan, inverse hit agreement, polygon/socket projection, multiple compatible catalog pins, group last-member removal, deterministic routing, strict snapshot validation/canonicalization, controlled atomic mutations, and transient dynamic-port tombstones.
 

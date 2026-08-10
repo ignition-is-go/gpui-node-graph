@@ -95,6 +95,53 @@ pub struct OverlayBehavior {
     pub dismiss_on_escape: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlaySide {
+    Top,
+    #[default]
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+/// Selector-style overlay placement configured independently from the public
+/// overlay DTO, preserving compatibility with existing `NodeOverlay` literals.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayPlacement {
+    pub side: OverlaySide,
+    pub align: OverlayAlign,
+    /// World-space size of the retained trigger/anchor rectangle.
+    pub anchor_size: core::Size,
+    /// Unscaled pane-space gap between the projected anchor and panel.
+    pub gap: f32,
+    pub flip: bool,
+    pub clamp_to_canvas: bool,
+}
+
+impl Default for OverlayPlacement {
+    fn default() -> Self {
+        Self {
+            side: OverlaySide::Right,
+            align: OverlayAlign::Start,
+            anchor_size: core::Size {
+                width: 0.0,
+                height: 0.0,
+            },
+            gap: 8.0,
+            flip: true,
+            clamp_to_canvas: true,
+        }
+    }
+}
+
 impl NodeOverlay {
     pub fn new(offset: core::Point, element: impl IntoElement) -> Self {
         Self {
@@ -947,12 +994,16 @@ pub struct NodeGraph<
     node_overlay_renderer: Option<Box<dyn NodeOverlayRenderer<T, N, P>>>,
     world_scene: world::WorldScene,
     world_control_owners: HashMap<String, N>,
+    world_control_order: Vec<(N, String)>,
     last_world_control: Option<(N, String)>,
     groups: Vec<GraphGroup<N>>,
     render_geometry: RenderGeometry<N, P>,
     dangling_connections: Vec<DanglingConnection<P, C>>,
     dismissed_overlays: HashSet<String>,
     active_dismissible_overlays: HashSet<String>,
+    active_overlay_bounds: Vec<core::Rect>,
+    measured_overlay_sizes: HashMap<String, core::Size>,
+    overlay_placements: HashMap<String, OverlayPlacement>,
     route_cache: RefCell<RouteCache<C>>,
     group_editor: Option<GroupEditor>,
     box_selection: Option<BoxSelection<N, C>>,
@@ -1002,12 +1053,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             node_overlay_renderer: None,
             world_scene: world::WorldScene::new(),
             world_control_owners: HashMap::new(),
+            world_control_order: Vec::new(),
             last_world_control: None,
             groups: Vec::new(),
             render_geometry: RenderGeometry::default(),
             dangling_connections: Vec::new(),
             dismissed_overlays: HashSet::new(),
             active_dismissible_overlays: HashSet::new(),
+            active_overlay_bounds: Vec::new(),
+            measured_overlay_sizes: HashMap::new(),
+            overlay_placements: HashMap::new(),
             route_cache: RefCell::new(RouteCache::default()),
             group_editor: None,
             box_selection: None,
@@ -1023,6 +1078,25 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     pub fn with_style(mut self, style: GraphStyle) -> Self {
         self.style = style;
         self
+    }
+
+    pub fn with_overlay_placement(
+        mut self,
+        id: impl Into<String>,
+        placement: OverlayPlacement,
+    ) -> Self {
+        self.overlay_placements.insert(id.into(), placement);
+        self
+    }
+
+    pub fn set_overlay_placement(
+        &mut self,
+        id: impl Into<String>,
+        placement: OverlayPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay_placements.insert(id.into(), placement);
+        cx.notify();
     }
 
     pub fn with_catalog(mut self, catalog: Vec<NodeCatalogItem<T>>) -> Self {
@@ -1097,6 +1171,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.last_world_control
             .as_ref()
             .map(|(node, control)| (node, control.as_str()))
+    }
+    fn blur_world_control(&mut self, cx: &mut Context<Self>) {
+        if let Some((node_id, control_id)) = self.last_world_control.take() {
+            cx.emit(core::GraphEvent::NodeControlBlurred {
+                node_id,
+                control_id,
+            });
+        }
     }
 
     pub fn render_geometry(&self) -> &RenderGeometry<N, P> {
@@ -2271,6 +2353,26 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    fn dismiss_overlays_before_world_pointer(
+        &mut self,
+        local: core::Point,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_dismissible_overlays.is_empty()
+            || self.active_overlay_bounds.iter().any(|bounds| {
+                local.x >= bounds.origin.x
+                    && local.y >= bounds.origin.y
+                    && local.x <= bounds.origin.x + bounds.size.width
+                    && local.y <= bounds.origin.y + bounds.size.height
+            })
+        {
+            return;
+        }
+        self.dismissed_overlays
+            .extend(self.active_dismissible_overlays.drain());
+        cx.notify();
+    }
+
     fn begin_canvas_selection(&mut self, local: core::Point, shift: bool, cx: &mut Context<Self>) {
         self.catalog_menu = None;
         if !self.active_dismissible_overlays.is_empty() {
@@ -2518,6 +2620,46 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let key = event.keystroke.key.as_str();
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         let shift = event.keystroke.modifiers.shift;
+        if let Some((node_id, control_id)) = self.last_world_control.clone() {
+            cx.emit(core::GraphEvent::NodeControlKeyDown {
+                node_id: node_id.clone(),
+                control_id: control_id.clone(),
+                key: key.to_string(),
+                text: event.keystroke.key_char.clone(),
+                shift,
+                command,
+            });
+            if key == "tab" {
+                self.blur_world_control(cx);
+                if !self.world_control_order.is_empty() {
+                    let current =
+                        self.world_control_order
+                            .iter()
+                            .position(|(entry_node, entry_control)| {
+                                entry_node == &node_id && entry_control == &control_id
+                            });
+                    let next = match (current, shift) {
+                        (Some(index), true) => {
+                            (index + self.world_control_order.len() - 1)
+                                % self.world_control_order.len()
+                        }
+                        (Some(index), false) => (index + 1) % self.world_control_order.len(),
+                        (None, true) => self.world_control_order.len() - 1,
+                        (None, false) => 0,
+                    };
+                    let focused = self.world_control_order[next].clone();
+                    self.last_world_control = Some(focused.clone());
+                    cx.emit(core::GraphEvent::NodeControlFocused {
+                        node_id: focused.0,
+                        control_id: focused.1,
+                    });
+                }
+            }
+            cx.notify();
+            cx.stop_propagation();
+            window.prevent_default();
+            return;
+        }
         if self.catalog_menu.is_some() {
             let before = self.filtered_catalog_entries();
             match key {
@@ -2955,9 +3097,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
 
         let mut node_overlays = Vec::new();
         self.active_dismissible_overlays.clear();
+        self.active_overlay_bounds.clear();
         let mut body_anchored_nodes = HashSet::new();
         let mut frame_world_scene = world::WorldScene::new();
         let mut frame_world_control_owners = HashMap::new();
+        let mut frame_world_control_order = Vec::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
         nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
         for mut node in nodes {
@@ -2990,6 +3134,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 for hit in &scene.hit_regions {
                     if matches!(hit.role, world::HitRole::Control) {
                         frame_world_control_owners.insert(hit.id.clone(), id.clone());
+                        frame_world_control_order.push((id.clone(), hit.id.clone()));
                     }
                 }
                 frame_world_scene.primitives.extend(scene.primitives);
@@ -3036,6 +3181,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 let screen_offset =
                     overlay_screen_offset(overlay.offset, viewport) + overlay.screen_offset;
                 let mut overlay_position = position + screen_offset;
+                let mut measurement_id = None;
                 if let Some(behavior) = &overlay.behavior {
                     if self.dismissed_overlays.contains(&behavior.id) {
                         continue;
@@ -3043,19 +3189,50 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     if behavior.dismiss_on_escape {
                         self.active_dismissible_overlays.insert(behavior.id.clone());
                     }
+                    measurement_id = Some(behavior.id.clone());
+                    let panel_size = self
+                        .measured_overlay_sizes
+                        .get(&behavior.id)
+                        .copied()
+                        .unwrap_or(behavior.estimated_size);
                     let canvas = self.canvas_bounds.get();
-                    overlay_position = resolve_overlay_position(
-                        position,
-                        viewport.scale_length(node.size.width),
-                        screen_offset,
-                        behavior,
-                        core::Size {
-                            width: f32::from(canvas.size.width),
-                            height: f32::from(canvas.size.height),
-                        },
-                    );
+                    let canvas_size = core::Size {
+                        width: f32::from(canvas.size.width),
+                        height: f32::from(canvas.size.height),
+                    };
+                    overlay_position = if let Some(placement) =
+                        self.overlay_placements.get(&behavior.id).copied()
+                    {
+                        resolve_positioned_overlay(
+                            core::Rect {
+                                origin: position + overlay_screen_offset(overlay.offset, viewport),
+                                size: core::Size {
+                                    width: viewport.scale_length(placement.anchor_size.width),
+                                    height: viewport.scale_length(placement.anchor_size.height),
+                                },
+                            },
+                            placement,
+                            panel_size,
+                            canvas_size,
+                        ) + overlay.screen_offset
+                    } else {
+                        resolve_overlay_position(
+                            position,
+                            viewport.scale_length(node.size.width),
+                            screen_offset,
+                            behavior,
+                            panel_size,
+                            canvas_size,
+                        )
+                    };
+                    if behavior.dismiss_on_escape {
+                        self.active_overlay_bounds.push(core::Rect {
+                            origin: overlay_position,
+                            size: panel_size,
+                        });
+                    }
                 }
-                node_overlays.push((overlay_position, overlay.element));
+                node_overlays.push((overlay_position, overlay.element, measurement_id));
             }
             let graph = cx.weak_entity();
             let measured_node = id.clone();
@@ -3169,6 +3346,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             window.prevent_default();
                             this.focus(window, cx);
                             let local = this.local_screen(event.position);
+                            this.dismiss_overlays_before_world_pointer(local, cx);
                             if let Some(hit) = this
                                 .world_scene
                                 .hit_test_screen(local, this.graph.viewport)
@@ -3183,6 +3361,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 cx.notify();
                                 return;
                             }
+                            this.blur_world_control(cx);
                             if let Some(port_id) = this.port_at_screen(
                                 local,
                                 this.graph
@@ -3412,6 +3591,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
 
         self.world_scene = frame_world_scene.clone();
         self.world_control_owners = frame_world_control_owners;
+        self.world_control_order = frame_world_control_order;
         if !frame_world_scene.primitives.is_empty() {
             root = root.child(
                 div()
@@ -3448,6 +3628,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             this.focus(window, cx);
                             let local = this.local_screen(event.position);
+                            this.dismiss_overlays_before_world_pointer(local, cx);
                             if event.modifiers.control {
                                 this.panning = Some(local);
                                 this.box_selection = None;
@@ -3466,6 +3647,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
+                                if this.last_world_control.as_ref()
+                                    != Some(&(node_id.clone(), hit.id.clone()))
+                                {
+                                    this.blur_world_control(cx);
+                                }
                                 this.last_world_control = Some((node_id.clone(), hit.id.clone()));
                                 cx.emit(core::GraphEvent::NodeControlActivated {
                                     node_id,
@@ -3474,6 +3660,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 cx.notify();
                                 return;
                             }
+                            this.blur_world_control(cx);
                             if let Some(port_id) = this.port_at_screen(
                                 local,
                                 this.graph
@@ -3563,33 +3750,66 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             this.dismissed_overlays
                                 .extend(this.active_dismissible_overlays.drain());
                             cx.notify();
-                            cx.stop_propagation();
-                            window.prevent_default();
                         }),
                     ),
             );
         }
 
-        for (position, overlay) in node_overlays {
+        for (position, overlay, measurement_id) in node_overlays {
             let panel = self.style.overlay.panel_background;
             let panel_border = self.style.overlay.panel_border;
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(px(position.x))
-                    .top(px(position.y))
-                    .bg(rgb(panel.rgb).opacity(panel.alpha))
-                    .border(px(panel_border.width))
-                    .border_color(rgb(panel_border.color.rgb).opacity(panel_border.color.alpha))
-                    .when(self.style.editor.overlay_isolated, |element| {
-                        element.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    })
-                    .child(overlay),
-            );
+            let panel = div()
+                .absolute()
+                .left(px(position.x))
+                .top(px(position.y))
+                .bg(rgb(panel.rgb).opacity(panel.alpha))
+                .border(px(panel_border.width))
+                .border_color(rgb(panel_border.color.rgb).opacity(panel_border.color.alpha))
+                .when(self.style.editor.overlay_isolated, |element| {
+                    element.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                })
+                .child(overlay);
+            if let Some(measurement_id) = measurement_id {
+                let graph = cx.weak_entity();
+                root = root.child(MeasuredElement::new(panel, move |bounds, cx| {
+                    let measured = core::Size {
+                        width: f32::from(bounds.size.width),
+                        height: f32::from(bounds.size.height),
+                    };
+                    if !measured.width.is_finite()
+                        || !measured.height.is_finite()
+                        || measured.width <= 0.0
+                        || measured.height <= 0.0
+                    {
+                        return;
+                    }
+                    let graph = graph.clone();
+                    let measurement_id = measurement_id.clone();
+                    cx.defer(move |cx| {
+                        let _ = graph.update(cx, |editor, cx| {
+                            let changed = editor
+                                .measured_overlay_sizes
+                                .get(&measurement_id)
+                                .is_none_or(|current| {
+                                    (current.width - measured.width).abs() > 0.1
+                                        || (current.height - measured.height).abs() > 0.1
+                                });
+                            if changed {
+                                editor
+                                    .measured_overlay_sizes
+                                    .insert(measurement_id, measured);
+                                cx.notify();
+                            }
+                        });
+                    });
+                }));
+            } else {
+                root = root.child(panel);
+            }
         }
 
         if let Some(menu) = self.catalog_menu.as_ref() {
@@ -3935,30 +4155,114 @@ fn overlay_screen_offset(offset: core::Point, viewport: Viewport) -> core::Point
     )
 }
 
+fn positioned_overlay_candidate(
+    anchor: core::Rect,
+    side: OverlaySide,
+    align: OverlayAlign,
+    gap: f32,
+    panel_size: core::Size,
+) -> core::Point {
+    let aligned_x = match align {
+        OverlayAlign::Start => anchor.origin.x,
+        OverlayAlign::Center => anchor.origin.x + (anchor.size.width - panel_size.width) * 0.5,
+        OverlayAlign::End => anchor.origin.x + anchor.size.width - panel_size.width,
+    };
+    let aligned_y = match align {
+        OverlayAlign::Start => anchor.origin.y,
+        OverlayAlign::Center => anchor.origin.y + (anchor.size.height - panel_size.height) * 0.5,
+        OverlayAlign::End => anchor.origin.y + anchor.size.height - panel_size.height,
+    };
+    match side {
+        OverlaySide::Top => core::Point::new(aligned_x, anchor.origin.y - panel_size.height - gap),
+        OverlaySide::Right => {
+            core::Point::new(anchor.origin.x + anchor.size.width + gap, aligned_y)
+        }
+        OverlaySide::Bottom => {
+            core::Point::new(aligned_x, anchor.origin.y + anchor.size.height + gap)
+        }
+        OverlaySide::Left => core::Point::new(anchor.origin.x - panel_size.width - gap, aligned_y),
+    }
+}
+
+fn opposite_overlay_side(side: OverlaySide) -> OverlaySide {
+    match side {
+        OverlaySide::Top => OverlaySide::Bottom,
+        OverlaySide::Right => OverlaySide::Left,
+        OverlaySide::Bottom => OverlaySide::Top,
+        OverlaySide::Left => OverlaySide::Right,
+    }
+}
+
+fn overlay_fits_primary_axis(
+    position: core::Point,
+    side: OverlaySide,
+    panel_size: core::Size,
+    canvas_size: core::Size,
+) -> bool {
+    match side {
+        OverlaySide::Top | OverlaySide::Bottom => {
+            position.y >= 0.0 && position.y + panel_size.height <= canvas_size.height
+        }
+        OverlaySide::Right | OverlaySide::Left => {
+            position.x >= 0.0 && position.x + panel_size.width <= canvas_size.width
+        }
+    }
+}
+
+fn resolve_positioned_overlay(
+    anchor: core::Rect,
+    placement: OverlayPlacement,
+    panel_size: core::Size,
+    canvas_size: core::Size,
+) -> core::Point {
+    let gap = placement.gap.max(0.0);
+    let side = placement.side;
+    let mut position = positioned_overlay_candidate(anchor, side, placement.align, gap, panel_size);
+    if placement.flip && !overlay_fits_primary_axis(position, side, panel_size, canvas_size) {
+        let opposite = opposite_overlay_side(side);
+        let opposite_position =
+            positioned_overlay_candidate(anchor, opposite, placement.align, gap, panel_size);
+        if overlay_fits_primary_axis(opposite_position, opposite, panel_size, canvas_size) {
+            position = opposite_position;
+        }
+    }
+    if placement.clamp_to_canvas && canvas_size.width > 0.0 && canvas_size.height > 0.0 {
+        position.x = position
+            .x
+            .clamp(0.0, (canvas_size.width - panel_size.width).max(0.0));
+        position.y = position
+            .y
+            .clamp(0.0, (canvas_size.height - panel_size.height).max(0.0));
+    }
+    position
+}
+
 fn resolve_overlay_position(
     node_origin: core::Point,
     node_width: f32,
     offset: core::Point,
     behavior: &OverlayBehavior,
+    panel_size: core::Size,
     canvas_size: core::Size,
 ) -> core::Point {
     let mut position = node_origin + offset;
     if behavior.flip_horizontal
         && canvas_size.width > 0.0
-        && position.x + behavior.estimated_size.width > canvas_size.width
+        && position.x + panel_size.width > canvas_size.width
     {
         let gap = (offset.x - node_width).max(0.0);
-        position.x = node_origin.x - behavior.estimated_size.width - gap;
+        let flipped_x = node_origin.x - panel_size.width - gap;
+        if flipped_x >= 0.0 {
+            position.x = flipped_x;
+        }
     }
     if behavior.clamp_to_canvas && canvas_size.width > 0.0 && canvas_size.height > 0.0 {
-        position.x = position.x.clamp(
-            0.0,
-            (canvas_size.width - behavior.estimated_size.width).max(0.0),
-        );
-        position.y = position.y.clamp(
-            0.0,
-            (canvas_size.height - behavior.estimated_size.height).max(0.0),
-        );
+        position.x = position
+            .x
+            .clamp(0.0, (canvas_size.width - panel_size.width).max(0.0));
+        position.y = position
+            .y
+            .clamp(0.0, (canvas_size.height - panel_size.height).max(0.0));
     }
     position
 }
@@ -4451,12 +4755,119 @@ mod tests {
                 50.0,
                 core::Point::new(60.0, 0.0),
                 &behavior,
+                behavior.estimated_size,
                 core::Size {
                     width: 300.0,
                     height: 300.0,
                 },
             ),
             core::Point::new(140.0, 250.0)
+        );
+        assert_eq!(
+            resolve_overlay_position(
+                core::Point::new(250.0, 280.0),
+                50.0,
+                core::Point::new(60.0, 0.0),
+                &behavior,
+                core::Size {
+                    width: 140.0,
+                    height: 70.0,
+                },
+                core::Size {
+                    width: 300.0,
+                    height: 300.0,
+                },
+            ),
+            core::Point::new(100.0, 230.0)
+        );
+    }
+
+    #[test]
+    fn positioned_overlays_support_every_side_alignment_and_primary_axis_flip() {
+        let anchor = core::Rect {
+            origin: core::Point::new(100.0, 100.0),
+            size: core::Size {
+                width: 20.0,
+                height: 30.0,
+            },
+        };
+        let panel = core::Size {
+            width: 40.0,
+            height: 50.0,
+        };
+        let canvas = core::Size {
+            width: 300.0,
+            height: 300.0,
+        };
+        let place = |side, align| OverlayPlacement {
+            side,
+            align,
+            anchor_size: anchor.size,
+            gap: 8.0,
+            flip: false,
+            clamp_to_canvas: false,
+        };
+        assert_eq!(
+            resolve_positioned_overlay(
+                anchor,
+                place(OverlaySide::Right, OverlayAlign::Start),
+                panel,
+                canvas,
+            ),
+            core::Point::new(128.0, 100.0)
+        );
+        assert_eq!(
+            resolve_positioned_overlay(
+                anchor,
+                place(OverlaySide::Left, OverlayAlign::Center),
+                panel,
+                canvas,
+            ),
+            core::Point::new(52.0, 90.0)
+        );
+        assert_eq!(
+            resolve_positioned_overlay(
+                anchor,
+                place(OverlaySide::Top, OverlayAlign::End),
+                panel,
+                canvas,
+            ),
+            core::Point::new(80.0, 42.0)
+        );
+        assert_eq!(
+            resolve_positioned_overlay(
+                anchor,
+                place(OverlaySide::Bottom, OverlayAlign::Center),
+                panel,
+                canvas,
+            ),
+            core::Point::new(90.0, 138.0)
+        );
+        let edge_anchor = core::Rect {
+            origin: core::Point::new(270.0, 100.0),
+            size: core::Size {
+                width: 20.0,
+                height: 20.0,
+            },
+        };
+        assert_eq!(
+            resolve_positioned_overlay(
+                edge_anchor,
+                OverlayPlacement {
+                    side: OverlaySide::Right,
+                    align: OverlayAlign::Start,
+                    anchor_size: edge_anchor.size,
+                    gap: 8.0,
+                    flip: true,
+                    clamp_to_canvas: true,
+                },
+                core::Size {
+                    width: 60.0,
+                    height: 40.0,
+                },
+                canvas,
+            ),
+            core::Point::new(202.0, 100.0)
         );
     }
 

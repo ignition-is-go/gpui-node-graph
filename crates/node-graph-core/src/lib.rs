@@ -243,6 +243,26 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
         node_id: N,
         control_id: String,
     },
+    /// A key press routed to the most recently activated world-space control.
+    /// `text` is the produced character (when any), kept separate from the
+    /// physical/logical key so editors work identically on native and WebAssembly.
+    NodeControlKeyDown {
+        node_id: N,
+        control_id: String,
+        key: String,
+        text: Option<String>,
+        shift: bool,
+        command: bool,
+    },
+    /// A previously active world-space control lost pointer/keyboard focus.
+    NodeControlFocused {
+        node_id: N,
+        control_id: String,
+    },
+    NodeControlBlurred {
+        node_id: N,
+        control_id: String,
+    },
     ConnectionRequested {
         source: P,
         target: P,

@@ -489,6 +489,7 @@ impl GraphStyle {
         style.node.header_border_bottom = Border::none();
         style.node.body_border_bottom = Border::none();
         style.anchor.row_height = 20.0;
+        style.overlay.backdrop_pointer_events = false;
         style
     }
 }
@@ -675,7 +676,9 @@ mod tests {
         assert_eq!(demo.anchor.row_height, 20.0);
         assert_eq!(demo.menu, defaults.menu);
         assert_eq!(demo.group, defaults.group);
-        assert_eq!(demo.overlay, defaults.overlay);
+        let mut expected_overlay = defaults.overlay;
+        expected_overlay.backdrop_pointer_events = false;
+        assert_eq!(demo.overlay, expected_overlay);
     }
 
     #[test]

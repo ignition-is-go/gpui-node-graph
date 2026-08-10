@@ -3,7 +3,8 @@ use gpui::{App, WindowOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use gpui::{Bounds, WindowBounds, px, size};
 use gpui_node_graph::{
-    CatalogPort, GraphGroup, NodeCatalogItem, NodeGraph, NodeOverlay, WorldNodeBodyContext,
+    CatalogPort, GraphGroup, NodeCatalogItem, NodeGraph, NodeOverlay, OverlayAlign,
+    OverlayPlacement, OverlaySide, WorldNodeBodyContext,
     core::*,
     world::{HitRole, HitShape, TextLines, WorldColor, WorldHitRegion, WorldPrimitive, WorldScene},
 };
@@ -24,6 +25,319 @@ static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 thread_local! {
     static MIX_AMOUNTS: std::cell::RefCell<std::collections::HashMap<String, f32>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+thread_local! {
+    static TEST_CONTROLS: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<DemoControls>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+const BLEND_OPTIONS: [&str; 5] = ["Normal", "Multiply", "Screen", "Overlay", "Add"];
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct DemoControls {
+    blends: std::collections::HashMap<String, usize>,
+    factors: std::collections::HashMap<String, String>,
+    input_counts: std::collections::HashMap<String, usize>,
+    output_counts: std::collections::HashMap<String, usize>,
+    /// (node id, control id). Keeping this outside graph/domain state makes the
+    /// popup ephemeral, just like an HTML select's UA-owned popup.
+    open_select: Option<(String, String)>,
+    editing_number: Option<(String, String, String)>,
+    number_select_all: bool,
+    number_cursor: usize,
+}
+
+impl DemoControls {
+    fn blend_label(&self, node: &str) -> &'static str {
+        BLEND_OPTIONS[self.blends.get(node).copied().unwrap_or(0) % BLEND_OPTIONS.len()]
+    }
+
+    fn factor_text(&self, node: &str) -> &str {
+        self.factors.get(node).map(String::as_str).unwrap_or("0.0")
+    }
+
+    fn activate(&mut self, node: &str, control: &str) -> Option<(PortDirection, usize)> {
+        if control.ends_with(":blend-select") {
+            self.open_select = Some((node.into(), control.into()));
+            self.editing_number = None;
+        } else if let Some(index) = control
+            .rsplit(":blend-option-")
+            .next()
+            .filter(|_| control.contains(":blend-option-"))
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            self.blends
+                .insert(node.into(), index.min(BLEND_OPTIONS.len() - 1));
+            self.open_select = None;
+        } else if control.ends_with(":factor-value") {
+            self.open_select = None;
+            let original = self
+                .factors
+                .entry(node.into())
+                .or_insert_with(|| "0.0".into())
+                .clone();
+            self.number_cursor = original.chars().count();
+            self.editing_number = Some((node.into(), control.into(), original));
+            self.number_select_all = false;
+        } else if control.ends_with(":inputs-count") || control.ends_with(":outputs-count") {
+            if control.ends_with(":inputs-count") {
+                self.input_counts.entry(node.into()).or_insert(2);
+            } else {
+                self.output_counts.entry(node.into()).or_insert(1);
+            }
+            self.open_select = Some((node.into(), control.into()));
+            self.editing_number = None;
+        } else if let Some((direction, value)) = parse_count_option(control) {
+            self.open_select = None;
+            match direction {
+                PortDirection::Input => {
+                    self.input_counts.insert(node.into(), value);
+                }
+                PortDirection::Output => {
+                    self.output_counts.insert(node.into(), value);
+                }
+            }
+            return Some((direction, value));
+        } else {
+            self.open_select = None;
+            self.editing_number = None;
+        }
+        None
+    }
+
+    fn focus(&mut self, node: &str, control: &str) {
+        self.open_select = None;
+        self.editing_number = None;
+        self.number_select_all = false;
+        if control.ends_with(":factor-value") {
+            let original = self
+                .factors
+                .entry(node.into())
+                .or_insert_with(|| "0.0".into())
+                .clone();
+            self.number_cursor = original.chars().count();
+            self.editing_number = Some((node.into(), control.into(), original));
+        }
+    }
+
+    fn blur(&mut self, node: &str, control: &str) {
+        if self
+            .open_select
+            .as_ref()
+            .is_some_and(|(active_node, active_control)| {
+                active_node == node && active_control == control
+            })
+        {
+            self.open_select = None;
+        }
+        if self
+            .editing_number
+            .as_ref()
+            .is_some_and(|(active_node, active_control, _)| {
+                active_node == node && active_control == control
+            })
+        {
+            self.editing_number = None;
+            self.number_select_all = false;
+        }
+    }
+
+    fn key_down(
+        &mut self,
+        node: &str,
+        control: &str,
+        key: &str,
+        text: Option<&str>,
+        command: bool,
+    ) -> Option<(PortDirection, usize)> {
+        if control.ends_with(":blend-select") {
+            let value = self.blends.entry(node.into()).or_insert(0);
+            match key {
+                "up" => *value = value.saturating_sub(1),
+                "down" => *value = (*value + 1).min(BLEND_OPTIONS.len() - 1),
+                "home" => *value = 0,
+                "end" => *value = BLEND_OPTIONS.len() - 1,
+                "enter" => {
+                    self.open_select = if self.open_select.is_some() {
+                        None
+                    } else {
+                        Some((node.into(), control.into()))
+                    };
+                }
+                "escape" | "tab" => self.open_select = None,
+                _ => {
+                    if let Some(prefix) = text.and_then(|s| s.chars().next())
+                        && let Some(found) = BLEND_OPTIONS.iter().position(|option| {
+                            option
+                                .to_ascii_lowercase()
+                                .starts_with(prefix.to_ascii_lowercase())
+                        })
+                    {
+                        *value = found;
+                    }
+                }
+            }
+        } else if control.ends_with(":factor-value") {
+            if !self
+                .editing_number
+                .as_ref()
+                .is_some_and(|(active_node, active_control, _)| {
+                    active_node == node && active_control == control
+                })
+            {
+                return None;
+            }
+            let value = self
+                .factors
+                .entry(node.into())
+                .or_insert_with(|| "0.0".into());
+            match key {
+                "a" if command => self.number_select_all = true,
+                "left" => {
+                    self.number_select_all = false;
+                    self.number_cursor = self.number_cursor.saturating_sub(1);
+                }
+                "right" => {
+                    self.number_select_all = false;
+                    self.number_cursor = (self.number_cursor + 1).min(value.chars().count());
+                }
+                "home" => {
+                    self.number_select_all = false;
+                    self.number_cursor = 0;
+                }
+                "end" => {
+                    self.number_select_all = false;
+                    self.number_cursor = value.chars().count();
+                }
+                "backspace" => {
+                    if std::mem::take(&mut self.number_select_all) {
+                        value.clear();
+                        self.number_cursor = 0;
+                    } else if self.number_cursor > 0 {
+                        let end = value
+                            .char_indices()
+                            .nth(self.number_cursor)
+                            .map_or(value.len(), |(index, _)| index);
+                        let start = value
+                            .char_indices()
+                            .nth(self.number_cursor - 1)
+                            .map_or(0, |(index, _)| index);
+                        value.replace_range(start..end, "");
+                        self.number_cursor -= 1;
+                    }
+                }
+                "delete" => {
+                    if std::mem::take(&mut self.number_select_all) {
+                        value.clear();
+                        self.number_cursor = 0;
+                    } else if self.number_cursor < value.chars().count() {
+                        let start = value
+                            .char_indices()
+                            .nth(self.number_cursor)
+                            .map_or(value.len(), |(index, _)| index);
+                        let end = value
+                            .char_indices()
+                            .nth(self.number_cursor + 1)
+                            .map_or(value.len(), |(index, _)| index);
+                        value.replace_range(start..end, "");
+                    }
+                }
+                "escape" => {
+                    if let Some((editing_node, _, original)) = self.editing_number.take()
+                        && editing_node == node
+                    {
+                        *value = original;
+                        self.number_cursor = value.chars().count();
+                    }
+                    self.number_select_all = false;
+                }
+                "enter" | "tab" => {
+                    self.editing_number = None;
+                    self.number_select_all = false;
+                }
+                _ => {
+                    if let Some(text) = text
+                        && !text.chars().any(char::is_control)
+                    {
+                        if std::mem::take(&mut self.number_select_all) {
+                            value.clear();
+                            self.number_cursor = 0;
+                        }
+                        let byte = value
+                            .char_indices()
+                            .nth(self.number_cursor)
+                            .map_or(value.len(), |(index, _)| index);
+                        value.insert_str(byte, text);
+                        self.number_cursor += text.chars().count();
+                    }
+                }
+            }
+        } else if control.ends_with(":inputs-count") || control.ends_with(":outputs-count") {
+            let direction = if control.ends_with(":inputs-count") {
+                PortDirection::Input
+            } else {
+                PortDirection::Output
+            };
+            let counts = if direction == PortDirection::Input {
+                &mut self.input_counts
+            } else {
+                &mut self.output_counts
+            };
+            let default = if direction == PortDirection::Input {
+                2
+            } else {
+                1
+            };
+            let value = counts.entry(node.into()).or_insert(default);
+            match key {
+                "up" => {
+                    *value = value.saturating_sub(1);
+                    return Some((direction, *value));
+                }
+                "down" => {
+                    *value = (*value + 1).min(8);
+                    return Some((direction, *value));
+                }
+                "home" => {
+                    *value = 0;
+                    return Some((direction, 0));
+                }
+                "end" => {
+                    *value = 8;
+                    return Some((direction, 8));
+                }
+                "enter" => {
+                    self.open_select = if self.open_select.is_some() {
+                        None
+                    } else {
+                        Some((node.into(), control.into()))
+                    };
+                }
+                "escape" | "tab" => self.open_select = None,
+                _ => {
+                    if let Ok(current) = text.unwrap_or("").parse::<usize>() {
+                        *value = current.min(8);
+                        return Some((direction, *value));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+fn parse_count_option(control: &str) -> Option<(PortDirection, usize)> {
+    let (direction, marker) = if control.contains(":inputs-option-") {
+        (PortDirection::Input, ":inputs-option-")
+    } else {
+        (PortDirection::Output, ":outputs-option-")
+    };
+    control
+        .rsplit_once(marker)?
+        .1
+        .parse()
+        .ok()
+        .map(|n: usize| (direction, n.min(8)))
 }
 
 fn next_id(prefix: &str) -> String {
@@ -403,13 +717,13 @@ fn world_socket(
 
 #[cfg(test)]
 fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> WorldScene {
-    leptos_world_node_with_values(context, "Normal", 0.0)
+    leptos_world_node_with_values(context, "Normal", "0.0")
 }
 
 fn leptos_world_node_with_values(
     context: WorldNodeBodyContext<Kind, String, String>,
     blend: &str,
-    factor: f32,
+    factor: &str,
 ) -> WorldScene {
     let mut scene = WorldScene::new();
     let node = &context.node;
@@ -630,7 +944,7 @@ fn leptos_world_node_with_values(
                 &mut scene,
                 node.position.x + 103.0,
                 port.position.y - 6.0,
-                format!("{factor:.1}"),
+                factor.to_string(),
                 11.0,
                 0xd4d4d8,
             );
@@ -650,10 +964,11 @@ fn leptos_world_node_with_values(
     scene
 }
 
-fn cycle_custom_port_count(
+fn set_custom_port_count(
     editor: &mut NodeGraph<Kind>,
     node_id: &str,
     direction: PortDirection,
+    next: usize,
     cx: &mut gpui::Context<NodeGraph<Kind>>,
 ) {
     let Some(node) = editor.graph.nodes.get(node_id).cloned() else {
@@ -670,7 +985,7 @@ fn cycle_custom_port_count(
         .values()
         .filter(|port| port.node == node_id && port.direction == direction)
         .count();
-    let next = (current + 1) % 9;
+    let next = next.min(8);
     if next < current {
         let ids: Vec<_> = editor
             .graph
@@ -776,43 +1091,26 @@ fn launch(cx: &mut App) {
             ));
             let renderer_overlays = open_overlays.clone();
             let event_overlays = open_overlays.clone();
-            let mix_blends =
-                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
-                    String,
-                    usize,
-                >::new()));
-            let renderer_blends = mix_blends.clone();
-            let event_blends = mix_blends.clone();
-            let mix_factors =
-                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
-                    String,
-                    f32,
-                >::new()));
-            let renderer_factors = mix_factors.clone();
-            let event_factors = mix_factors.clone();
+            let controls = std::rc::Rc::new(std::cell::RefCell::new(DemoControls::default()));
+            TEST_CONTROLS.with(|slot| *slot.borrow_mut() = Some(controls.clone()));
+            let renderer_controls = controls.clone();
+            let overlay_controls = controls.clone();
+            let event_controls = controls.clone();
             let graph = cx.new(move |cx| {
+                let graph_weak = cx.entity().downgrade();
                 let graph = leptos_demo_graph();
                 NodeGraph::new_in(graph, cx)
                     .with_style(gpui_node_graph::style::leptos_demo())
                     .with_world_node_body_renderer(
                         move |context: WorldNodeBodyContext<Kind, String, String>| {
-                            const BLENDS: [&str; 5] =
-                                ["Normal", "Multiply", "Screen", "Overlay", "Add"];
-                            let blend = renderer_blends
-                                .borrow()
-                                .get(&context.node.id)
-                                .copied()
-                                .unwrap_or(0);
-                            let factor = renderer_factors
-                                .borrow()
-                                .get(&context.node.id)
-                                .copied()
-                                .unwrap_or(0.0);
-                            leptos_world_node_with_values(
-                                context,
-                                BLENDS[blend % BLENDS.len()],
-                                factor,
-                            )
+                            let (blend, factor) = {
+                                let controls = renderer_controls.borrow();
+                                (
+                                    controls.blend_label(&context.node.id).to_string(),
+                                    controls.factor_text(&context.node.id).to_string(),
+                                )
+                            };
+                            leptos_world_node_with_values(context, &blend, &factor)
                         },
                     )
                     .with_catalog(editor_catalog)
@@ -820,115 +1118,251 @@ fn launch(cx: &mut App) {
                         move |context: WorldNodeBodyContext<Kind, String, String>,
                               _: &mut gpui::Window,
                               _: &mut App| {
-                            if context.node.title != "Mix"
-                                || !renderer_overlays.borrow().contains(&context.node.id)
-                            {
-                                return Vec::new();
-                            }
-                            let node_id = context.node.id.clone();
-                            let amount = MIX_AMOUNTS.with(|amounts| {
-                                amounts.borrow().get(&node_id).copied().unwrap_or(0.5)
-                            });
-                            let slider_steps = (0..=100)
-                                .map(|step| {
-                                    let down_node_id = node_id.clone();
-                                    let move_node_id = node_id.clone();
-                                    let value = step as f32 / 100.0;
-                                    gpui::div()
-                                        .absolute()
-                                        .left(gpui::px(2.0 + step as f32 * 1.72))
-                                        .top_0()
-                                        .w(gpui::px(2.0))
-                                        .h(gpui::px(14.0))
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            move |_, window, cx| {
-                                                MIX_AMOUNTS.with(|amounts| {
-                                                    amounts
-                                                        .borrow_mut()
-                                                        .insert(down_node_id.clone(), value);
-                                                });
-                                                cx.refresh_windows();
-                                                cx.stop_propagation();
-                                                window.prevent_default();
+                            let mut overlays = Vec::new();
+                            let open_select = overlay_controls
+                                .borrow()
+                                .open_select
+                                .clone()
+                                .filter(|(node, _)| node == &context.node.id);
+                            if let Some((node_id, control_id)) = open_select {
+                                let (offset, width, option_prefix, options, selected) =
+                                    if control_id.ends_with(":blend-select") {
+                                        (
+                                            Point::new(54.0, 52.5),
+                                            107.0,
+                                            "blend-option",
+                                            BLEND_OPTIONS
+                                                .iter()
+                                                .map(|option| (*option).to_string())
+                                                .collect::<Vec<_>>(),
+                                            overlay_controls
+                                                .borrow()
+                                                .blends
+                                                .get(&node_id)
+                                                .copied()
+                                                .unwrap_or(0),
+                                        )
+                                    } else {
+                                        let inputs = control_id.ends_with(":inputs-count");
+                                        let selected = if inputs {
+                                            overlay_controls
+                                                .borrow()
+                                                .input_counts
+                                                .get(&node_id)
+                                                .copied()
+                                                .unwrap_or(2)
+                                        } else {
+                                            overlay_controls
+                                                .borrow()
+                                                .output_counts
+                                                .get(&node_id)
+                                                .copied()
+                                                .unwrap_or(1)
+                                        };
+                                        (
+                                            Point::new(56.0, if inputs { 55.0 } else { 83.0 }),
+                                            context.node.size.width - 66.0,
+                                            if inputs {
+                                                "inputs-option"
+                                            } else {
+                                                "outputs-option"
                                             },
+                                            (0..=8).map(|value| value.to_string()).collect(),
+                                            selected,
                                         )
-                                        .on_mouse_move(move |event, window, cx| {
-                                            if event.pressed_button == Some(gpui::MouseButton::Left)
-                                            {
-                                                MIX_AMOUNTS.with(|amounts| {
-                                                    amounts
+                                    };
+                                let mut panel = gpui::div()
+                                    .w(gpui::px(width))
+                                    .flex()
+                                    .flex_col()
+                                    .rounded(gpui::px(4.0))
+                                    .border_1()
+                                    .border_color(gpui::rgb(0x3f3f46))
+                                    .bg(gpui::rgb(0x27272a))
+                                    .shadow(vec![gpui::BoxShadow {
+                                        color: gpui::rgba(0x00000080).into(),
+                                        offset: gpui::point(gpui::px(0.0), gpui::px(6.0)),
+                                        blur_radius: gpui::px(14.0),
+                                        spread_radius: gpui::px(0.0),
+                                        inset: false,
+                                    }]);
+                                for (index, label) in options.into_iter().enumerate() {
+                                    let option_id = format!("{node_id}:{option_prefix}-{index}");
+                                    let option_node = node_id.clone();
+                                    let option_controls = overlay_controls.clone();
+                                    let option_graph = graph_weak.clone();
+                                    panel = panel.child(
+                                        gpui::div()
+                                            .id(("node-select-option", index))
+                                            .h(gpui::px(22.0))
+                                            .px(gpui::px(7.0))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(gpui::px(11.0))
+                                            .text_color(gpui::rgb(0xd4d4d8))
+                                            .when(index == selected, |row| {
+                                                row.bg(gpui::rgb(0x3f3f46))
+                                            })
+                                            .hover(|row| row.bg(gpui::rgb(0x52525b)))
+                                            .child(label)
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                move |_, window, cx| {
+                                                    let mutation = option_controls
                                                         .borrow_mut()
-                                                        .insert(move_node_id.clone(), value);
-                                                });
-                                                cx.refresh_windows();
-                                                cx.stop_propagation();
-                                                window.prevent_default();
-                                            }
-                                        })
-                                })
-                                .collect::<Vec<_>>();
-                            vec![
-                                NodeOverlay::new(
-                                    Point::new(context.node.size.width - 10.0, 29.0),
-                                    gpui::div()
-                                        .w(gpui::px(200.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .rounded(gpui::px(6.0))
-                                        .border_1()
-                                        .border_color(gpui::rgb(0x3f3f46))
-                                        .bg(gpui::rgb(0x18181b))
-                                        .p(gpui::px(10.0))
-                                        .text_size(gpui::px(11.0))
-                                        .child(
-                                            gpui::div()
-                                                .text_size(gpui::px(10.0))
-                                                .text_color(gpui::rgb(0xa1a1aa))
-                                                .child("MIX AMOUNT"),
-                                        )
-                                        .child(
-                                            gpui::div()
-                                                .relative()
-                                                .h(gpui::px(14.0))
-                                                .child(
-                                                    gpui::div()
-                                                        .absolute()
-                                                        .left(gpui::px(2.0))
-                                                        .right(gpui::px(2.0))
-                                                        .top(gpui::px(5.0))
-                                                        .h(gpui::px(4.0))
-                                                        .rounded_full()
-                                                        .bg(gpui::rgb(0x71717a)),
-                                                )
-                                                .child(
-                                                    gpui::div()
-                                                        .absolute()
-                                                        .left(gpui::px(2.0 + amount * 164.0))
-                                                        .top(gpui::px(0.0))
-                                                        .w(gpui::px(14.0))
-                                                        .h(gpui::px(14.0))
-                                                        .rounded_full()
-                                                        .bg(gpui::rgb(0x93c5fd)),
-                                                )
-                                                .children(slider_steps),
-                                        )
-                                        .child(format!("{amount:.2}"))
-                                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
-                                            cx.stop_propagation();
-                                            window.prevent_default();
-                                        }),
-                                )
-                                .with_screen_offset(Point::new(8.0, 0.0))
-                                .adaptive(
-                                    "mix-amount",
-                                    Size {
-                                        width: 200.0,
-                                        height: 86.0,
-                                    },
-                                ),
-                            ]
+                                                        .activate(&option_node, &option_id);
+                                                    let _ =
+                                                        option_graph.update(cx, |editor, cx| {
+                                                            if let Some((direction, count)) =
+                                                                mutation
+                                                            {
+                                                                set_custom_port_count(
+                                                                    editor,
+                                                                    &option_node,
+                                                                    direction,
+                                                                    count,
+                                                                    cx,
+                                                                );
+                                                            } else {
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    cx.stop_propagation();
+                                                    window.prevent_default();
+                                                },
+                                            ),
+                                    );
+                                }
+                                overlays.push(NodeOverlay::new(offset, panel));
+                            }
+
+                            if context.node.title == "Mix"
+                                && renderer_overlays.borrow().contains(&context.node.id)
+                            {
+                                let node_id = context.node.id.clone();
+                                let amount = MIX_AMOUNTS.with(|amounts| {
+                                    amounts.borrow().get(&node_id).copied().unwrap_or(0.5)
+                                });
+                                let slider_steps = (0..=100)
+                                    .map(|step| {
+                                        let down_node_id = node_id.clone();
+                                        let move_node_id = node_id.clone();
+                                        let value = step as f32 / 100.0;
+                                        gpui::div()
+                                            .absolute()
+                                            .left(gpui::px(2.0 + step as f32 * 1.72))
+                                            .top_0()
+                                            .w(gpui::px(2.0))
+                                            .h(gpui::px(14.0))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                move |_, window, cx| {
+                                                    MIX_AMOUNTS.with(|amounts| {
+                                                        amounts
+                                                            .borrow_mut()
+                                                            .insert(down_node_id.clone(), value);
+                                                    });
+                                                    cx.refresh_windows();
+                                                    cx.stop_propagation();
+                                                    window.prevent_default();
+                                                },
+                                            )
+                                            .on_mouse_move(move |event, window, cx| {
+                                                if event.pressed_button
+                                                    == Some(gpui::MouseButton::Left)
+                                                {
+                                                    MIX_AMOUNTS.with(|amounts| {
+                                                        amounts
+                                                            .borrow_mut()
+                                                            .insert(move_node_id.clone(), value);
+                                                    });
+                                                    cx.refresh_windows();
+                                                    cx.stop_propagation();
+                                                    window.prevent_default();
+                                                }
+                                            })
+                                    })
+                                    .collect::<Vec<_>>();
+                                overlays.push(
+                                    NodeOverlay::new(
+                                        Point::new(167.0, 29.0),
+                                        gpui::div()
+                                            .w(gpui::px(200.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .rounded(gpui::px(6.0))
+                                            .border_1()
+                                            .border_color(gpui::rgb(0x3f3f46))
+                                            .bg(gpui::rgb(0x18181b))
+                                            .p(gpui::px(10.0))
+                                            .text_size(gpui::px(11.0))
+                                            .child(
+                                                gpui::div()
+                                                    .text_size(gpui::px(10.0))
+                                                    .text_color(gpui::rgb(0xa1a1aa))
+                                                    .child("MIX AMOUNT"),
+                                            )
+                                            .child(
+                                                gpui::div()
+                                                    .relative()
+                                                    .h(gpui::px(14.0))
+                                                    .child(
+                                                        gpui::div()
+                                                            .absolute()
+                                                            .left(gpui::px(2.0))
+                                                            .right(gpui::px(2.0))
+                                                            .top(gpui::px(5.0))
+                                                            .h(gpui::px(4.0))
+                                                            .rounded_full()
+                                                            .bg(gpui::rgb(0x71717a)),
+                                                    )
+                                                    .child(
+                                                        gpui::div()
+                                                            .absolute()
+                                                            .left(gpui::px(2.0 + amount * 164.0))
+                                                            .top(gpui::px(0.0))
+                                                            .w(gpui::px(14.0))
+                                                            .h(gpui::px(14.0))
+                                                            .rounded_full()
+                                                            .bg(gpui::rgb(0x93c5fd)),
+                                                    )
+                                                    .children(slider_steps),
+                                            )
+                                            .child(format!("{amount:.2}"))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                |_, window, cx| {
+                                                    cx.stop_propagation();
+                                                    window.prevent_default();
+                                                },
+                                            ),
+                                    )
+                                    .with_screen_offset(Point::new(8.0, 0.0))
+                                    .adaptive(
+                                        "mix-amount",
+                                        Size {
+                                            width: 200.0,
+                                            height: 86.0,
+                                        },
+                                    ),
+                                );
+                            }
+                            overlays
+                        },
+                    )
+                    .with_overlay_placement(
+                        "mix-amount",
+                        OverlayPlacement {
+                            side: OverlaySide::Right,
+                            align: OverlayAlign::Start,
+                            anchor_size: Size {
+                                width: 25.0,
+                                height: 25.0,
+                            },
+                            gap: 8.0,
+                            flip: true,
+                            clamp_to_canvas: true,
                         },
                     )
                     .with_groups(vec![GraphGroup {
@@ -946,30 +1380,49 @@ fn launch(cx: &mut App) {
                         GraphEvent::NodeControlActivated {
                             node_id,
                             control_id,
-                        } if control_id.ends_with(":blend-select") => {
-                            let mut blends = event_blends.borrow_mut();
-                            let blend = blends.entry(node_id.clone()).or_insert(0);
-                            *blend = (*blend + 1) % 5;
+                        } if !control_id.ends_with(":mix-amount") => {
+                            if let Some((direction, count)) =
+                                event_controls.borrow_mut().activate(node_id, control_id)
+                            {
+                                set_custom_port_count(editor, node_id, direction, count, cx);
+                            }
                         }
-                        GraphEvent::NodeControlActivated {
+                        GraphEvent::NodeControlKeyDown {
                             node_id,
                             control_id,
-                        } if control_id.ends_with(":factor-value") => {
-                            let mut factors = event_factors.borrow_mut();
-                            let factor = factors.entry(node_id.clone()).or_insert(0.0);
-                            *factor = ((*factor * 10.0).round() + 1.0).rem_euclid(11.0) / 10.0;
+                            key,
+                            ..
+                        } if control_id.ends_with(":mix-amount")
+                            && matches!(key.as_str(), "escape" | "enter") =>
+                        {
+                            let mut overlays = event_overlays.borrow_mut();
+                            if key == "escape" {
+                                overlays.remove(node_id);
+                                editor.dismiss_overlay("mix-amount", cx);
+                            } else if editor.is_overlay_dismissed("mix-amount") {
+                                overlays.insert(node_id.clone());
+                                editor.reopen_overlay("mix-amount", cx);
+                            } else if !overlays.remove(node_id) {
+                                overlays.insert(node_id.clone());
+                            }
                         }
-                        GraphEvent::NodeControlActivated {
+                        GraphEvent::NodeControlKeyDown {
                             node_id,
                             control_id,
-                        } if control_id.ends_with(":inputs-count") => {
-                            cycle_custom_port_count(editor, node_id, PortDirection::Input, cx);
-                        }
-                        GraphEvent::NodeControlActivated {
-                            node_id,
-                            control_id,
-                        } if control_id.ends_with(":outputs-count") => {
-                            cycle_custom_port_count(editor, node_id, PortDirection::Output, cx);
+                            key,
+                            text,
+                            command,
+                            ..
+                        } => {
+                            if let Some((direction, count)) = event_controls.borrow_mut().key_down(
+                                node_id,
+                                control_id,
+                                key,
+                                text.as_deref(),
+                                *command,
+                            ) {
+                                set_custom_port_count(editor, node_id, direction, count, cx);
+                            }
                         }
                         GraphEvent::NodeControlActivated {
                             node_id,
@@ -982,6 +1435,18 @@ fn launch(cx: &mut App) {
                             } else if !overlays.remove(node_id) {
                                 overlays.insert(node_id.clone());
                             }
+                        }
+                        GraphEvent::NodeControlFocused {
+                            node_id,
+                            control_id,
+                        } => {
+                            event_controls.borrow_mut().focus(node_id, control_id);
+                        }
+                        GraphEvent::NodeControlBlurred {
+                            node_id,
+                            control_id,
+                        } => {
+                            event_controls.borrow_mut().blur(node_id, control_id);
                         }
                         GraphEvent::ConnectionRequested { source, target } => {
                             insert_connection(&mut editor.graph, source.clone(), target.clone());
@@ -1056,14 +1521,42 @@ fn browser_test_state() -> String {
             let graph = graph.as_ref().expect("node graph entity is retained");
             application.update(|cx| {
                 let graph = graph.read(cx);
+                let (select_open, blend, factor_text) = TEST_CONTROLS.with(|slot| {
+                    let controls = slot.borrow();
+                    let controls = controls.as_ref().expect("demo controls are retained").borrow();
+                    (
+                        controls.open_select.is_some(),
+                        controls.blend_label("mix_1").to_string(),
+                        controls.factor_text("mix_1").to_string(),
+                    )
+                });
+                let custom_inputs = graph
+                    .graph
+                    .nodes
+                    .values()
+                    .find(|node| node.title == "Custom")
+                    .map_or(0, |node| {
+                        graph
+                            .graph
+                            .ports
+                            .values()
+                            .filter(|port| {
+                                port.node == node.id && port.direction == PortDirection::Input
+                            })
+                            .count()
+                    });
                 format!(
-                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"catalogDraft":{},"catalogEntries":{},"catalogSelected":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"mixAmount":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
+                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"catalogDraft":{},"catalogEntries":{},"catalogSelected":{},"selectOpen":{},"blend":"{}","factorText":"{}","customInputs":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"mixAmount":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
                     graph.graph.nodes.len(),
                     graph.graph.connections.len(),
                     graph.catalog_is_open(),
                     graph.catalog_connects_draft(),
                     graph.catalog_entry_count(),
                     graph.catalog_selected_entry().unwrap_or(0),
+                    select_open,
+                    blend,
+                    factor_text,
+                    custom_inputs,
                     graph.is_overlay_dismissed("mix-amount"),
                     graph.graph.viewport.zoom,
                     graph
@@ -1115,6 +1608,52 @@ fn main() {
 #[cfg(test)]
 mod parity_tests {
     use super::*;
+
+    #[test]
+    fn demo_select_controls_choose_options_instead_of_click_cycling() {
+        let mut controls = DemoControls::default();
+        assert_eq!(controls.blend_label("mix"), "Normal");
+        controls.activate("mix", "mix:blend-select");
+        assert_eq!(controls.blend_label("mix"), "Normal");
+        controls.activate("mix", "mix:blend-option-3");
+        assert_eq!(controls.blend_label("mix"), "Overlay");
+        controls.activate("custom", "custom:inputs-count");
+        assert_eq!(
+            controls.key_down("custom", "custom:inputs-count", "down", None, false),
+            Some((PortDirection::Input, 3))
+        );
+    }
+
+    #[test]
+    fn factor_editor_supports_select_all_commit_and_escape_restoration() {
+        let mut controls = DemoControls::default();
+        controls.activate("mix", "mix:factor-value");
+        controls.key_down("mix", "mix:factor-value", "a", None, true);
+        controls.key_down("mix", "mix:factor-value", "7", Some("7"), false);
+        controls.key_down("mix", "mix:factor-value", ".", Some("."), false);
+        controls.key_down("mix", "mix:factor-value", "5", Some("5"), false);
+        assert_eq!(controls.factor_text("mix"), "7.5");
+        controls.key_down("mix", "mix:factor-value", "enter", None, false);
+        controls.activate("mix", "mix:factor-value");
+        controls.key_down("mix", "mix:factor-value", "backspace", None, false);
+        assert_eq!(controls.factor_text("mix"), "7.");
+        controls.key_down("mix", "mix:factor-value", "escape", None, false);
+        assert_eq!(controls.factor_text("mix"), "7.5");
+    }
+
+    #[test]
+    fn factor_editor_supports_caret_delete_and_unrestricted_text_input() {
+        let mut controls = DemoControls::default();
+        controls.activate("mix", "mix:factor-value");
+        controls.key_down("mix", "mix:factor-value", "a", None, true);
+        controls.key_down("mix", "mix:factor-value", "x", Some("x"), false);
+        controls.key_down("mix", "mix:factor-value", "y", Some("y"), false);
+        controls.key_down("mix", "mix:factor-value", "left", None, false);
+        controls.key_down("mix", "mix:factor-value", "z", Some("z"), false);
+        assert_eq!(controls.factor_text("mix"), "xzy");
+        controls.key_down("mix", "mix:factor-value", "delete", None, false);
+        assert_eq!(controls.factor_text("mix"), "xz");
+    }
 
     #[test]
     fn catalog_matches_leptos_demo_schema() {
