@@ -1,6 +1,6 @@
 # Final world-space and Leptos-demo parity validation
 
-Validated implementation base: `5242a86` (this report is a documentation-only follow-up).
+Validated implementation base: current exact head (see repository history and CI link below).
 Reference: `leptos-node-graph@87658950fccfeeea123285c706820ffea4ab55d1`.
 
 ## Rendering contract
@@ -19,10 +19,10 @@ Audited 1200px goldens cover the initial, selected-node, Mix-overlay, and catalo
 
 | frame | MAE | exact pixels | pixels delta > 20 |
 |---|---:|---:|---:|
-| initial | 0.5266 | 91.4585% | 0.7294% |
-| selected | 0.7198 | 89.8572% | 0.8321% |
-| overlay | 0.7942 | 89.1893% | 0.9768% |
-| menu | 1.6906 | 85.0250% | 2.3020% |
+| initial | 0.4889 | 92.4369% | 0.6864% |
+| selected | 0.4966 | 92.4686% | 0.6886% |
+| overlay | 0.8242 | 90.0091% | 0.9919% |
+| menu | 1.4827 | 87.1949% | 1.9741% |
 
 The remaining differing pixels are principally GPUI-versus-DOM glyph/subpixel and shadow rasterization. Geometry, palette, fixture placement, route, controls, overlay anchor and menu placement are aligned. CI installs official Google Chrome because the generic hosted Chromium build can omit direct-present WebGPU surfaces from capture. A background-only/missing surface is an explicit failure (not a visual-pass escape hatch), dimensions must match exactly, and every frame is retained as an artifact. Functional state/fingerprint checks always run as well.
 
@@ -35,15 +35,18 @@ The remaining differing pixels are principally GPUI-versus-DOM glyph/subpixel an
 - catalog open/search/keyboard creation and menu visual state;
 - click-to-connect source/target ports;
 - retained pane-space Blend and Custom option selection by mouse and keyboard;
-- editable Factor text with Ctrl/Cmd+A, caret traversal, commit/restore, and control Tab order;
-- Mix range dragging plus measured selector-style overlay placement and click-through dismissal;
+- editable Factor text with pointer caret, Shift selection, platform text replacement, real composition/IME, native Enter/Escape behavior, and control Tab order;
+- Mix range mouse dragging plus focused Home and Arrow keyboard behavior;
+- port hover tooltips, default right-click connection removal/recreation, menu Escape dismissal, and live connected/draft visual state;
+- measured semantic-control overlay anchoring and click-through dismissal;
+- typed `NodeDrop` creation through `EditorHandle::drop_node`, including live client↔canvas conversion and catalog-backed cross-pane creation;
 - pointer-anchored fractional zoom with an unchanged authored world layout;
 - post-zoom inverse node dragging, right-edge resizing, and marquee selection;
 - stable fixture dimensions across retained frames.
 
-Overlay placement now measures retained panel bounds after layout, supports Top/Right/Bottom/Left with Start/Center/End alignment through `OverlayPlacement`, flips only when the opposite side fits, and clamps to the pane. The demo's selector trigger remains in immutable world space while its dropdown and overlay content remain unscaled in pane space. Outside dismissal runs before the underlying world interaction, so the dismissing click still activates its intended target.
+Overlay placement now measures retained panel bounds after layout, supports Top/Right/Bottom/Left with Start/Center/End alignment through `OverlayPlacement`, flips only when the opposite side fits, and clamps to the pane. The demo anchors by the trigger's stable world-control ID (not a duplicated screen gap); its trigger remains in immutable world space while its dropdown and overlay content remain unscaled in pane space. Outside dismissal runs before the underlying world interaction, so the dismissing click still activates its intended target.
 
-Unit coverage additionally exercises all reference zoom levels (`0.1`, `0.740818`, `1`, `1.349859`, `2`, `5`), fractional pan, inverse hit agreement, polygon/socket projection, multiple compatible catalog pins, group last-member removal, deterministic routing, strict snapshot validation/canonicalization, controlled atomic mutations, and transient dynamic-port tombstones.
+Unit coverage additionally exercises all-side overlay placement plus semantic anchor extent/gap at multiple zooms, UTF-16/surrogate selection, copy/cut ranges, and marked-text replacement, live/broken anchor menus, client↔canvas conversion, every dot silhouette, runtime style resolution, and all reference zoom levels (`0.1`, `0.740818`, `1`, `1.349859`, `2`, `5`), fractional pan, inverse hit agreement, polygon/socket projection, multiple compatible catalog pins, group last-member removal, deterministic routing, strict snapshot validation/canonicalization, controlled atomic mutations, and transient dynamic-port tombstones.
 
 ## Validation commands
 

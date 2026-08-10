@@ -17,7 +17,8 @@ cargo test --workspace
 # double-click blank space or press Tab to search/create; click wires and press Delete;
 # drag a node's right edge to resize (double-click resets); wheel zoom;
 # middle-drag or Ctrl-drag to pan; Ctrl/Cmd+G groups a multi-selection;
-# Blend/Custom selects expose mouse and keyboard option choice; Factor is editable text;
+# Blend/Custom selects expose mouse and keyboard option choice; Factor uses native/IME text input;
+# right-click ports for connection actions; hover ports for typed tooltips;
 # R cycles subway/Bezier/simple routing; F fits; Escape rolls back/cancels/clears.
 
 # Browser host (requires Trunk)
@@ -29,7 +30,7 @@ curl -sSI http://127.0.0.1:8181/ | grep -Ei 'cross-origin-(opener|embedder)-poli
 ## Architecture
 
 - `node-graph-core`: canonical serializable model and deterministic logic. Persist `GraphSnapshot`; `GraphUiState` (selection and viewport) is session-only. `GraphState` still accepts the former top-level domain JSON shape, but deliberately skips transient fields when serialized. Call `validate`, `canonicalize_ids`, or `GraphState::from_snapshot` at trust boundaries. `NodeGraph::try_new` rejects invalid editor state; `NodeGraph::new` is the convenience constructor for already-trusted state and panics with the validation error rather than silently rendering a corrupt graph.
-- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` view and input adapter. `WorldNodeBodyRenderer` is the compositor-style path: it authors an immutable world-unit display list without access to zoom/pan, GPUI projects the completed primitives at paint time, and pointer input is inverse-transformed before hit testing, dragging, resizing, marquee selection, or port gestures. Pane-space menus and overlays remain unscaled while their anchors follow the projection. The older `NodeBodyRenderer` remains as a compatibility path for arbitrary retained GPUI controls. The adapter and core share one `GraphEvent` vocabulary (`EditorEvent` is a compatibility alias). Measured geometry stays transient and node-relative, preserving strict snapshots. Dynamic-port removal uses transient wire tombstones and can restore the original strict connection when the same stable port ID returns.
+- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` view and input adapter. `WorldNodeBodyRenderer` is the canonical affine world-space path: it authors an immutable world-unit display list without access to zoom/pan, GPUI projects the completed primitives at paint time, and pointer input is inverse-transformed before hit testing, dragging, resizing, marquee selection, or port gestures. It receives live connected/source/snap/compatibility state, and pane-space menus and measured overlays remain unscaled while semantic control anchors follow the projection. World text controls can register GPUI's real `InputHandler` for UTF-16 selection, composition/IME, marked text, and clipboard insertion. The older `NodeBodyRenderer` is a compatibility path for retained GPUI controls, but pinned GPUI has no arbitrary retained-subtree affine transform; consumers requiring zoom-stable parity should use the world display list. The adapter and core share one `GraphEvent` vocabulary (`EditorEvent` is a compatibility alias). Measured geometry stays transient and node-relative, preserving strict snapshots. Dynamic-port removal uses dashed transient wire tombstones and can restore the original strict connection when the same stable port ID returns; controlled removal/restoration emits atomic mutations instead of taking model ownership.
 
 `EditorConfig::mutation_mode` makes ownership explicit. `Uncontrolled` commits move/resize/delete/group previews locally and emits compatibility events. `Controlled` rolls persistent previews back and emits one atomic `GraphEvent::MutationRequested` batch of `GraphMutation` operations for the host to reconcile. Selection and viewport remain transient editor state in either mode; connection creation always remains a request because generic consumer IDs cannot be synthesized safely by the view.
 - `examples/demo`: shared GPUI application with thin target-specific desktop/browser packaging. `gpui_platform::application()` selects the backend.
@@ -46,10 +47,10 @@ The evidence-backed Leptos parity audit and phased acceptance plan are in
 - [x] node drag event and middle-button pan
 - [x] wheel zoom around cursor, grid snap, box/connection selection, fit view
 - [x] typed draft connections, snapping and remove/create events
-- [x] obstacle-aware subway router and incremental route cache
+- [x] obstacle-aware subway router and deterministic batch route cache
 - [x] dynamic ports and searchable, keyboard-navigable node catalog
 - [x] groups, resizing, overlays, culling and keyboard actions
-- [ ] persisted-graph fixtures and full interaction replay tests
+- [x] persisted-graph fixtures and full browser interaction replay tests
 - [x] audited multi-state visual regression suite and stateful browser interaction trace
 - [x] one-window browser architecture and native-only detached-window capability boundary
 

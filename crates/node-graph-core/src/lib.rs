@@ -30,6 +30,11 @@ impl_id_roles!(String, u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
 
 pub trait PortType: Clone + PartialEq + Debug + 'static {
     fn compatible(source: &Self, target: &Self) -> bool;
+
+    /// Human-readable type text used by the built-in anchor tooltip.
+    fn type_label(&self) -> String {
+        format!("{self:?}")
+    }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -221,6 +226,8 @@ pub enum GraphMutation<N: Eq + Hash, P, C: Eq + Hash> {
     ResizeNode { id: N, size: Size },
     RequestConnection { source: P, target: P },
     RemoveConnection { id: C },
+    RemovePort { id: P },
+    RestoreConnection { connection: Connection<P, C> },
     DeleteNodes { ids: Vec<N> },
     SetGroupMembership { group_id: String, node_ids: Vec<N> },
     SetGroupLabel { group_id: String, label: String },
@@ -243,6 +250,12 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
         node_id: N,
         control_id: String,
     },
+    NodeControlPointerActivated {
+        node_id: N,
+        control_id: String,
+        world_position: Point,
+        click_count: usize,
+    },
     /// A key press routed to the most recently activated world-space control.
     /// `text` is the produced character (when any), kept separate from the
     /// physical/logical key so editors work identically on native and WebAssembly.
@@ -254,6 +267,16 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
         shift: bool,
         command: bool,
     },
+    /// A complete platform-text snapshot produced by native or WebAssembly IME.
+    /// Selection and marked ranges use UTF-16 code units.
+    NodeControlTextChanged {
+        node_id: N,
+        control_id: String,
+        text: String,
+        selection: std::ops::Range<usize>,
+        selection_reversed: bool,
+        marked: Option<std::ops::Range<usize>>,
+    },
     /// A previously active world-space control lost pointer/keyboard focus.
     NodeControlFocused {
         node_id: N,
@@ -262,6 +285,9 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
     NodeControlBlurred {
         node_id: N,
         control_id: String,
+    },
+    NodeOverlayDismissed {
+        id: String,
     },
     ConnectionRequested {
         source: P,

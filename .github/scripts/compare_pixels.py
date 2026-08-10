@@ -41,6 +41,7 @@ large_ratio = large / total
 print(f"pixel parity: size={width}x{height} mae={mae:.4f} exact={exact_ratio:.4%} delta>20={large_ratio:.4%} "
       f"reference-bg={reference.getpixel((0, 0))} actual-bg={actual.getpixel((0, 0))}")
 # Font rasterization and GPU antialiasing differ slightly, but structural divergence is
-# deliberately given very little room. Local Mesa/X11 is ~0.50 / 92.2% / 0.8%.
-if mae > 1.75 or exact_ratio < 0.84 or large_ratio > 0.03:
+# deliberately given very little room. The worst audited state (catalog) is
+# ~1.48 / 87.2% / 2.0%; the other three states are substantially closer.
+if mae > 1.65 or exact_ratio < 0.86 or large_ratio > 0.022:
     raise SystemExit("initial frame diverged from the audited Leptos golden")

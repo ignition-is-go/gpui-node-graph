@@ -191,6 +191,13 @@ async function click(atX = x, atY = y, clickCount = 1) {
       type, x: atX, y: atY, button: "left", clickCount,
     });
 }
+async function rightClick(atX, atY) {
+  for (const type of ["mousePressed", "mouseReleased"])
+    await command("Input.dispatchMouseEvent", {
+      type, x: atX, y: atY, button: "right",
+      buttons: type === "mousePressed" ? 2 : 0, clickCount: 1,
+    });
+}
 async function move(toX, toY) {
   await command("Input.dispatchMouseEvent", {
     type: "mouseMoved",
@@ -316,6 +323,24 @@ if (initialScreenshot) {
 if (baseline.sourceWidth < 100) {
   throw new Error(`node width collapsed before interaction trace: ${JSON.stringify(baseline)}`);
 }
+await move(left + 195, top + 95);
+await waitFor("anchor tooltip", (value) => value.anchorTooltip);
+await move(x, y);
+await waitFor("anchor tooltip dismissal", (value) => !value.anchorTooltip);
+await rightClick(left + 195, top + 95);
+await waitFor("anchor menu opening", (value) => value.anchorMenu);
+await pause();
+await click(left + 260, top + 114);
+await waitFor("anchor remove-connections action", (value) => !value.anchorMenu && value.connections === 0 && !value.sourceConnected);
+await pause();
+await click(left + 195, top + 95);
+await pause();
+await click(left + 344, top + 140);
+await waitFor("anchor connection recreation", (value) => value.connections === baseline.connections && value.sourceConnected);
+await rightClick(left + 195, top + 95);
+await waitFor("anchor menu reopening", (value) => value.anchorMenu);
+await key("Escape", "Escape");
+await waitFor("anchor menu Escape dismissal", (value) => !value.anchorMenu);
 await click(left + 100, top + 65);
 await saveStateScreenshot("selected");
 await click();
@@ -327,6 +352,15 @@ await command("Input.dispatchMouseEvent", {
 });
 await waitFor("world-space control activation", (value) => value.controlActivated);
 await saveStateScreenshot("overlay");
+await key("Tab", "Tab");
+await waitFor(
+  "range keyboard focus",
+  (value) => value.lastControl.endsWith(":mix-range"),
+);
+await key("Home", "Home");
+await waitFor("range keyboard Home", (value) => value.mixAmount === 0);
+await key("ArrowRight", "ArrowRight");
+await waitFor("range keyboard step", (value) => Math.abs(value.mixAmount - 0.01) < 0.001);
 await drag(left + 545, top + 121, left + 700, top + 121);
 await waitFor("Mix range dragging", (value) => value.mixAmount > 0.85);
 await key("Escape", "Escape");
@@ -376,7 +410,28 @@ await key("a", "KeyA", undefined, 2);
 for (const [character, code] of [["0", "Digit0"], [".", "Period"], ["7", "Digit7"], ["5", "Digit5"]]) {
   await key(character, code, character);
 }
+await key("ArrowLeft", "ArrowLeft");
+await key("ArrowLeft", "ArrowLeft", undefined, 8);
+await key("9", "Digit9", "9");
+await key("Escape", "Escape");
+await waitFor("native Factor Escape preservation", (value) => value.factorText === "0.95");
+await key("a", "KeyA", undefined, 2);
+for (const [character, code] of [["0", "Digit0"], [".", "Period"], ["7", "Digit7"], ["5", "Digit5"]]) {
+  await key(character, code, character);
+}
 await key("Enter", "Enter");
+await command("Runtime.evaluate", {
+  expression: `(() => { const input = document.querySelector("input");
+    input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
+    input.dispatchEvent(new CompositionEvent("compositionupdate", { bubbles: true, data: "漢" }));
+    input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "漢" }));
+  })()`,
+});
+await waitFor("Factor IME composition", (value) => value.factorText === "0.75漢");
+await key("a", "KeyA", undefined, 2);
+for (const [character, code] of [["0", "Digit0"], [".", "Period"], ["7", "Digit7"], ["5", "Digit5"]]) {
+  await key(character, code, character);
+}
 await key("Tab", "Tab", undefined, 8);
 await waitFor(
   "reverse control focus traversal",
@@ -489,6 +544,13 @@ await waitFor(
   (value) => value.panX - beforeMiddlePan.panX > 20
     && value.panY - beforeMiddlePan.panY > 15,
 );
+const dropped = await command("Runtime.evaluate", {
+  expression: `globalThis.__nodeGraphTestDrop?.("output", ${left + 1000}, ${top + 550})`,
+  returnByValue: true,
+});
+if (!dropped.result.value) throw new Error("cross-pane drop handle rejected a laid-out catalog item");
+await waitFor("cross-pane drop node creation", (value) => value.nodes === baseline.nodes + 4);
+
 const transitions = {
   menuOpened: true,
   nodeCreated: true,
@@ -496,10 +558,14 @@ const transitions = {
   draftMenuConnected: true,
   blendChanged: true,
   factorChanged: true,
+  factorIme: true,
   controlFocusTraversal: true,
   customSelectChanged: true,
   rangeDragged: true,
+  rangeKeyboard: true,
   worldControlActivated: true,
+  anchorTooltip: true,
+  anchorMenu: true,
   overlayDismissed: true,
   overlayOutsideDismissed: true,
   viewportChanged: zoomed.zoom !== created.zoom,
@@ -507,6 +573,7 @@ const transitions = {
   inverseResize: true,
   inverseMarquee: true,
   middlePan: true,
+  crossPaneDrop: true,
 };
 await shot();
 
