@@ -30,7 +30,8 @@ for y in range(height):
         large += delta > 20
 exact_ratio = exact / total
 large_ratio = large / total
-print(f"pixel parity: size={width}x{height} mae={mae:.4f} exact={exact_ratio:.4%} delta>20={large_ratio:.4%}")
+print(f"pixel parity: size={width}x{height} mae={mae:.4f} exact={exact_ratio:.4%} delta>20={large_ratio:.4%} "
+      f"reference-bg={reference.getpixel((0, 0))} actual-bg={actual.getpixel((0, 0))}")
 # Font rasterization and GPU antialiasing differ slightly, but structural divergence is
 # deliberately given very little room. Local Mesa/X11 is ~0.50 / 92.2% / 0.8%.
 if mae > 1.75 or exact_ratio < 0.78 or large_ratio > 0.035:
