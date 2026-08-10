@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Compare the GPUI initial frame with the audited Leptos reference golden."""
+import sys
+from PIL import Image, ImageChops, ImageStat
+
+if len(sys.argv) != 3:
+    raise SystemExit("usage: compare_pixels.py REFERENCE.png ACTUAL.png")
+reference = Image.open(sys.argv[1]).convert("RGB")
+actual = Image.open(sys.argv[2]).convert("RGB")
+width = min(reference.width, actual.width)
+height = min(reference.height, actual.height)
+if width < 1000 or height < 600:
+    raise SystemExit(f"unexpected screenshot size: reference={reference.size}, actual={actual.size}")
+reference = reference.crop((0, 0, width, height))
+actual = actual.crop((0, 0, width, height))
+difference = ImageChops.difference(reference, actual)
+stat = ImageStat.Stat(difference)
+mae = sum(stat.mean) / 3.0
+ref_pixels = reference.load()
+actual_pixels = actual.load()
+exact = 0
+large = 0
+total = width * height
+for y in range(height):
+    for x in range(width):
+        left = ref_pixels[x, y]
+        right = actual_pixels[x, y]
+        delta = max(abs(left[channel] - right[channel]) for channel in range(3))
+        exact += left == right
+        large += delta > 20
+exact_ratio = exact / total
+large_ratio = large / total
+print(f"pixel parity: size={width}x{height} mae={mae:.4f} exact={exact_ratio:.4%} delta>20={large_ratio:.4%}")
+# Font rasterization and GPU antialiasing differ slightly, but structural divergence is
+# deliberately given very little room. Local Mesa/X11 is ~0.50 / 92.2% / 0.8%.
+if mae > 1.75 or exact_ratio < 0.78 or large_ratio > 0.035:
+    raise SystemExit("initial frame diverged from the audited Leptos golden")

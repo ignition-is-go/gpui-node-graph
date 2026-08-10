@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-const [url, port = "9222"] = process.argv.slice(2);
+import fs from "node:fs";
+const [url, port = "9222", initialScreenshot] = process.argv.slice(2);
 if (!url) throw new Error("usage: check_browser.mjs URL [DEBUG_PORT]");
 const deadline = Date.now() + 60_000;
 let page;
@@ -115,6 +116,12 @@ async function waitFor(label, predicate) {
 }
 
 const baseline = await graphState();
+if (initialScreenshot) {
+  const captured = await command("Page.captureScreenshot", {
+    format: "png", captureBeyondViewport: false,
+  });
+  fs.writeFileSync(initialScreenshot, Buffer.from(captured.data, "base64"));
+}
 if (baseline.sourceWidth < 100) {
   throw new Error(`node width collapsed before interaction trace: ${JSON.stringify(baseline)}`);
 }
