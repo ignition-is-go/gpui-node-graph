@@ -84,7 +84,8 @@ jobs:
             --ozone-platform=x11 --no-sandbox --no-first-run --no-default-browser-check \
             --disable-dev-shm-usage --enable-unsafe-webgpu \
             --enable-features=Vulkan --disable-features=UseSkiaRenderer \
-            --use-angle=vulkan --window-position=0,0 --window-size=1200,800 \
+            --use-angle=vulkan --use-webgpu-adapter=swiftshader \
+            --window-position=0,0 --window-size=1200,800 \
             --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
             --user-data-dir=/tmp/node-graph-chrome http://127.0.0.1:8181/ \
             > /tmp/node-graph-chrome.log 2>&1 &
