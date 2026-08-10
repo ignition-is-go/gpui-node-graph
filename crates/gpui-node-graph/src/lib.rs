@@ -3238,38 +3238,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 window.prevent_default();
                                 this.focus(window, cx);
                                 if event.click_count >= 2 {
-                                    let width = this.config.default_node_width.clamp(
-                                        this.config.min_node_width,
-                                        this.config.max_node_width,
-                                    );
-                                    let previous_width = this
-                                        .graph
-                                        .nodes
-                                        .get(&resize_id)
-                                        .map(|node| node.size.width);
-                                    if this.resize_node_width(&resize_id, width)
-                                        && let Some(size) =
-                                            this.graph.nodes.get(&resize_id).map(|node| node.size)
-                                    {
-                                        if this.config.mutation_mode == MutationMode::Controlled {
-                                            if let Some(previous_width) = previous_width {
-                                                let _ = this
-                                                    .resize_node_width(&resize_id, previous_width);
-                                            }
-                                            cx.emit(core::GraphEvent::MutationRequested {
-                                                mutations: vec![core::GraphMutation::ResizeNode {
-                                                    id: resize_id.clone(),
-                                                    size,
-                                                }],
-                                            });
-                                        } else {
-                                            cx.emit(core::GraphEvent::NodeResized {
-                                                id: resize_id.clone(),
-                                                size,
-                                            });
-                                        }
-                                        cx.notify();
-                                    }
+                                    this.reset_node_width(&resize_id, cx);
                                     return;
                                 }
                                 let Some(node) = this.graph.nodes.get(&resize_id) else {
@@ -3393,14 +3362,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     cx.stop_propagation();
                                     window.prevent_default();
                                     this.focus(window, cx);
-                                    if this.draft.as_ref().is_some_and(|draft| draft.origin != id)
-                                        && this.finish_draft(&id, cx)
-                                    {
-                                        return;
-                                    }
-                                    if this.draft.is_none() {
-                                        this.engage_port(&id, cx);
-                                    }
+                                    this.engage_port(&id, cx);
                                 }
                             }),
                         )

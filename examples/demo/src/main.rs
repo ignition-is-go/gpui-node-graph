@@ -89,7 +89,7 @@ fn catalog() -> Vec<NodeCatalogItem<Kind>> {
             id: "custom".into(),
             label: "Custom".into(),
             category: "Utility".into(),
-            description: "Dynamic port configuration".into(),
+            description: "Configurable inputs/outputs".into(),
             keywords: Vec::new(),
             ports: Vec::new(),
         },
@@ -833,8 +833,43 @@ fn launch(cx: &mut App) {
                                 .get(&node_id)
                                 .copied()
                                 .unwrap_or(0.5);
-                            let slider_amounts = renderer_amounts.clone();
-                            let slider_node_id = node_id.clone();
+                            let slider_steps = (0..=100)
+                                .map(|step| {
+                                    let down_amounts = renderer_amounts.clone();
+                                    let down_node_id = node_id.clone();
+                                    let move_amounts = renderer_amounts.clone();
+                                    let move_node_id = node_id.clone();
+                                    let value = step as f32 / 100.0;
+                                    gpui::div()
+                                        .absolute()
+                                        .left(gpui::px(2.0 + step as f32 * 1.64))
+                                        .top_0()
+                                        .w(gpui::px(2.0))
+                                        .h(gpui::px(14.0))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            move |_, window, cx| {
+                                                down_amounts
+                                                    .borrow_mut()
+                                                    .insert(down_node_id.clone(), value);
+                                                cx.refresh_windows();
+                                                cx.stop_propagation();
+                                                window.prevent_default();
+                                            },
+                                        )
+                                        .on_mouse_move(move |event, window, cx| {
+                                            if event.pressed_button == Some(gpui::MouseButton::Left)
+                                            {
+                                                move_amounts
+                                                    .borrow_mut()
+                                                    .insert(move_node_id.clone(), value);
+                                                cx.refresh_windows();
+                                                cx.stop_propagation();
+                                                window.prevent_default();
+                                            }
+                                        })
+                                })
+                                .collect::<Vec<_>>();
                             vec![
                                 NodeOverlay::new(
                                     Point::new(context.node.size.width - 10.0, 29.0),
@@ -859,22 +894,6 @@ fn launch(cx: &mut App) {
                                             gpui::div()
                                                 .relative()
                                                 .h(gpui::px(14.0))
-                                                .on_mouse_down(
-                                                    gpui::MouseButton::Left,
-                                                    move |_, window, cx| {
-                                                        let mut amounts =
-                                                            slider_amounts.borrow_mut();
-                                                        let value = amounts
-                                                            .entry(slider_node_id.clone())
-                                                            .or_insert(0.5);
-                                                        *value = ((*value * 10.0).round() + 1.0)
-                                                            .rem_euclid(11.0)
-                                                            / 10.0;
-                                                        cx.refresh_windows();
-                                                        cx.stop_propagation();
-                                                        window.prevent_default();
-                                                    },
-                                                )
                                                 .child(
                                                     gpui::div()
                                                         .absolute()
@@ -894,7 +913,8 @@ fn launch(cx: &mut App) {
                                                         .h(gpui::px(14.0))
                                                         .rounded_full()
                                                         .bg(gpui::rgb(0x93c5fd)),
-                                                ),
+                                                )
+                                                .children(slider_steps),
                                         )
                                         .child(format!("{amount:.2}"))
                                         .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {

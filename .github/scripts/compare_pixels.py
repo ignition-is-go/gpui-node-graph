@@ -13,14 +13,11 @@ actual = Image.open(sys.argv[2]).convert("RGB")
 # as a visual regression; the browser interaction/fingerprint assertions still run.
 colors = actual.getcolors(maxcolors=actual.width * actual.height)
 if colors and max(count for count, _ in colors) / (actual.width * actual.height) > 0.98:
-    print("pixel parity unavailable: hosted compositor did not expose the WebGPU surface")
-    raise SystemExit(0)
-width = min(reference.width, actual.width)
-height = min(reference.height, actual.height)
-if width < 1000 or height < 600:
-    raise SystemExit(f"unexpected screenshot size: reference={reference.size}, actual={actual.size}")
-# X11 app-window capture includes a one-pixel compositor separator above the page.
-# Ignore the same row in both images; all authored content remains position-aligned.
+    raise SystemExit("WebGPU surface is absent from the captured parity frame")
+if reference.size != actual.size:
+    raise SystemExit(f"screenshot dimensions diverged: reference={reference.size}, actual={actual.size}")
+width, height = reference.size
+# Ignore the browser compositor's one-pixel separator consistently in both frames.
 reference = reference.crop((0, 1, width, height))
 actual = actual.crop((0, 1, width, height))
 height -= 1
@@ -45,5 +42,5 @@ print(f"pixel parity: size={width}x{height} mae={mae:.4f} exact={exact_ratio:.4%
       f"reference-bg={reference.getpixel((0, 0))} actual-bg={actual.getpixel((0, 0))}")
 # Font rasterization and GPU antialiasing differ slightly, but structural divergence is
 # deliberately given very little room. Local Mesa/X11 is ~0.50 / 92.2% / 0.8%.
-if mae > 1.75 or exact_ratio < 0.78 or large_ratio > 0.035:
+if mae > 1.75 or exact_ratio < 0.84 or large_ratio > 0.03:
     raise SystemExit("initial frame diverged from the audited Leptos golden")

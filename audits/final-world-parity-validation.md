@@ -24,7 +24,7 @@ Audited 1200px goldens cover the initial, selected-node, Mix-overlay, and catalo
 | overlay | 0.7942 | 89.1893% | 0.9768% |
 | menu | 1.6906 | 85.0250% | 2.3020% |
 
-The remaining differing pixels are principally GPUI-versus-DOM glyph/subpixel and shadow rasterization. Geometry, palette, fixture placement, route, controls, overlay anchor and menu placement are aligned. Hosted Xvfb drivers sometimes direct-present WebGPU without exposing the surface to CDP or X11 capture; CI detects and reports that compositor limitation rather than accepting a background-only image, while retaining the captures as artifacts. Functional state/fingerprint checks always run.
+The remaining differing pixels are principally GPUI-versus-DOM glyph/subpixel and shadow rasterization. Geometry, palette, fixture placement, route, controls, overlay anchor and menu placement are aligned. CI installs official Google Chrome because the generic hosted Chromium build can omit direct-present WebGPU surfaces from capture. A background-only/missing surface is an explicit failure (not a visual-pass escape hatch), dimensions must match exactly, and every frame is retained as an artifact. Functional state/fingerprint checks always run as well.
 
 ## Stateful interaction evidence
 
