@@ -2,6 +2,13 @@
 
 Cross-platform node graph editor on official Zed GPUI, pinned to `zed-industries/zed@08827f9208b4848d62f3faf86ffa15155966d63c`. This is the standalone GPUI port of the audited Leptos graph. One shared GPUI view runs on desktop and WebAssembly without Leptos or DOM rendering.
 
+## Ecosystem theme API convention
+
+GPUI libraries use `set_<crate>_theme(cx, theme)` for installation and
+`Active<Crate>Theme::<crate>_theme(&self)` for ambient access. The backing
+`Global<Crate>Theme(Arc<CrateTheme>)` remains private. Setters do not refresh or
+fall back; applications batch all crate-theme installs and refresh once.
+
 ## Status
 
 The production foundation includes a serde-compatible framework-free domain snapshot, separately managed transient editor state, generic typed IDs, validated/canonical graph references, directional port compatibility, safe viewport transforms, geometry and selection queries, deterministic orthogonal routes, and a shared GPUI view. The shared editor now renders typed ports and supports draft/snap/complete/reroute gestures, wire and box selection, modifier multi-selection and batched multi-node drag, pointer-centered wheel zoom, grid snap, fit view, keyboard editing hooks, and middle/Ctrl-drag panning. The same view code runs on Windows, macOS, Linux, and WebAssembly.
@@ -26,6 +33,33 @@ cd examples/demo && trunk serve
 # verify the required cross-origin-isolation headers
 curl -sSI http://127.0.0.1:8181/ | grep -Ei 'cross-origin-(opener|embedder)-policy'
 ```
+
+## Theming
+
+`NodeGraphTheme` is the single complete look configuration. It contains the component-level
+`EditorStyle`, `NodeStyle`, `AnchorStyle`, `ConnectionStyle`, `SelectionBoxStyle`, `GroupStyle`,
+`MenuStyle`, and `OverlayStyle` records.
+
+Install the required ambient theme before opening or rendering a node graph:
+
+```rust
+use gpui_node_graph::{set_node_graph_theme, NodeGraphTheme};
+use std::sync::Arc;
+
+let mut theme = NodeGraphTheme::dark();
+theme.node.border_radius = 6.0;
+let theme = Arc::new(theme);
+set_node_graph_theme(cx, Arc::clone(&theme));
+```
+
+`set_node_graph_theme` installs or replaces the application global without refreshing windows, so
+applications can replace several ambient themes and call `App::refresh_windows` once. Rendering
+without an installed theme panics rather than silently choosing a fallback. The root reads the
+immutable `Arc<NodeGraphTheme>` once per render and passes that snapshot to layout and leaf
+renderers.
+
+The value-returning `NodeGraphTheme::light()`, `dark()`, `system(window_appearance)`, and
+`leptos_demo()` constructors remain available for customization.
 
 ## Architecture
 

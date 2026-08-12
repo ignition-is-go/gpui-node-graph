@@ -199,6 +199,12 @@ impl Viewport {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node<N> {
     pub id: N,
+    /// Stable renderer/catalog identity, independent from the user-visible title.
+    ///
+    /// Empty values are accepted for snapshots created before this field existed;
+    /// renderers may then apply their own legacy fallback.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_type: String,
     pub title: String,
     pub position: Point,
     pub size: Size,
@@ -221,7 +227,14 @@ pub struct Connection<P, C> {
     pub target: P,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum GraphMutation<N: Eq + Hash, P, C: Eq + Hash> {
+pub struct PortChange<N, P, T> {
+    pub node_id: N,
+    pub remove: Vec<P>,
+    pub upsert: Vec<Port<N, P, T>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GraphMutation<N: Eq + Hash, P, C: Eq + Hash, T> {
     MoveNodes { nodes: Vec<(N, Point)> },
     ResizeNode { id: N, size: Size },
     RequestConnection { source: P, target: P },
@@ -232,12 +245,16 @@ pub enum GraphMutation<N: Eq + Hash, P, C: Eq + Hash> {
     SetGroupMembership { group_id: String, node_ids: Vec<N> },
     SetGroupLabel { group_id: String, label: String },
     RemoveGroups { group_ids: Vec<String> },
+    ReconcileNodePorts { change: PortChange<N, P, T> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
+pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
     MutationRequested {
-        mutations: Vec<GraphMutation<N, P, C>>,
+        mutations: Vec<GraphMutation<N, P, C, T>>,
+    },
+    NodePortsReconciled {
+        change: PortChange<N, P, T>,
     },
     NodesMoved {
         nodes: Vec<(N, Point)>,
@@ -333,6 +350,10 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash> {
         position: Point,
         connect_from: Option<P>,
         connect_to: Option<String>,
+        /// Direction of the draft-origin port in `connect_from`.
+        ///
+        /// `connect_from`, `connect_to`, and `connect_direction` are either all
+        /// present for create-and-connect, or all absent for ordinary creation.
         connect_direction: Option<PortDirection>,
     },
     ViewportChanged {
@@ -453,7 +474,7 @@ impl<
     pub fn reconcile(
         &mut self,
         mut snapshot: GraphSnapshot<N, P, C, T>,
-    ) -> Result<Vec<GraphEvent<N, P, C>>, GraphValidationError> {
+    ) -> Result<Vec<GraphEvent<N, P, C, T>>, GraphValidationError> {
         Self::canonicalize_snapshot(&mut snapshot);
         let candidate = Self {
             nodes: snapshot.nodes,
@@ -586,7 +607,7 @@ impl<
     /// The update is atomic: a missing node, non-finite coordinate, or translated
     /// port outside the finite `f32` range rejects the
     /// entire gesture without changing any node or port.
-    pub fn move_nodes(&mut self, updates: &[(N, Point)]) -> Option<GraphEvent<N, P, C>> {
+    pub fn move_nodes(&mut self, updates: &[(N, Point)]) -> Option<GraphEvent<N, P, C, T>> {
         if updates.is_empty() {
             return None;
         }
@@ -655,12 +676,12 @@ impl<
 
     /// Move one node atomically. This is the single-node convenience wrapper for
     /// [`Self::move_nodes`].
-    pub fn move_node(&mut self, id: &N, position: Point) -> Option<GraphEvent<N, P, C>> {
+    pub fn move_node(&mut self, id: &N, position: Point) -> Option<GraphEvent<N, P, C, T>> {
         self.move_nodes(&[(id.clone(), position)])
     }
 
     /// Delete nodes and reconcile all dependent ports, connections and selection.
-    pub fn remove_nodes(&mut self, ids: &[N]) -> Vec<GraphEvent<N, P, C>> {
+    pub fn remove_nodes(&mut self, ids: &[N]) -> Vec<GraphEvent<N, P, C, T>> {
         let old_selection = (
             self.selected_nodes.clone(),
             self.selected_connections.clone(),
@@ -796,6 +817,7 @@ mod tests {
             "a".into(),
             Node {
                 id: "a".into(),
+                node_type: "test".into(),
                 title: "A".into(),
                 position: Point::new(2., 2.),
                 size: Size {
@@ -835,6 +857,7 @@ mod tests {
                 id.into(),
                 Node {
                     id: id.into(),
+                    node_type: id.into(),
                     title: id.into(),
                     position: Point::new(x, 0.),
                     size: Size {
@@ -892,7 +915,7 @@ mod tests {
     }
     #[test]
     fn controlled_mutation_batch_round_trips() {
-        let event: GraphEvent<String, String, String> = GraphEvent::MutationRequested {
+        let event: GraphEvent<String, String, String, Flow> = GraphEvent::MutationRequested {
             mutations: vec![
                 GraphMutation::MoveNodes {
                     nodes: vec![("node".into(), Point::new(10.0, 20.0))],
@@ -904,11 +927,28 @@ mod tests {
             ],
         };
         let json = serde_json::to_string(&event).unwrap();
-        let decoded: GraphEvent<String, String, String> = serde_json::from_str(&json).unwrap();
+        let decoded: GraphEvent<String, String, String, Flow> =
+            serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
             GraphEvent::MutationRequested { mutations } if mutations.len() == 2
         ));
+    }
+
+    #[test]
+    fn legacy_nodes_without_type_identity_still_deserialize() {
+        let node: Node<String> = serde_json::from_str(
+            r#"{"id":"legacy","title":"Legacy","position":{"x":1.0,"y":2.0},"size":{"width":3.0,"height":4.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(node.id, "legacy");
+        assert!(node.node_type.is_empty());
+        assert!(
+            serde_json::to_value(node)
+                .unwrap()
+                .get("node_type")
+                .is_none()
+        );
     }
 
     #[test]
@@ -925,6 +965,7 @@ mod tests {
                 &"connections".to_string()
             ])
         );
+        assert_eq!(value["nodes"]["a"]["node_type"], "a");
         let fixture = serde_json::to_string(&value).unwrap();
         let decoded: GraphSnapshot<String, String, String, Flow> =
             serde_json::from_str(&fixture).unwrap();

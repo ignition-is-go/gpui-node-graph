@@ -331,7 +331,7 @@ await rightClick(left + 195, top + 95);
 await waitFor("anchor menu opening", (value) => value.anchorMenu);
 await pause();
 await click(left + 260, top + 114);
-await waitFor("anchor remove-connections action", (value) => !value.anchorMenu && value.connections === 0 && !value.sourceConnected);
+await waitFor("anchor remove-connections action", (value) => !value.anchorMenu && value.connections === baseline.connections - 1 && !value.sourceConnected);
 await pause();
 await click(left + 195, top + 95);
 await pause();
@@ -449,7 +449,8 @@ const authored = await waitFor(
 await click(left + 195, top + 95);
 await click(left + 344, top + 120);
 await waitFor("click-to-connect ports", (value) => value.connections === baseline.connections + 1);
-await drag(left + 195, top + 95, left + 750, top + 250);
+await click(left + 195, top + 95);
+await key("Tab", "Tab");
 await pause();
 await waitFor(
   "draft connection catalog",
@@ -461,9 +462,9 @@ await waitFor(
   (value) => value.catalogEntries === 2 && value.catalogSelected === 0,
 );
 await saveStateScreenshot("draft-menu");
-await move(left + 800, top + 401);
+await move(left + 800, top + 450);
 await waitFor("draft pin mouse selection", (value) => value.catalogSelected === 1);
-await move(left + 800, top + 377);
+await move(left + 800, top + 425);
 await waitFor("draft pin mouse reselection", (value) => value.catalogSelected === 0);
 await key("ArrowDown", "ArrowDown");
 await waitFor("draft pin keyboard selection", (value) => value.catalogSelected === 1);
@@ -487,13 +488,13 @@ await waitFor(
   (value) => !value.catalogOpen && value.nodes === baseline.nodes + 3 && value.customInputs === 2,
 );
 const beforeCustomSelect = await graphState();
-await click(left + 870, top + 421);
+await click(left + 870, top + 469);
 await waitFor(
   "custom count dropdown opening",
   (value) => value.selectOpen && value.worldLayout === beforeCustomSelect.worldLayout,
 );
 await pause();
-await click(left + 870, top + 531);
+await click(left + 870, top + 580);
 await waitFor(
   "custom count option selection",
   (value) => !value.selectOpen && value.customInputs === 4,

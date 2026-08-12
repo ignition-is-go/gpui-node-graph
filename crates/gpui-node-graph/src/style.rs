@@ -5,6 +5,8 @@
 //! colors retain a 24-bit RGB value plus an independent alpha component.  This
 //! keeps the configuration useful to GPUI without carrying CSS strings.
 
+use gpui::WindowAppearance;
+
 /// A 24-bit RGB color and an alpha value in the inclusive range `0.0..=1.0`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color {
@@ -320,6 +322,9 @@ impl Default for SelectionBoxStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupStyle {
     pub default_color: Color,
+    pub padding_x: f32,
+    pub padding_top: f32,
+    pub padding_bottom: f32,
     pub border_radius: f32,
     pub border_width: f32,
     pub border_opacity: f32,
@@ -341,6 +346,9 @@ impl Default for GroupStyle {
     fn default() -> Self {
         Self {
             default_color: Color::rgb(0x8b5cf6),
+            padding_x: 16.0,
+            padding_top: 40.0,
+            padding_bottom: 16.0,
             border_radius: 8.0,
             border_width: 1.0,
             border_opacity: 0.5,
@@ -459,7 +467,7 @@ impl Default for OverlayStyle {
 
 /// Complete public style set for one editor.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct GraphStyle {
+pub struct NodeGraphTheme {
     pub editor: EditorStyle,
     pub node: NodeStyle,
     pub anchor: AnchorStyle,
@@ -470,7 +478,58 @@ pub struct GraphStyle {
     pub overlay: OverlayStyle,
 }
 
-impl GraphStyle {
+impl NodeGraphTheme {
+    /// Complete built-in dark theme.
+    pub fn dark() -> Self {
+        Self::default()
+    }
+
+    /// Complete built-in light theme with the same reference geometry.
+    pub fn light() -> Self {
+        let mut theme = Self::dark();
+        theme.editor.background = Color::rgb(0xf4f4f5);
+        theme.node.background = Color::rgb(0xffffff);
+        theme.node.border = Border::solid(1.0, Color::rgb(0xd4d4d8));
+        theme.node.outline_selected = Border::solid(1.5, Color::rgb(0x2563eb));
+        theme.node.header_background = Color::rgb(0xf4f4f5);
+        theme.node.header_color = Color::rgb(0x3f3f46);
+        theme.node.header_border_bottom = Border::solid(1.0, Color::rgb(0xe4e4e7));
+        theme.node.body_border_bottom = Border::solid(1.0, Color::rgb(0xe4e4e7));
+        theme.node.field_label_color = Color::rgb(0x71717a);
+        theme.node.resize_handle_color = Color::rgb(0x71717a);
+        theme.anchor.dot_color = Color::rgb(0x71717a);
+        theme.anchor.dot_connected_color = Color::rgb(0x52525b);
+        theme.anchor.dot_compatible_color = Color::rgb(0x0891b2);
+        theme.anchor.label_color = Color::rgb(0x3f3f46);
+        theme.anchor.tooltip_background = Color::rgb(0xffffff);
+        theme.anchor.tooltip_color = Color::rgb(0x27272a);
+        theme.anchor.tooltip_border = Border::solid(1.0, Color::rgb(0xd4d4d8));
+        theme.connection.stroke = Color::rgb(0x71717a);
+        theme.connection.stroke_selected = Color::rgb(0x2563eb);
+        theme.connection.stroke_draft = Color::rgb(0x0891b2);
+        theme.selection_box.border = Border::solid(1.0, Color::rgba(0x2563eb, 0.45));
+        theme.selection_box.background = Color::rgba(0x2563eb, 0.08);
+        theme.menu.background = Color::rgb(0xffffff);
+        theme.menu.item_color = Color::rgb(0x27272a);
+        theme.menu.border = Border::solid(1.0, Color::rgb(0xd4d4d8));
+        theme.menu.input_background = Color::rgb(0xf4f4f5);
+        theme.menu.input_color = Color::rgb(0x27272a);
+        theme.menu.input_border = Border::solid(1.0, Color::rgb(0xd4d4d8));
+        theme.menu.hover_background = Color::rgb(0xe4e4e7);
+        theme.overlay.panel_background = Color::rgb(0xffffff);
+        theme.overlay.panel_border = Border::solid(1.0, Color::rgb(0xd4d4d8));
+        theme.overlay.backdrop_background = Color::rgba(0x000000, 0.2);
+        theme
+    }
+
+    /// Resolve a complete built-in theme for the GPUI window appearance.
+    pub fn system(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::light(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::dark(),
+        }
+    }
+
     /// The exact style overrides applied by the Leptos demo, including its
     /// full-window `#18181b` wrapper background.
     pub fn leptos_demo() -> Self {
@@ -494,14 +553,29 @@ impl GraphStyle {
     }
 }
 
-/// Return the complete Leptos demo preset.
-pub fn leptos_demo() -> GraphStyle {
-    GraphStyle::leptos_demo()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_theme_maps_all_gpui_appearances() {
+        assert_eq!(
+            NodeGraphTheme::system(WindowAppearance::Light),
+            NodeGraphTheme::light()
+        );
+        assert_eq!(
+            NodeGraphTheme::system(WindowAppearance::VibrantLight),
+            NodeGraphTheme::light()
+        );
+        assert_eq!(
+            NodeGraphTheme::system(WindowAppearance::Dark),
+            NodeGraphTheme::dark()
+        );
+        assert_eq!(
+            NodeGraphTheme::system(WindowAppearance::VibrantDark),
+            NodeGraphTheme::dark()
+        );
+    }
 
     #[test]
     fn color_helpers_preserve_rgb_and_alpha() {
@@ -518,7 +592,7 @@ mod tests {
 
     #[test]
     fn graph_default_is_composed_from_section_defaults() {
-        let graph = GraphStyle::default();
+        let graph = NodeGraphTheme::default();
         assert_eq!(graph.editor, EditorStyle::default());
         assert_eq!(graph.node, NodeStyle::default());
         assert_eq!(graph.anchor, AnchorStyle::default());
@@ -650,8 +724,8 @@ mod tests {
 
     #[test]
     fn leptos_demo_changes_only_documented_overrides() {
-        let defaults = GraphStyle::default();
-        let demo = GraphStyle::leptos_demo();
+        let defaults = NodeGraphTheme::default();
+        let demo = NodeGraphTheme::leptos_demo();
         assert_eq!(demo.editor.background, Color::rgb(0x18181b));
         assert_eq!(demo.connection.stroke, defaults.connection.stroke);
         assert_eq!(demo.connection.stroke_selected, Color::rgb(0xdddddd));
@@ -683,7 +757,7 @@ mod tests {
 
     #[test]
     fn styles_are_independently_cloneable_and_comparable() {
-        let original = GraphStyle::default();
+        let original = NodeGraphTheme::default();
         let mut changed = original.clone();
         changed.node.resize_max_width = Some(480.0);
         changed.anchor.default_dot_shape = DotShape::Hexagon;

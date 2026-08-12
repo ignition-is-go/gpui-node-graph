@@ -6,7 +6,11 @@ use gpui_node_graph::{
     CatalogPort, GraphGroup, NodeCatalogItem, NodeGraph, NodeOverlay, OverlayAlign,
     OverlayPlacement, OverlaySide, WorldNodeBodyContext, WorldTextInputState,
     core::*,
-    world::{HitRole, HitShape, TextLines, WorldColor, WorldHitRegion, WorldPrimitive, WorldScene},
+    style::Color as GraphColor,
+    world::{
+        AccessibleControlRole, HitRole, HitShape, TextLines, WorldColor, WorldHitRegion,
+        WorldPrimitive, WorldScene,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,8 +56,22 @@ impl DemoControls {
         BLEND_OPTIONS[self.blends.get(node).copied().unwrap_or(0) % BLEND_OPTIONS.len()]
     }
 
+    #[allow(dead_code)]
     fn factor_text(&self, node: &str) -> &str {
-        self.factors.get(node).map(String::as_str).unwrap_or("0.0")
+        self.factors
+            .iter()
+            .find(|(control, _)| control.starts_with(&format!("{node}:")))
+            .map(|(_, value)| value.as_str())
+            .or_else(|| self.factors.get(node).map(String::as_str))
+            .unwrap_or("0.0")
+    }
+
+    fn factor_text_for(&self, node: &str, control: &str) -> &str {
+        self.factors
+            .get(control)
+            .or_else(|| self.factors.get(node))
+            .map(String::as_str)
+            .unwrap_or("0.0")
     }
 
     fn activate(&mut self, node: &str, control: &str) -> Option<(PortDirection, usize)> {
@@ -73,7 +91,7 @@ impl DemoControls {
             self.open_select = None;
             let original = self
                 .factors
-                .entry(node.into())
+                .entry(control.into())
                 .or_insert_with(|| "0.0".into())
                 .clone();
             self.number_cursor = original.chars().count();
@@ -112,7 +130,7 @@ impl DemoControls {
         if control.ends_with(":factor-value") {
             let original = self
                 .factors
-                .entry(node.into())
+                .entry(control.into())
                 .or_insert_with(|| "0.0".into())
                 .clone();
             self.number_cursor = original.chars().count();
@@ -153,7 +171,7 @@ impl DemoControls {
         if !control.ends_with(":factor-value") {
             return;
         }
-        let char_count = self.factor_text(node).chars().count();
+        let char_count = self.factor_text_for(node, control).chars().count();
         if click_count >= 2 {
             self.number_selection_anchor = Some(0);
             self.number_cursor = char_count;
@@ -171,7 +189,7 @@ impl DemoControls {
             return None;
         }
         let anchor = self.number_selection_anchor?;
-        let value = self.factor_text(node);
+        let value = self.factor_text_for(node, control);
         let (start_char, end_char) = (
             anchor.min(self.number_cursor),
             anchor.max(self.number_cursor),
@@ -193,7 +211,7 @@ impl DemoControls {
         if active_node != node || active_control != control {
             return None;
         }
-        let text = self.factor_text(node).to_owned();
+        let text = self.factor_text_for(node, control).to_owned();
         let to_utf16 = |chars: usize| text.chars().take(chars).map(char::len_utf16).sum::<usize>();
         let cursor = to_utf16(self.number_cursor);
         let (selection, reversed) = if let Some(anchor) = self.number_selection_anchor {
@@ -212,7 +230,7 @@ impl DemoControls {
 
     fn apply_platform_text(
         &mut self,
-        node: &str,
+        _node: &str,
         control: &str,
         text: &str,
         selection: std::ops::Range<usize>,
@@ -221,7 +239,7 @@ impl DemoControls {
         if !control.ends_with(":factor-value") {
             return;
         }
-        self.factors.insert(node.into(), text.into());
+        self.factors.insert(control.into(), text.into());
         let to_char = |utf16: usize| {
             let mut units = 0;
             text.chars()
@@ -289,7 +307,7 @@ impl DemoControls {
             }
             let value = self
                 .factors
-                .entry(node.into())
+                .entry(control.into())
                 .or_insert_with(|| "0.0".into());
             let char_count = value.chars().count();
             let selection = self.number_selection_anchor.map(|anchor| {
@@ -512,6 +530,7 @@ fn catalog() -> Vec<NodeCatalogItem<Kind>> {
             id: "color_source".into(),
             label: "Color Source".into(),
             category: "Input".into(),
+            category_color: Some(GraphColor::rgb(0x22d3ee)),
             description: "Produces a color and alpha".into(),
             keywords: Vec::new(),
             ports: vec![
@@ -523,6 +542,7 @@ fn catalog() -> Vec<NodeCatalogItem<Kind>> {
             id: "mix".into(),
             label: "Mix".into(),
             category: "Color".into(),
+            category_color: Some(GraphColor::rgb(0xf59e0b)),
             description: "Blend two colors".into(),
             keywords: Vec::new(),
             ports: vec![
@@ -536,6 +556,7 @@ fn catalog() -> Vec<NodeCatalogItem<Kind>> {
             id: "math".into(),
             label: "Math".into(),
             category: "Math".into(),
+            category_color: Some(GraphColor::rgb(0x8b5cf6)),
             description: "Arithmetic operation".into(),
             keywords: Vec::new(),
             ports: vec![
@@ -548,6 +569,7 @@ fn catalog() -> Vec<NodeCatalogItem<Kind>> {
             id: "output".into(),
             label: "Output".into(),
             category: "Output".into(),
+            category_color: Some(GraphColor::rgb(0xef4444)),
             description: "Final output destination".into(),
             keywords: Vec::new(),
             ports: vec![
@@ -559,6 +581,7 @@ fn catalog() -> Vec<NodeCatalogItem<Kind>> {
             id: "custom".into(),
             label: "Custom".into(),
             category: "Utility".into(),
+            category_color: Some(GraphColor::rgb(0x10b981)),
             description: "Configurable inputs/outputs".into(),
             keywords: Vec::new(),
             ports: Vec::new(),
@@ -618,6 +641,7 @@ fn instantiate_node(
         node_id.clone(),
         Node {
             id: node_id.clone(),
+            node_type: item.id.clone(),
             title: item.label.clone(),
             position,
             size: node_size,
@@ -663,7 +687,7 @@ fn instantiate_node(
     if let (Some(existing), Some(created), Some(direction)) =
         (connect_from, auto_port, connect_direction)
     {
-        let (source, target) = if direction == PortDirection::Input {
+        let (source, target) = if direction == PortDirection::Output {
             (existing, created)
         } else {
             (created, existing)
@@ -674,9 +698,10 @@ fn instantiate_node(
 
 fn leptos_demo_graph() -> GraphState<String, String, String, Kind> {
     let mut graph: GraphState<String, String, String, Kind> = Default::default();
-    for (id, title, position, size) in [
+    for (id, node_type, title, position, size) in [
         (
             "color_source_0",
+            "color_source",
             "Color Source",
             Point::new(50.0, 50.0),
             Size {
@@ -686,6 +711,7 @@ fn leptos_demo_graph() -> GraphState<String, String, String, Kind> {
         ),
         (
             "mix_1",
+            "mix",
             "Mix",
             Point::new(330.0, 50.0),
             Size {
@@ -698,6 +724,7 @@ fn leptos_demo_graph() -> GraphState<String, String, String, Kind> {
             id.into(),
             Node {
                 id: id.into(),
+                node_type: node_type.into(),
                 title: title.into(),
                 position,
                 size,
@@ -774,6 +801,71 @@ fn leptos_demo_graph() -> GraphState<String, String, String, Kind> {
             target: "mix_1_b".into(),
         },
     );
+
+    // Keep the two reference nodes at their original coordinates for the guided demo,
+    // then seed a deterministic off-canvas stress graph. Panning or Fit View reveals it.
+    const SEEDED_NODES: usize = 148;
+    for index in 0..SEEDED_NODES {
+        let column = index % 15;
+        let row = index / 15;
+        let node_id = format!("seed_math_{index}");
+        let position = Point::new(1_600.0 + column as f32 * 240.0, 50.0 + row as f32 * 150.0);
+        let size = Size {
+            width: 180.0,
+            height: 110.0,
+        };
+        graph.nodes.insert(
+            node_id.clone(),
+            Node {
+                id: node_id.clone(),
+                node_type: "seed".into(),
+                title: format!("Seed {index}"),
+                position,
+                size,
+            },
+        );
+        for (suffix, label, direction, offset) in [
+            ("a", "A", PortDirection::Input, Point::new(14.0, 55.0)),
+            ("b", "B", PortDirection::Input, Point::new(14.0, 80.0)),
+            (
+                "result",
+                "Result",
+                PortDirection::Output,
+                Point::new(size.width - 14.0, 55.0),
+            ),
+        ] {
+            let port_id = format!("{node_id}_{suffix}");
+            graph.ports.insert(
+                port_id.clone(),
+                Port {
+                    id: port_id,
+                    node: node_id.clone(),
+                    label: label.into(),
+                    direction,
+                    kind: Kind::Float,
+                    position: position + offset,
+                },
+            );
+        }
+    }
+
+    // The original edge plus these 199 deterministic edges yields exactly 200.
+    // Each input is occupied at most once while outputs are intentionally fanned out.
+    for edge in 0..199usize {
+        let target = edge % SEEDED_NODES;
+        let target_suffix = if edge < SEEDED_NODES { "a" } else { "b" };
+        let source = (target + SEEDED_NODES - 1) % SEEDED_NODES;
+        let id = format!("seed_conn_{edge}");
+        graph.connections.insert(
+            id.clone(),
+            Connection {
+                id,
+                source: format!("seed_math_{source}_result"),
+                target: format!("seed_math_{target}_{target_suffix}"),
+            },
+        );
+    }
+
     graph
 }
 
@@ -900,26 +992,41 @@ fn world_socket(
     }
 }
 
+fn effective_node_type(node: &Node<String>) -> &str {
+    if !node.node_type.is_empty() {
+        return &node.node_type;
+    }
+    match node.title.as_str() {
+        "Color Source" => "color_source",
+        "Mix" => "mix",
+        "Math" => "math",
+        "Output" => "output",
+        "Custom" => "custom",
+        _ => "",
+    }
+}
+
 #[cfg(test)]
 fn leptos_world_node(context: WorldNodeBodyContext<Kind, String, String>) -> WorldScene {
-    leptos_world_node_with_values(context, "Normal", "0.0", None)
+    leptos_world_node_with_values(context, "Normal", &std::collections::HashMap::new(), None)
 }
 
 fn leptos_world_node_with_values(
     context: WorldNodeBodyContext<Kind, String, String>,
     blend: &str,
-    factor: &str,
-    factor_edit: Option<(usize, Option<usize>)>,
+    factors: &std::collections::HashMap<String, String>,
+    factor_edit: Option<(String, usize, Option<usize>)>,
 ) -> WorldScene {
     let mut scene = WorldScene::new();
     let node = &context.node;
-    let node_style = &context.style.node;
-    let anchor_style = &context.style.anchor;
-    let (category, accent) = match node.title.as_str() {
-        "Color Source" => ("INPUT", 0x22d3ee),
-        "Mix" => ("COLOR", 0xf59e0b),
-        "Math" => ("MATH", 0x8b5cf6),
-        "Output" => ("OUTPUT", 0xef4444),
+    let node_style = &context.theme.node;
+    let anchor_style = &context.theme.anchor;
+    let node_type = effective_node_type(node);
+    let (category, accent) = match node_type {
+        "color_source" => ("INPUT", 0x22d3ee),
+        "mix" => ("COLOR", 0xf59e0b),
+        "math" => ("MATH", 0x8b5cf6),
+        "output" => ("OUTPUT", 0xef4444),
         _ => ("UTILITY", 0x10b981),
     };
     scene.push(WorldPrimitive::Quad {
@@ -958,7 +1065,7 @@ fn leptos_world_node_with_values(
         node_style.header_border_bottom,
     );
 
-    if node.title == "Custom" {
+    if node_type == "custom" {
         for (row, (label, count, control)) in [
             (
                 "Inputs",
@@ -1022,15 +1129,24 @@ fn leptos_world_node_with_values(
                 11.0,
                 0xd4d4d8,
             );
-            scene.push_hit_region(WorldHitRegion::new(
-                format!("{}:{control}", node.id),
-                HitRole::Control,
-                HitShape::Rect(select),
-            ));
+            scene.push_hit_region(
+                WorldHitRegion::new(
+                    format!("{}:{control}", node.id),
+                    HitRole::Control,
+                    HitShape::Rect(select),
+                )
+                .with_accessible_label(if control == "input-count" {
+                    "Input count"
+                } else {
+                    "Output count"
+                })
+                .with_accessible_role(AccessibleControlRole::SpinButton)
+                .with_accessible_numeric_range(count as f64, 1.0, 8.0, 1.0),
+            );
         }
     }
 
-    if node.title == "Mix" {
+    if node_type == "mix" {
         world_text(
             &mut scene,
             node.position.x + node_style.padding_x,
@@ -1067,11 +1183,16 @@ fn leptos_world_node_with_values(
             11.0,
             0xd4d4d8,
         );
-        scene.push_hit_region(WorldHitRegion::new(
-            format!("{}:blend-select", node.id),
-            HitRole::Control,
-            HitShape::Rect(blend_select),
-        ));
+        scene.push_hit_region(
+            WorldHitRegion::new(
+                format!("{}:blend-select", node.id),
+                HitRole::Control,
+                HitShape::Rect(blend_select),
+            )
+            .with_accessible_label("Blend mode")
+            .with_accessible_role(AccessibleControlRole::ComboBox)
+            .with_accessible_value(blend),
+        );
         scene.push(WorldPrimitive::BorderedQuad {
             bounds: Rect {
                 origin: Point::new(node.position.x + 167.0, node.position.y + 29.0),
@@ -1097,20 +1218,23 @@ fn leptos_world_node_with_values(
             color: WorldColor::rgb(0xd4d4d8),
             width: 1.5,
         });
-        scene.push_hit_region(WorldHitRegion::new(
-            format!("{}:mix-amount", node.id),
-            HitRole::Control,
-            HitShape::Rect(Rect {
-                origin: Point::new(node.position.x + 167.0, node.position.y + 29.0),
-                size: Size {
-                    width: 25.0,
-                    height: 25.0,
-                },
-            }),
-        ));
+        scene.push_hit_region(
+            WorldHitRegion::new(
+                format!("{}:mix-amount", node.id),
+                HitRole::Control,
+                HitShape::Rect(Rect {
+                    origin: Point::new(node.position.x + 167.0, node.position.y + 29.0),
+                    size: Size {
+                        width: 25.0,
+                        height: 25.0,
+                    },
+                }),
+            )
+            .with_accessible_label("Mix amount"),
+        );
     }
 
-    if matches!(node.title.as_str(), "Mix" | "Custom")
+    if matches!(node_type, "mix" | "custom")
         && let Some(first_port_y) = context
             .ports
             .iter()
@@ -1135,10 +1259,10 @@ fn leptos_world_node_with_values(
             anchor_style,
             node_style.background,
         );
-        let (x, y) = match (node.title.as_str(), port.label.as_str(), port.direction) {
-            ("Color Source", "Color", _) => (node.position.x + 107.0, port.position.y - 6.0),
-            ("Color Source", "Alpha", _) => (node.position.x + 107.0, port.position.y - 6.0),
-            ("Mix", "Result", _) => (node.position.x + 148.0, port.position.y - 6.0),
+        let (x, y) = match (node_type, port.label.as_str(), port.direction) {
+            ("color_source", "Color", _) => (node.position.x + 107.0, port.position.y - 6.0),
+            ("color_source", "Alpha", _) => (node.position.x + 107.0, port.position.y - 6.0),
+            ("mix", "Result", _) => (node.position.x + 148.0, port.position.y - 6.0),
             (_, _, PortDirection::Input) => (port.position.x + 9.0, port.position.y - 6.0),
             (_, _, PortDirection::Output) => (port.position.x - 50.0, port.position.y - 6.0),
         };
@@ -1160,6 +1284,15 @@ fn leptos_world_node_with_values(
             },
         );
         if port.direction == PortDirection::Input && port.kind == Kind::Float {
+            let factor_control_id = format!("{}:{}:factor-value", node.id, port.id);
+            let factor = factors
+                .get(&factor_control_id)
+                .map(String::as_str)
+                .unwrap_or("0.0");
+            let active_factor_edit = factor_edit
+                .as_ref()
+                .filter(|(control, _, _)| control == &factor_control_id)
+                .map(|(_, cursor, anchor)| (*cursor, *anchor));
             scene.push(WorldPrimitive::BorderedQuad {
                 bounds: Rect {
                     origin: Point::new(node.position.x + 60.0, port.position.y - 9.0),
@@ -1176,7 +1309,7 @@ fn leptos_world_node_with_values(
             let factor_character_width = 16.0 / 3.0;
             let factor_text_x =
                 node.position.x + 119.0 - factor.chars().count() as f32 * factor_character_width;
-            if let Some((cursor, anchor)) = factor_edit {
+            if let Some((cursor, anchor)) = active_factor_edit {
                 if let Some(anchor) = anchor
                     && anchor != cursor
                 {
@@ -1220,17 +1353,22 @@ fn leptos_world_node_with_values(
                 11.0,
                 0xd4d4d8,
             );
-            scene.push_hit_region(WorldHitRegion::new(
-                format!("{}:factor-value", node.id),
-                HitRole::Control,
-                HitShape::Rect(Rect {
-                    origin: Point::new(node.position.x + 60.0, port.position.y - 9.0),
-                    size: Size {
-                        width: 66.0,
-                        height: 18.0,
-                    },
-                }),
-            ));
+            scene.push_hit_region(
+                WorldHitRegion::new(
+                    factor_control_id,
+                    HitRole::Control,
+                    HitShape::Rect(Rect {
+                        origin: Point::new(node.position.x + 60.0, port.position.y - 9.0),
+                        size: Size {
+                            width: 66.0,
+                            height: 18.0,
+                        },
+                    }),
+                )
+                .with_accessible_label("Factor value")
+                .with_accessible_role(AccessibleControlRole::TextInput)
+                .with_accessible_value(factor),
+            );
         }
     }
     scene
@@ -1342,6 +1480,7 @@ fn set_custom_port_count(
 }
 
 fn launch(cx: &mut App) {
+    gpui_node_graph::set_node_graph_theme(cx, gpui_node_graph::NodeGraphTheme::leptos_demo());
     #[cfg(not(target_arch = "wasm32"))]
     let window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
         None,
@@ -1373,21 +1512,22 @@ fn launch(cx: &mut App) {
                 let graph_weak = cx.entity().downgrade();
                 let graph = leptos_demo_graph();
                 NodeGraph::new_in(graph, cx)
-                    .with_style(gpui_node_graph::style::leptos_demo())
                     .with_world_node_body_renderer(
                         move |context: WorldNodeBodyContext<Kind, String, String>| {
-                            let (blend, factor, factor_edit) = {
+                            let (blend, factors, factor_edit) = {
                                 let controls = renderer_controls.borrow();
-                                let editing =
-                                    controls.editing_number.as_ref().and_then(|(node, _, _)| {
+                                let editing = controls.editing_number.as_ref().and_then(
+                                    |(node, control, _)| {
                                         (node == &context.node.id).then_some((
+                                            control.clone(),
                                             controls.number_cursor,
                                             controls.number_selection_anchor,
                                         ))
-                                    });
+                                    },
+                                );
                                 (
                                     controls.blend_label(&context.node.id).to_string(),
-                                    controls.factor_text(&context.node.id).to_string(),
+                                    controls.factors.clone(),
                                     editing,
                                 )
                             };
@@ -1395,7 +1535,7 @@ fn launch(cx: &mut App) {
                             let mut scene = leptos_world_node_with_values(
                                 context,
                                 &blend,
-                                &factor,
+                                &factors,
                                 factor_edit,
                             );
                             if renderer_amount_overlays.borrow().contains(&node_id)
@@ -1416,7 +1556,10 @@ fn launch(cx: &mut App) {
                                                 height: 0.0,
                                             },
                                         }),
-                                    ),
+                                    )
+                                    .with_accessible_label("Mix range")
+                                    .with_accessible_role(AccessibleControlRole::Slider)
+                                    .with_accessible_numeric_range(0.75, 0.0, 1.0, 0.05),
                                 );
                             }
                             scene
@@ -1545,7 +1688,7 @@ fn launch(cx: &mut App) {
                                 overlays.push(NodeOverlay::new(offset, panel));
                             }
 
-                            if context.node.title == "Mix"
+                            if effective_node_type(&context.node) == "mix"
                                 && renderer_overlays.borrow().contains(&context.node.id)
                             {
                                 let node_id = context.node.id.clone();
@@ -1686,8 +1829,9 @@ fn launch(cx: &mut App) {
                     .with_overlay_anchor_control("mix-amount", "mix_1:mix-amount")
                     .with_groups(vec![GraphGroup {
                         id: "group_0".into(),
-                        label: "Group 1".into(),
-                        color: 0x8b5cf6,
+                        label: Some("Group 1".into()),
+                        color: Some(gpui_node_graph::style::Color::rgb(0x8b5cf6)),
+                        error: false,
                         nodes: ["color_source_0".to_string(), "mix_1".to_string()]
                             .into_iter()
                             .collect(),
@@ -1902,8 +2046,9 @@ fn launch(cx: &mut App) {
                             editor.upsert_group(
                                 GraphGroup {
                                     id: format!("group-{sequence}"),
-                                    label: format!("Group {sequence}"),
-                                    color: 0xa78bfa,
+                                    label: Some(format!("Group {sequence}")),
+                                    color: Some(gpui_node_graph::style::Color::rgb(0xa78bfa)),
+                                    error: false,
                                     nodes: node_ids.iter().cloned().collect(),
                                 },
                                 cx,
@@ -1965,7 +2110,7 @@ fn browser_test_state() -> String {
                     .graph
                     .nodes
                     .values()
-                    .find(|node| node.title == "Custom")
+                    .find(|node| effective_node_type(node) == "custom")
                     .map_or(0, |node| {
                         graph
                             .graph
@@ -1977,11 +2122,12 @@ fn browser_test_state() -> String {
                             .count()
                     });
                 format!(
-                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"catalogDraft":{},"catalogEntries":{},"catalogSelected":{},"selectOpen":{},"blend":"{}","factorText":"{}","customInputs":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"anchorTooltip":{},"anchorMenu":{},"textInput":{},"textInputActive":{},"sourceConnected":{},"mixAmount":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
+                    r#"{{"nodes":{},"connections":{},"catalogOpen":{},"catalogDraft":{},"activeDraft":{},"catalogEntries":{},"catalogSelected":{},"selectOpen":{},"blend":"{}","factorText":"{}","customInputs":{},"overlayDismissed":{},"zoom":{},"sourceWidth":{},"sourceHeight":{},"controlActivated":{},"lastControl":"{}","activeOverlays":{},"anchorTooltip":{},"anchorMenu":{},"textInput":{},"textInputActive":{},"sourceConnected":{},"mixAmount":{},"selectedNodes":{},"mixX":{},"mixY":{},"mixWidth":{},"panX":{},"panY":{},"worldLayout":"{}"}}"#,
                     graph.graph.nodes.len(),
                     graph.graph.connections.len(),
                     graph.catalog_is_open(),
                     graph.catalog_connects_draft(),
+                    graph.has_active_draft(),
                     graph.catalog_entry_count(),
                     graph.catalog_selected_entry().unwrap_or(0),
                     select_open,
@@ -2095,6 +2241,27 @@ mod parity_tests {
     }
 
     #[test]
+    fn port_number_editors_keep_value_and_cursor_state_scoped_to_the_exact_control() {
+        let mut controls = DemoControls::default();
+        let first = "custom:custom_in_0:factor-value";
+        let second = "custom:custom_in_1:factor-value";
+
+        controls.activate("custom", first);
+        controls.key_down("custom", first, "a", None, true, false);
+        controls.key_down("custom", first, "1", Some("1"), false, false);
+        assert_eq!(controls.factor_text_for("custom", first), "1");
+        assert_eq!(controls.factor_text_for("custom", second), "0.0");
+
+        controls.activate("custom", second);
+        assert!(controls.factor_input_state("custom", first).is_none());
+        assert!(controls.factor_input_state("custom", second).is_some());
+        controls.key_down("custom", second, "a", None, true, false);
+        controls.key_down("custom", second, "2", Some("2"), false, false);
+        assert_eq!(controls.factor_text_for("custom", first), "1");
+        assert_eq!(controls.factor_text_for("custom", second), "2");
+    }
+
+    #[test]
     fn factor_editor_supports_select_all_and_native_enter_escape_preservation() {
         let mut controls = DemoControls::default();
         controls.activate("mix", "mix:factor-value");
@@ -2128,7 +2295,9 @@ mod parity_tests {
     #[test]
     fn factor_editor_supports_pointer_caret_shift_selection_and_clipboard_ranges() {
         let mut controls = DemoControls::default();
-        controls.factors.insert("mix".into(), "abcd".into());
+        controls
+            .factors
+            .insert("mix:factor-value".into(), "abcd".into());
         controls.activate("mix", "mix:factor-value");
         let node_x = 330.0;
         let text_start = node_x + 119.0 - 4.0 * 5.3;
@@ -2164,6 +2333,61 @@ mod parity_tests {
             ["color_source", "mix", "math", "output", "custom"]
         );
         assert_eq!(
+            items
+                .iter()
+                .map(|item| (
+                    item.category.as_str(),
+                    item.category_color
+                        .expect("demo categories have accents")
+                        .rgb,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("Input", 0x22d3ee),
+                ("Color", 0xf59e0b),
+                ("Math", 0x8b5cf6),
+                ("Output", 0xef4444),
+                ("Utility", 0x10b981),
+            ]
+        );
+        assert!(items.iter().all(|item| {
+            item.category_color
+                .is_some_and(|color| (color.alpha - 1.0).abs() < f32::EPSILON)
+        }));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| {
+                    item.ports
+                        .iter()
+                        .map(|port| (port.id.as_str(), port.direction, port.kind.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                vec![
+                    ("color", PortDirection::Output, Kind::Color),
+                    ("alpha", PortDirection::Output, Kind::Float),
+                ],
+                vec![
+                    ("a", PortDirection::Input, Kind::Color),
+                    ("b", PortDirection::Input, Kind::Color),
+                    ("factor", PortDirection::Input, Kind::Float),
+                    ("result", PortDirection::Output, Kind::Color),
+                ],
+                vec![
+                    ("a", PortDirection::Input, Kind::Float),
+                    ("b", PortDirection::Input, Kind::Float),
+                    ("result", PortDirection::Output, Kind::Float),
+                ],
+                vec![
+                    ("color", PortDirection::Input, Kind::Color),
+                    ("value", PortDirection::Input, Kind::Any),
+                ],
+                vec![],
+            ]
+        );
+        assert_eq!(
             items[0]
                 .ports
                 .iter()
@@ -2185,12 +2409,32 @@ mod parity_tests {
     }
 
     #[test]
-    fn initial_graph_matches_leptos_seed_two_nodes_one_connection() {
+    fn stable_node_type_is_independent_from_display_title_with_legacy_fallback() {
+        let mut graph = leptos_demo_graph();
+        let mut node = graph.nodes.remove("mix_1").unwrap();
+        node.title = "Renamed Blend".into();
+        assert_eq!(effective_node_type(&node), "mix");
+
+        node.node_type.clear();
+        node.title = "Mix".into();
+        assert_eq!(effective_node_type(&node), "mix");
+        node.title = "Localized Mix".into();
+        assert_eq!(effective_node_type(&node), "");
+
+        node.node_type = "consumer.custom.type".into();
+        node.title = "Mix".into();
+        assert_eq!(effective_node_type(&node), "consumer.custom.type");
+    }
+
+    #[test]
+    fn initial_graph_keeps_reference_fixture_and_adds_stress_seed() {
         let graph = leptos_demo_graph();
-        assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.ports.len(), 6);
-        assert_eq!(graph.connections.len(), 1);
+        assert_eq!(graph.nodes.len(), 150);
+        assert_eq!(graph.ports.len(), 450);
+        assert_eq!(graph.connections.len(), 200);
+        graph.validate().unwrap();
         let color = &graph.nodes["color_source_0"];
+        assert_eq!(color.node_type, "color_source");
         assert_eq!(color.position, Point::new(50.0, 50.0));
         assert_eq!(
             color.size,
@@ -2200,6 +2444,7 @@ mod parity_tests {
             }
         );
         let mix = &graph.nodes["mix_1"];
+        assert_eq!(mix.node_type, "mix");
         assert_eq!(mix.position, Point::new(330.0, 50.0));
         assert_eq!(
             mix.size,
@@ -2227,11 +2472,12 @@ mod parity_tests {
             node: node.clone(),
             ports: ports.clone(),
             port_states: std::sync::Arc::new(std::collections::HashMap::new()),
+            port_presentations: std::sync::Arc::new(std::collections::HashMap::new()),
             state: gpui_node_graph::WorldNodeVisualState {
                 selected: false,
                 visible: true,
             },
-            style: gpui_node_graph::style::leptos_demo(),
+            theme: std::sync::Arc::new(gpui_node_graph::NodeGraphTheme::leptos_demo()),
         });
         let control = scene
             .hit_regions

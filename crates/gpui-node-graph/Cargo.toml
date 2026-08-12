@@ -6,3 +6,6 @@ license.workspace=true
 [dependencies]
 gpui.workspace=true
 node-graph-core.workspace=true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

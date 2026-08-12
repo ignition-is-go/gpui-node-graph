@@ -145,12 +145,31 @@ impl HitShape {
     }
 }
 
+/// Semantic role exposed when a control hit region is projected into AccessKit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccessibleControlRole {
+    #[default]
+    Button,
+    TextInput,
+    ComboBox,
+    Slider,
+    SpinButton,
+}
+
 /// An id-bearing interactive area, stored independently of paint commands.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldHitRegion {
     pub id: String,
     pub role: HitRole,
     pub shape: HitShape,
+    /// Human-readable name for projected semantic controls.
+    pub accessible_label: Option<String>,
+    pub accessible_role: AccessibleControlRole,
+    pub accessible_value: Option<String>,
+    pub accessible_numeric_value: Option<f64>,
+    pub accessible_min_numeric_value: Option<f64>,
+    pub accessible_max_numeric_value: Option<f64>,
+    pub accessible_numeric_value_step: Option<f64>,
 }
 
 impl WorldHitRegion {
@@ -159,7 +178,43 @@ impl WorldHitRegion {
             id: id.into(),
             role,
             shape,
+            accessible_label: None,
+            accessible_role: AccessibleControlRole::Button,
+            accessible_value: None,
+            accessible_numeric_value: None,
+            accessible_min_numeric_value: None,
+            accessible_max_numeric_value: None,
+            accessible_numeric_value_step: None,
         }
+    }
+
+    pub fn with_accessible_label(mut self, label: impl Into<String>) -> Self {
+        self.accessible_label = Some(label.into());
+        self
+    }
+
+    pub fn with_accessible_role(mut self, role: AccessibleControlRole) -> Self {
+        self.accessible_role = role;
+        self
+    }
+
+    pub fn with_accessible_value(mut self, value: impl Into<String>) -> Self {
+        self.accessible_value = Some(value.into());
+        self
+    }
+
+    pub fn with_accessible_numeric_range(
+        mut self,
+        value: f64,
+        minimum: f64,
+        maximum: f64,
+        step: f64,
+    ) -> Self {
+        self.accessible_numeric_value = Some(value);
+        self.accessible_min_numeric_value = Some(minimum);
+        self.accessible_max_numeric_value = Some(maximum);
+        self.accessible_numeric_value_step = Some(step);
+        self
     }
 }
 
@@ -228,6 +283,13 @@ impl WorldScene {
                     id: region.id.clone(),
                     role: region.role.clone(),
                     shape: region.shape.project(transform),
+                    accessible_label: region.accessible_label.clone(),
+                    accessible_role: region.accessible_role,
+                    accessible_value: region.accessible_value.clone(),
+                    accessible_numeric_value: region.accessible_numeric_value,
+                    accessible_min_numeric_value: region.accessible_min_numeric_value,
+                    accessible_max_numeric_value: region.accessible_max_numeric_value,
+                    accessible_numeric_value_step: region.accessible_numeric_value_step,
                 })
                 .collect(),
         }
@@ -415,6 +477,19 @@ impl ScreenHitShape {
             Self::Circle { center, radius } => radius >= 0.0 && center.distance(point) <= radius,
         }
     }
+
+    pub fn bounds(self) -> core::Rect {
+        match self {
+            Self::Rect(bounds) => bounds,
+            Self::Circle { center, radius } => core::Rect {
+                origin: core::Point::new(center.x - radius, center.y - radius),
+                size: core::Size {
+                    width: radius * 2.0,
+                    height: radius * 2.0,
+                },
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -422,6 +497,13 @@ pub struct ScreenHitRegion {
     pub id: String,
     pub role: HitRole,
     pub shape: ScreenHitShape,
+    pub accessible_label: Option<String>,
+    pub accessible_role: AccessibleControlRole,
+    pub accessible_value: Option<String>,
+    pub accessible_numeric_value: Option<f64>,
+    pub accessible_min_numeric_value: Option<f64>,
+    pub accessible_max_numeric_value: Option<f64>,
+    pub accessible_numeric_value_step: Option<f64>,
 }
 
 /// The result of projecting a [`WorldScene`].
@@ -641,6 +723,38 @@ mod tests {
         for (actual, expected) in screen.iter().zip(points.iter()) {
             close_point(*actual, transform.point(*expected));
         }
+    }
+
+    #[test]
+    fn semantic_labels_and_bounds_survive_projection() {
+        let projected = WorldScene::new()
+            .with_hit_region(
+                WorldHitRegion::new(
+                    "button",
+                    HitRole::Control,
+                    HitShape::Circle {
+                        center: p(5.0, 7.0),
+                        radius: 2.0,
+                    },
+                )
+                .with_accessible_label("Mix")
+                .with_accessible_role(AccessibleControlRole::Slider)
+                .with_accessible_value("75 percent")
+                .with_accessible_numeric_range(0.75, 0.0, 1.0, 0.05),
+            )
+            .project(Transform::new(p(0.25, -0.5), 1.349859));
+        let region = &projected.hit_regions[0];
+        assert_eq!(region.accessible_label.as_deref(), Some("Mix"));
+        assert_eq!(region.accessible_role, AccessibleControlRole::Slider);
+        assert_eq!(region.accessible_value.as_deref(), Some("75 percent"));
+        assert_eq!(region.accessible_numeric_value, Some(0.75));
+        assert_eq!(region.accessible_min_numeric_value, Some(0.0));
+        assert_eq!(region.accessible_max_numeric_value, Some(1.0));
+        assert_eq!(region.accessible_numeric_value_step, Some(0.05));
+        let bounds = region.shape.bounds();
+        close_point(bounds.origin, p(4.299577, 6.249295));
+        close(bounds.size.width, 5.399436);
+        close(bounds.size.height, 5.399436);
     }
 
     #[test]
