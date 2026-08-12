@@ -1480,6 +1480,7 @@ fn set_custom_port_count(
 }
 
 fn launch(cx: &mut App) {
+    gpui_node_graph::init(cx);
     gpui_node_graph::set_node_graph_theme(cx, gpui_node_graph::NodeGraphTheme::leptos_demo());
     #[cfg(not(target_arch = "wasm32"))]
     let window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
@@ -1511,7 +1512,7 @@ fn launch(cx: &mut App) {
             let graph = cx.new(move |cx| {
                 let graph_weak = cx.entity().downgrade();
                 let graph = leptos_demo_graph();
-                NodeGraph::new_in(graph, cx)
+                NodeGraph::new(graph, cx)
                     .with_world_node_body_renderer(
                         move |context: WorldNodeBodyContext<Kind, String, String>| {
                             let (blend, factors, factor_edit) = {

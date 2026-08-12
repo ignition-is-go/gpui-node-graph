@@ -290,6 +290,10 @@ pub struct ConnectionStyle {
     pub stroke_draft: Color,
     pub stroke_width: f32,
     pub stroke_width_selected: f32,
+    pub automap_preview: Color,
+    pub automap_preview_width: f32,
+    pub automap_preview_dash: f32,
+    pub automap_preview_gap: f32,
 }
 
 impl Default for ConnectionStyle {
@@ -300,6 +304,10 @@ impl Default for ConnectionStyle {
             stroke_draft: Color::rgb(0x22d3ee),
             stroke_width: 2.0,
             stroke_width_selected: 3.0,
+            automap_preview: Color::rgba(0x22d3ee, 0.55),
+            automap_preview_width: 1.5,
+            automap_preview_dash: 5.0,
+            automap_preview_gap: 4.0,
         }
     }
 }
@@ -315,6 +323,46 @@ impl Default for SelectionBoxStyle {
         Self {
             border: Border::solid(1.0, Color::rgba(0x6366f1, 0.6)),
             background: Color::rgba(0x6366f1, 0.1),
+        }
+    }
+}
+
+/// Pane-space toolbar shown above a multi-node selection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectionToolbarStyle {
+    pub background: Color,
+    pub border: Border,
+    pub border_radius: f32,
+    pub shadow: Vec<Shadow>,
+    pub button_size: f32,
+    pub icon_color: Color,
+    pub hover_background: Color,
+    pub disabled_opacity: f32,
+    pub gap: f32,
+    pub padding: f32,
+    pub selection_gap: f32,
+}
+
+impl Default for SelectionToolbarStyle {
+    fn default() -> Self {
+        Self {
+            background: Color::rgb(0x27272a),
+            border: Border::solid(1.0, Color::rgb(0x3f3f46)),
+            border_radius: 6.0,
+            shadow: vec![Shadow {
+                offset_x: 0.0,
+                offset_y: 4.0,
+                blur: 12.0,
+                spread: 0.0,
+                color: Color::rgba(0x000000, 0.4),
+            }],
+            button_size: 24.0,
+            icon_color: Color::rgb(0xd4d4d8),
+            hover_background: Color::rgb(0x3f3f46),
+            disabled_opacity: 0.35,
+            gap: 2.0,
+            padding: 3.0,
+            selection_gap: 8.0,
         }
     }
 }
@@ -396,10 +444,6 @@ pub struct MenuStyle {
     pub list_padding_y: f32,
 }
 
-/// Leptos calls this section `NodeMenuStyle`; retain that spelling as an
-/// ergonomic compatibility alias.
-pub type NodeMenuStyle = MenuStyle;
-
 impl Default for MenuStyle {
     fn default() -> Self {
         Self {
@@ -473,6 +517,7 @@ pub struct NodeGraphTheme {
     pub anchor: AnchorStyle,
     pub connection: ConnectionStyle,
     pub selection_box: SelectionBoxStyle,
+    pub selection_toolbar: SelectionToolbarStyle,
     pub group: GroupStyle,
     pub menu: MenuStyle,
     pub overlay: OverlayStyle,
@@ -509,6 +554,10 @@ impl NodeGraphTheme {
         theme.connection.stroke_draft = Color::rgb(0x0891b2);
         theme.selection_box.border = Border::solid(1.0, Color::rgba(0x2563eb, 0.45));
         theme.selection_box.background = Color::rgba(0x2563eb, 0.08);
+        theme.selection_toolbar.background = Color::rgb(0xffffff);
+        theme.selection_toolbar.border = Border::solid(1.0, Color::rgb(0xd4d4d8));
+        theme.selection_toolbar.icon_color = Color::rgb(0x3f3f46);
+        theme.selection_toolbar.hover_background = Color::rgb(0xe4e4e7);
         theme.menu.background = Color::rgb(0xffffff);
         theme.menu.item_color = Color::rgb(0x27272a);
         theme.menu.border = Border::solid(1.0, Color::rgb(0xd4d4d8));

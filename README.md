@@ -24,6 +24,9 @@ cargo test --workspace
 # double-click blank space or press Tab to search/create; click wires and press Delete;
 # drag a node's right edge to resize (double-click resets); wheel zoom;
 # middle-drag or Ctrl-drag to pan; Ctrl/Cmd+G groups a multi-selection;
+# Multi-select nodes to show alignment/distribution plus inferred-grid Tidy above the selection;
+# connecting across a multi-selection pairs inferred columns/types by vertical rank, or fans the
+# selected endpoint side when no pair mapping applies; mapped disconnects are symmetric;
 # Blend/Custom selects expose mouse and keyboard option choice; Factor uses native/IME text input;
 # right-click ports for connection actions; hover ports for typed tooltips;
 # R cycles subway/Bezier/simple routing; F fits; Escape rolls back/cancels/clears.
@@ -40,12 +43,13 @@ curl -sSI http://127.0.0.1:8181/ | grep -Ei 'cross-origin-(opener|embedder)-poli
 `EditorStyle`, `NodeStyle`, `AnchorStyle`, `ConnectionStyle`, `SelectionBoxStyle`, `GroupStyle`,
 `MenuStyle`, and `OverlayStyle` records.
 
-Install the required ambient theme before opening or rendering a node graph:
+Install actions and the required ambient theme before opening or rendering a node graph:
 
 ```rust
-use gpui_node_graph::{set_node_graph_theme, NodeGraphTheme};
+use gpui_node_graph::{init, set_node_graph_theme, NodeGraph, NodeGraphTheme};
 use std::sync::Arc;
 
+init(cx);
 let mut theme = NodeGraphTheme::dark();
 theme.node.border_radius = 6.0;
 let theme = Arc::new(theme);
@@ -61,10 +65,16 @@ renderers.
 The value-returning `NodeGraphTheme::light()`, `dark()`, `system(window_appearance)`, and
 `leptos_demo()` constructors remain available for customization.
 
+Automatic multi-connect uses registry port keys when available and otherwise matches port labels.
+Consumers with encoded or localized port IDs can install an exact logical-key extractor with
+`NodeGraph::with_port_match_key`. Set `EditorConfig::auto_multi_connect = false` to retain strictly
+singular connection requests. `multi_connection_specs`, `multi_connection_ids_for`, and
+`multi_connection_preview` expose the same policy for host integrations.
+
 ## Architecture
 
-- `node-graph-core`: canonical serializable model and deterministic logic. Persist `GraphSnapshot`; `GraphUiState` (selection and viewport) is session-only. `GraphState` still accepts the former top-level domain JSON shape, but deliberately skips transient fields when serialized. Call `validate`, `canonicalize_ids`, or `GraphState::from_snapshot` at trust boundaries. `NodeGraph::try_new` rejects invalid editor state; `NodeGraph::new` is the convenience constructor for already-trusted state and panics with the validation error rather than silently rendering a corrupt graph.
-- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` view and input adapter. `WorldNodeBodyRenderer` is the canonical affine world-space path: it authors an immutable world-unit display list without access to zoom/pan, GPUI projects the completed primitives at paint time, and pointer input is inverse-transformed before hit testing, dragging, resizing, marquee selection, or port gestures. It receives live connected/source/snap/compatibility state, and pane-space menus and measured overlays remain unscaled while semantic control anchors follow the projection. World text controls can register GPUI's real `InputHandler` for UTF-16 selection, composition/IME, marked text, and clipboard insertion. The older `NodeBodyRenderer` is a compatibility path for retained GPUI controls, but pinned GPUI has no arbitrary retained-subtree affine transform; consumers requiring zoom-stable parity should use the world display list. The adapter and core share one `GraphEvent` vocabulary (`EditorEvent` is a compatibility alias). Measured geometry stays transient and node-relative, preserving strict snapshots. Dynamic-port removal uses dashed transient wire tombstones and can restore the original strict connection when the same stable port ID returns; controlled removal/restoration emits atomic mutations instead of taking model ownership.
+- `node-graph-core`: canonical serializable model and deterministic logic. Persist `GraphSnapshot`; `GraphUiState` (selection and viewport) is session-only. `GraphState` still accepts the former top-level domain JSON shape, but deliberately skips transient fields when serialized. Call `validate`, `canonicalize_ids`, or `GraphState::from_snapshot` at trust boundaries. Create explicit caller-owned editor state with `cx.new(|cx| NodeGraph::new(graph, cx))`; `NodeGraph::try_new(graph, cx)` rejects invalid state.
+- `gpui-node-graph`: one generic `NodeGraph<T, N, P, C>` view and input adapter. `WorldNodeBodyRenderer` is the canonical affine world-space path: it authors an immutable world-unit display list without access to zoom/pan, GPUI projects the completed primitives at paint time, and pointer input is inverse-transformed before hit testing, dragging, resizing, marquee selection, or port gestures. It receives live connected/source/snap/compatibility state, and pane-space menus and measured overlays remain unscaled while semantic control anchors follow the projection. World text controls can register GPUI's real `InputHandler` for UTF-16 selection, composition/IME, marked text, and clipboard insertion. The older `NodeBodyRenderer` is a compatibility path for retained GPUI controls, but pinned GPUI has no arbitrary retained-subtree affine transform; consumers requiring zoom-stable parity should use the world display list. The adapter emits the core's single typed `GraphEvent` vocabulary directly. Measured geometry stays transient and node-relative, preserving strict snapshots. Dynamic-port removal uses dashed transient wire tombstones and can restore the original strict connection when the same stable port ID returns; controlled removal/restoration emits atomic mutations instead of taking model ownership.
 
 `EditorConfig::mutation_mode` makes ownership explicit. `Uncontrolled` commits move/resize/delete/group previews locally and emits compatibility events. `Controlled` rolls persistent previews back and emits one atomic `GraphEvent::MutationRequested` batch of `GraphMutation` operations for the host to reconcile. Selection and viewport remain transient editor state in either mode; connection creation always remains a request because generic consumer IDs cannot be synthesized safely by the view.
 - `examples/demo`: shared GPUI application with thin target-specific desktop/browser packaging. `gpui_platform::application()` selects the backend.
@@ -93,3 +103,7 @@ The evidence-backed Leptos parity audit and phased acceptance plan are in
 First-class Windows, macOS, Linux, and `wasm32-unknown-unknown` builds are checked in CI. The browser has exactly **one document-owned GPUI window**; Mullion composes every pane and workspace inside that root. `PlatformWindowService` is the only optional detached-window gateway: native builds may open an OS window, while wasm returns `DetachedWindowError::UnavailableInBrowser` without changing shared view code. Browser launch/HTML/COOP+COEP packaging is isolated in the demo host. Web GPUI uses shared memory, so production hosting **must** return `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on the document and assets. `Trunk.toml` supplies these locally and `_headers` is copied for Netlify/Cloudflare Pages; for other hosts configure the equivalent response headers (HTML `<meta>` tags are not sufficient). CI serves the production Trunk bundle with both isolation headers and executes it in Google Chrome on an isolated virtual display, asserting cross-origin isolation, successful Wasm startup, and creation of the shared GPUI canvas.
 
 Licensed under Apache-2.0.
+
+## Zed-style API
+
+The completed public UI ownership/action audit is in [`audits/zed-style-api-audit.md`](audits/zed-style-api-audit.md). `WorldSceneElement` is the named `RenderOnce` display-list builder; the graph itself is explicit caller-owned entity state implementing `Render`, `Focusable`, and typed `EventEmitter`.

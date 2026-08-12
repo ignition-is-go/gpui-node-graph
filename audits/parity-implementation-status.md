@@ -96,9 +96,16 @@ lifecycle refresh for static and dynamic ports in both mutation modes; measured/
 batch subway routing, semantic controls, overlays, groups, width reset, style helpers, and dangling
 stubs all have corresponding reference behavior. Styling now uses a required ambient GPUI global: `NodeGraphTheme` is the sole complete aggregate,
 leaf records remain `*Style`, and one immutable `Arc<NodeGraphTheme>` snapshot (with preserved
-pointer identity) is read once and shared across each root render.
+pointer identity) is read once and shared across each root render. As an intentional extension beyond the
+checked-in Leptos reference, selecting two or more nodes mounts an accessible pane-space alignment
+toolbar with align/distribute operations and inferred-grid Tidy. Tidy clusters independently on each
+axis, resolves overlaps with measured heights, and all operations use the same atomic controlled/
+uncontrolled movement semantics as dragging. The Rship scene workflow automapping rules are also
+integrated: selected columns pair by vertical rank with node-type fallback, otherwise the selected
+endpoint side fans by stable anchor key; disconnect mapping is symmetric and ranked previews render
+before the gesture.
 
-Final validation covers 111 workspace tests (74 GPUI, 9 demo, 28 core), Clippy with warnings denied,
+Final validation covers 126 workspace tests (84 GPUI unit, 5 GPUI API/architecture, 9 demo, 28 core), Clippy with warnings denied,
 WASM compilation, `git diff --check`, a sustained native Xvfb run, and the full scripted Chrome/WASM
 interaction trace. All four reference-golden comparisons passed their configured thresholds:
 initial MAE 0.4889, selected 0.4966, overlay 0.8242, and menu 1.4827.
