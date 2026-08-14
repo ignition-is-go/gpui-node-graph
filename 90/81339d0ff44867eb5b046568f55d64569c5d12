@@ -1,0 +1,8 @@
+¦ditem©dbodyyôReplace Zed Git `gpui`, `gpui_platform`, and `gpui_web` with an exact corrected crates.io `gpui-unofficial` package-family release.
+
+Scope and acceptance:
+- Refresh the workspace lock and CI backend package-name probes.
+- Resolve exactly one registry-backed GPUI identity and no Zed GPUI Git source.
+- Keep application text fonts consumer-owned through `NodeGraphTheme` proportional/monospace families. Apply the proportional family at the editor root and explicitly to custom world-scene text shaping; bundle no application text fonts.
+- Pass all native tests, strict Clippy, WASM checking, Trunk build, and browser smoke validation.
+- Wait for iamnbutler/gpui-unofficial#243 to be fixed and published; do not use a Git, path, or vendored GPUI workaround.gcreatedx2026-08-14T22:53:15.950995ZlcreatedByDevxtrevor.a.sargent@gmail.compcreatedByMachinegmalcolmbidx 4105b795725d4b48bdb513d8085b507bflabelsƒdgpuiimigrationdwasmhprioritybP1iprojectIdx ed9720e522054e49832e31d6e3a3cd14etitlex/Migrate node graph to crates.io gpui-unofficialjchangeTypecSEThitemTypedTaskicreatedAtx2026-08-14T22:53:15.951001Zbtxx$ae9ca859-0614-4d66-876c-953d15c65438hsourceIdgmalcolm
