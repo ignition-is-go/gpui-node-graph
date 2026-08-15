@@ -243,6 +243,11 @@ let lastSoftwareFrame = 0;
 async function shot() {
   await pause();
   if (softwareReadback) {
+    const targetStatus = await command("Runtime.evaluate", {
+      expression: `globalThis.__gpuiSoftwareSequence || 0`,
+      returnByValue: true,
+    });
+    const targetSequence = targetStatus.result?.value || 0;
     const until = Date.now() + 8_000;
     let matched = false;
     while (Date.now() < until) {
@@ -251,7 +256,7 @@ async function shot() {
         returnByValue: true,
       });
       const frame = status.result?.value || 0;
-      if (frame > lastSoftwareFrame) {
+      if (frame > lastSoftwareFrame && frame >= targetSequence) {
         lastSoftwareFrame = frame;
         matched = true;
         break;
