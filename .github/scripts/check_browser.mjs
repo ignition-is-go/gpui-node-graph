@@ -243,27 +243,22 @@ let lastSoftwareFrame = 0;
 async function shot() {
   await pause();
   if (softwareReadback) {
-    const targetStatus = await command("Runtime.evaluate", {
-      expression: `globalThis.__gpuiSoftwareSequence || 0`,
-      returnByValue: true,
-    });
-    const targetSequence = targetStatus.result?.value || 0;
     const until = Date.now() + 8_000;
     let matched = false;
     while (Date.now() < until) {
       const status = await command("Runtime.evaluate", {
-        expression: `globalThis.__gpuiSoftwareFrame || 0`,
+        expression: `[globalThis.__gpuiSoftwareFrame || 0, globalThis.__gpuiSoftwareSequence || 0]`,
         returnByValue: true,
       });
-      const frame = status.result?.value || 0;
-      if (frame > lastSoftwareFrame && frame >= targetSequence) {
+      const [frame, sequence] = status.result?.value || [0, 0];
+      if (frame > lastSoftwareFrame && frame === sequence) {
         lastSoftwareFrame = frame;
         matched = true;
         break;
       }
       await pause(50);
     }
-    if (!matched) throw new Error("software WebGPU readback did not complete a new frame");
+    if (!matched) throw new Error("software WebGPU readback did not reach the latest submitted frame");
   }
   if (process.env.NODE_GRAPH_X11_CAPTURE === "1") {
     const geometry = await command("Runtime.evaluate", {
