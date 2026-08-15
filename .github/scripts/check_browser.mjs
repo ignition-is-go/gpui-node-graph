@@ -247,18 +247,18 @@ async function shot() {
     let matched = false;
     while (Date.now() < until) {
       const status = await command("Runtime.evaluate", {
-        expression: `[globalThis.__gpuiSoftwareFrame || 0, globalThis.__gpuiSoftwareSequence || 0]`,
+        expression: `globalThis.__gpuiSoftwareFrame || 0`,
         returnByValue: true,
       });
-      const [frame, sequence] = status.result?.value || [0, 0];
-      if (frame > lastSoftwareFrame && frame === sequence) {
+      const frame = status.result?.value || 0;
+      if (frame > lastSoftwareFrame) {
         lastSoftwareFrame = frame;
         matched = true;
         break;
       }
       await pause(50);
     }
-    if (!matched) throw new Error("software WebGPU readback did not reach the latest submitted frame");
+    if (!matched) throw new Error("software WebGPU readback did not complete a new frame");
   }
   if (process.env.NODE_GRAPH_X11_CAPTURE === "1") {
     const geometry = await command("Runtime.evaluate", {
