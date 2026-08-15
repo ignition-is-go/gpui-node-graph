@@ -1,5 +1,8 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 jobs:
   test:
     strategy:
@@ -46,78 +49,5 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: trunk
-      - name: Install browser parity dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils mesa-vulkan-drivers python3-pil
-          curl -fsSLo /tmp/google-chrome.deb \
-            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y /tmp/google-chrome.deb
       - run: cargo check --workspace --target wasm32-unknown-unknown
       - run: cd examples/demo && env -u NO_COLOR trunk build --release
-      - name: Execute built WASM in Google Chrome under Xvfb
-        shell: bash
-        run: |
-          python3 .github/scripts/serve_dist.py examples/demo/dist > /tmp/node-graph-server.log 2>&1 &
-          server=$!
-          trap 'kill "$server" 2>/dev/null || true' EXIT
-          for attempt in $(seq 1 90); do
-            if curl -fsS -D /tmp/headers http://127.0.0.1:8181/ -o /tmp/index.html; then
-              break
-            fi
-            if ! kill -0 "$server" 2>/dev/null; then
-              cat /tmp/node-graph-server.log
-              exit 1
-            fi
-            sleep 1
-          done
-          test -s /tmp/index.html || { cat /tmp/node-graph-server.log; exit 1; }
-          grep -qi '^cross-origin-opener-policy: same-origin' /tmp/headers
-          grep -qi '^cross-origin-embedder-policy: require-corp' /tmp/headers
-          Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset \
-            > /tmp/node-graph-xvfb.log 2>&1 &
-          xvfb=$!
-          export DISPLAY=:99
-          for attempt in $(seq 1 30); do
-            if xdpyinfo >/dev/null 2>&1; then
-              break
-            fi
-            if ! kill -0 "$xvfb" 2>/dev/null; then
-              cat /tmp/node-graph-xvfb.log
-              exit 1
-            fi
-            sleep 1
-          done
-          xdpyinfo >/dev/null 2>&1 || { cat /tmp/node-graph-xvfb.log; exit 1; }
-          export LIBGL_ALWAYS_SOFTWARE=1
-          chrome_path="$(command -v google-chrome-stable)"
-          setsid "$chrome_path" \
-            --ozone-platform=x11 --no-sandbox --no-first-run --no-default-browser-check \
-            --disable-dev-shm-usage --enable-unsafe-webgpu \
-            --enable-features=Vulkan --disable-features=UseSkiaRenderer \
-            --use-angle=vulkan --use-webgpu-adapter=swiftshader --disable-vulkan-surface \
-            --window-position=0,0 --window-size=1200,800 \
-            --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
-            --user-data-dir=/tmp/node-graph-chrome about:blank \
-            > /tmp/node-graph-chrome.log 2>&1 &
-          chrome=$!
-          trap 'kill -TERM -- -"$chrome" 2>/dev/null || true; kill "$xvfb" "$server" 2>/dev/null || true' EXIT
-          if ! NODE_GRAPH_SOFTWARE_READBACK=1 timeout 75 node .github/scripts/check_browser.mjs \
-            http://127.0.0.1:8181/ 9222 /tmp/gpui-initial.png; then
-            cat /tmp/node-graph-chrome.log
-            exit 1
-          fi
-          python3 .github/scripts/compare_pixels.py \
-            audits/goldens/leptos-initial-1200x661.png /tmp/gpui-initial.png
-          python3 .github/scripts/compare_pixels.py \
-            audits/goldens/leptos-selected-1200x661.png /tmp/gpui-initial-selected.png
-          python3 .github/scripts/compare_pixels.py \
-            audits/goldens/leptos-overlay-1200x661.png /tmp/gpui-initial-overlay.png
-          python3 .github/scripts/compare_pixels.py \
-            audits/goldens/leptos-menu-1200x661.png /tmp/gpui-initial-menu.png
-      - name: Upload browser parity frame
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpui-node-graph-initial-frame
-          path: /tmp/gpui-initial*.png

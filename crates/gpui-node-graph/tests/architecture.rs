@@ -42,6 +42,7 @@ fn public_ui_api_has_no_pascal_functions_or_stateful_compatibility_layer() {
 fn rich_view_and_render_once_builder_are_declared_explicitly() {
     let source =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs")).unwrap();
+    let source = source.replace("\r\n", "\n");
     assert!(source.contains("> gpui::Focusable\n    for NodeGraph"));
     assert!(source.contains("impl gpui::RenderOnce for WorldSceneElement"));
     assert!(source.contains(
