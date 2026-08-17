@@ -10,7 +10,7 @@ use gpui::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     hash::{Hash, Hasher},
     ops::Range,
     rc::Rc,
@@ -76,6 +76,156 @@ pub mod actions {
     );
 }
 
+/// Semantic command installed by one of the node graph's default shortcuts.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum NodeGraphCommand {
+    DeleteSelection,
+    SelectAll,
+    CycleRouting,
+    FitView,
+    Cancel,
+    CopySelection,
+    Paste,
+    Undo,
+    Redo,
+    GroupSelection,
+    UngroupSelection,
+}
+
+impl NodeGraphCommand {
+    /// Stable identity for settings, command catalogs, and telemetry.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::DeleteSelection => "node-graph.delete-selection",
+            Self::SelectAll => "node-graph.select-all",
+            Self::CycleRouting => "node-graph.cycle-routing",
+            Self::FitView => "node-graph.fit-view",
+            Self::Cancel => "node-graph.cancel",
+            Self::CopySelection => "node-graph.copy-selection",
+            Self::Paste => "node-graph.paste",
+            Self::Undo => "node-graph.undo",
+            Self::Redo => "node-graph.redo",
+            Self::GroupSelection => "node-graph.group-selection",
+            Self::UngroupSelection => "node-graph.ungroup-selection",
+        }
+    }
+
+    /// Concise user-facing label for shortcut and command-palette surfaces.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DeleteSelection => "Delete selection",
+            Self::SelectAll => "Select all nodes",
+            Self::CycleRouting => "Cycle connection routing",
+            Self::FitView => "Fit graph to view",
+            Self::Cancel => "Cancel graph interaction",
+            Self::CopySelection => "Copy selection",
+            Self::Paste => "Paste nodes",
+            Self::Undo => "Undo graph edit",
+            Self::Redo => "Redo graph edit",
+            Self::GroupSelection => "Group selection",
+            Self::UngroupSelection => "Ungroup selection",
+        }
+    }
+
+    /// User-facing section shared by shortcut reference surfaces.
+    pub const fn group(self) -> &'static str {
+        "Node graph"
+    }
+}
+
+/// Metadata for one key sequence installed by [`init`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeGraphShortcut {
+    pub sequence: &'static str,
+    pub command: NodeGraphCommand,
+}
+
+const NODE_GRAPH_KEY_CONTEXT: &str = "NodeGraph";
+
+const DEFAULT_SHORTCUTS: &[NodeGraphShortcut] = &[
+    NodeGraphShortcut {
+        sequence: "delete",
+        command: NodeGraphCommand::DeleteSelection,
+    },
+    NodeGraphShortcut {
+        sequence: "backspace",
+        command: NodeGraphCommand::DeleteSelection,
+    },
+    NodeGraphShortcut {
+        sequence: "ctrl-a",
+        command: NodeGraphCommand::SelectAll,
+    },
+    NodeGraphShortcut {
+        sequence: "cmd-a",
+        command: NodeGraphCommand::SelectAll,
+    },
+    NodeGraphShortcut {
+        sequence: "r",
+        command: NodeGraphCommand::CycleRouting,
+    },
+    NodeGraphShortcut {
+        sequence: "f",
+        command: NodeGraphCommand::FitView,
+    },
+    NodeGraphShortcut {
+        sequence: "escape",
+        command: NodeGraphCommand::Cancel,
+    },
+    NodeGraphShortcut {
+        sequence: "ctrl-c",
+        command: NodeGraphCommand::CopySelection,
+    },
+    NodeGraphShortcut {
+        sequence: "cmd-c",
+        command: NodeGraphCommand::CopySelection,
+    },
+    NodeGraphShortcut {
+        sequence: "ctrl-v",
+        command: NodeGraphCommand::Paste,
+    },
+    NodeGraphShortcut {
+        sequence: "cmd-v",
+        command: NodeGraphCommand::Paste,
+    },
+    NodeGraphShortcut {
+        sequence: "ctrl-z",
+        command: NodeGraphCommand::Undo,
+    },
+    NodeGraphShortcut {
+        sequence: "cmd-z",
+        command: NodeGraphCommand::Undo,
+    },
+    NodeGraphShortcut {
+        sequence: "ctrl-shift-z",
+        command: NodeGraphCommand::Redo,
+    },
+    NodeGraphShortcut {
+        sequence: "cmd-shift-z",
+        command: NodeGraphCommand::Redo,
+    },
+    NodeGraphShortcut {
+        sequence: "ctrl-g",
+        command: NodeGraphCommand::GroupSelection,
+    },
+    NodeGraphShortcut {
+        sequence: "cmd-g",
+        command: NodeGraphCommand::GroupSelection,
+    },
+    NodeGraphShortcut {
+        sequence: "ctrl-shift-g",
+        command: NodeGraphCommand::UngroupSelection,
+    },
+    NodeGraphShortcut {
+        sequence: "cmd-shift-g",
+        command: NodeGraphCommand::UngroupSelection,
+    },
+];
+
+/// The exact shortcut metadata consumed by [`init`].
+pub const fn default_shortcuts() -> &'static [NodeGraphShortcut] {
+    DEFAULT_SHORTCUTS
+}
+
 /// Install the node graph's namespaced default keyboard actions.
 ///
 /// This is intentionally separate from theme installation: host applications can install a theme
@@ -83,27 +233,46 @@ pub mod actions {
 pub fn init(cx: &mut App) {
     use actions::*;
     use gpui::KeyBinding;
-    cx.bind_keys([
-        KeyBinding::new("delete", DeleteSelection, Some("NodeGraph")),
-        KeyBinding::new("backspace", DeleteSelection, Some("NodeGraph")),
-        KeyBinding::new("ctrl-a", SelectAll, Some("NodeGraph")),
-        KeyBinding::new("cmd-a", SelectAll, Some("NodeGraph")),
-        KeyBinding::new("r", CycleRouting, Some("NodeGraph")),
-        KeyBinding::new("f", FitView, Some("NodeGraph")),
-        KeyBinding::new("escape", Cancel, Some("NodeGraph")),
-        KeyBinding::new("ctrl-c", CopySelection, Some("NodeGraph")),
-        KeyBinding::new("cmd-c", CopySelection, Some("NodeGraph")),
-        KeyBinding::new("ctrl-v", Paste, Some("NodeGraph")),
-        KeyBinding::new("cmd-v", Paste, Some("NodeGraph")),
-        KeyBinding::new("ctrl-z", Undo, Some("NodeGraph")),
-        KeyBinding::new("cmd-z", Undo, Some("NodeGraph")),
-        KeyBinding::new("ctrl-shift-z", Redo, Some("NodeGraph")),
-        KeyBinding::new("cmd-shift-z", Redo, Some("NodeGraph")),
-        KeyBinding::new("ctrl-g", GroupSelection, Some("NodeGraph")),
-        KeyBinding::new("cmd-g", GroupSelection, Some("NodeGraph")),
-        KeyBinding::new("ctrl-shift-g", UngroupSelection, Some("NodeGraph")),
-        KeyBinding::new("cmd-shift-g", UngroupSelection, Some("NodeGraph")),
-    ]);
+    for shortcut in default_shortcuts() {
+        let context = Some(NODE_GRAPH_KEY_CONTEXT);
+        match shortcut.command {
+            NodeGraphCommand::DeleteSelection => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, DeleteSelection, context)])
+            }
+            NodeGraphCommand::SelectAll => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, SelectAll, context)])
+            }
+            NodeGraphCommand::CycleRouting => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, CycleRouting, context)])
+            }
+            NodeGraphCommand::FitView => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, FitView, context)])
+            }
+            NodeGraphCommand::Cancel => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, Cancel, context)])
+            }
+            NodeGraphCommand::CopySelection => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, CopySelection, context)])
+            }
+            NodeGraphCommand::Paste => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, Paste, context)])
+            }
+            NodeGraphCommand::Undo => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, Undo, context)])
+            }
+            NodeGraphCommand::Redo => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, Redo, context)])
+            }
+            NodeGraphCommand::GroupSelection => {
+                cx.bind_keys([KeyBinding::new(shortcut.sequence, GroupSelection, context)])
+            }
+            NodeGraphCommand::UngroupSelection => cx.bind_keys([KeyBinding::new(
+                shortcut.sequence,
+                UngroupSelection,
+                context,
+            )]),
+        }
+    }
 }
 
 /// Typed payload for a node dragged from consumer-owned chrome into an editor.
@@ -115,13 +284,22 @@ pub fn init(cx: &mut App) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeDrop {
     pub item_id: String,
+    pub initial_values: BTreeMap<String, String>,
 }
 
 impl NodeDrop {
     pub fn new(item_id: impl Into<String>) -> Self {
         Self {
             item_id: item_id.into(),
+            initial_values: BTreeMap::new(),
         }
+    }
+
+    /// Attach one opaque consumer-owned initial value to the node request.
+    #[must_use]
+    pub fn with_initial_value(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.initial_values.insert(key.into(), value.into());
+        self
     }
 }
 
@@ -129,6 +307,11 @@ impl NodeDrop {
 #[derive(Clone)]
 pub enum AnchorMenuAction {
     RemoveConnections,
+    /// Remove the single live connection associated with this generated menu row.
+    ///
+    /// This action is populated by the graph's built-in anchor menu. Consumer-built
+    /// menus should use [`AnchorMenuItem::action`] for custom behavior.
+    RemoveConnection,
     RemoveBrokenConnections,
     Custom(Rc<dyn Fn()>),
 }
@@ -137,6 +320,7 @@ impl std::fmt::Debug for AnchorMenuAction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RemoveConnections => formatter.write_str("RemoveConnections"),
+            Self::RemoveConnection => formatter.write_str("RemoveConnection"),
             Self::RemoveBrokenConnections => formatter.write_str("RemoveBrokenConnections"),
             Self::Custom(_) => formatter.write_str("Custom(..)"),
         }
@@ -176,10 +360,11 @@ impl<P: core::PortId> AnchorMenuBuilder<P> {
 }
 
 #[derive(Clone, Debug)]
-struct ActiveAnchorMenu<P> {
+struct ActiveAnchorMenu<P, C> {
     port: P,
     position: core::Point,
     items: Vec<AnchorMenuItem>,
+    connection_ids: Vec<Option<C>>,
 }
 
 /// Consumer-side bridge to a retained [`NodeGraph`] entity.
@@ -239,15 +424,58 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
             .unwrap_or(false)
     }
 
-    /// Turn a typed cross-pane drop into the same `CreateNode` request used by the
-    /// built-in catalog. Returns false before layout or for an unknown catalog item.
-    pub fn drop_node(&self, payload: &NodeDrop, client: core::Point, cx: &mut App) -> bool {
+    /// Center a world-space point in the laid-out canvas while preserving zoom.
+    pub fn center_world_point(&self, point: core::Point, cx: &mut App) -> bool {
         self.editor
             .update(cx, |editor, cx| {
-                editor.request_create_node_at_client(&payload.item_id, client, cx)
+                let bounds = editor.canvas_bounds.get();
+                let size = core::Size {
+                    width: f32::from(bounds.size.width),
+                    height: f32::from(bounds.size.height),
+                };
+                if size.width <= 0.0 || size.height <= 0.0 {
+                    return false;
+                }
+                editor.set_external_viewport(editor.graph.viewport.centered_on(point, size), cx)
             })
             .unwrap_or(false)
     }
+
+    /// Replace the live node selection and emit the same typed selection event as a
+    /// pointer or keyboard gesture. Returns false after release or for a no-op update.
+    pub fn select_nodes(&self, nodes: impl IntoIterator<Item = N>, cx: &mut App) -> bool {
+        let selected_nodes = nodes.into_iter().collect::<HashSet<_>>();
+        self.editor
+            .update(cx, |editor, cx| {
+                if editor.graph.selected_nodes == selected_nodes {
+                    return false;
+                }
+                editor.graph.selected_nodes = selected_nodes;
+                editor.emit_selection(cx);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Turn a typed cross-pane drop into the same `CreateNode` request used by the
+    /// built-in catalog. Returns false before layout. The payload is explicitly
+    /// consumer-owned, so its node type need not be visible in the built-in catalog.
+    pub fn drop_node(&self, payload: &NodeDrop, client: core::Point, cx: &mut App) -> bool {
+        self.editor
+            .update(cx, |editor, cx| {
+                editor.request_create_node_at_client(
+                    &payload.item_id,
+                    payload.initial_values.clone(),
+                    client,
+                    cx,
+                )
+            })
+            .unwrap_or(false)
+    }
+}
+
+fn node_paint_rank(background_node_types: &HashSet<String>, node_type: &str) -> u8 {
+    u8::from(!background_node_types.contains(node_type))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -454,6 +682,10 @@ pub struct WorldNodeVisualState {
 
 pub struct NodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> {
     pub node: Node<N>,
+    /// Catalog category associated with the node type, when available.
+    pub category: Option<SharedString>,
+    /// Catalog/category accent associated with the node type, when available.
+    pub category_color: Option<style::Color>,
     pub ports: Arc<[Port<N, P, T>]>,
     pub port_states: Arc<HashMap<P, WorldPortVisualState>>,
     pub port_presentations: Arc<HashMap<P, AnchorPresentation>>,
@@ -684,6 +916,57 @@ where
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<NodeOverlay> {
+        self(context, window, cx)
+    }
+}
+
+/// Unscaled pane-space content anchored to a graph/world-space point.
+pub struct WorldOverlay {
+    pub position: core::Point,
+    pub screen_offset: core::Point,
+    pub element: AnyElement,
+}
+
+impl WorldOverlay {
+    pub fn new(position: core::Point, element: impl IntoElement) -> Self {
+        Self {
+            position,
+            screen_offset: core::Point::new(0.0, 0.0),
+            element: element.into_any_element(),
+        }
+    }
+
+    pub fn with_screen_offset(mut self, offset: core::Point) -> Self {
+        self.screen_offset = offset;
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct WorldOverlayContext {
+    pub viewport: core::Viewport,
+    pub theme: Arc<NodeGraphTheme>,
+}
+
+pub trait WorldOverlayRenderer: 'static {
+    fn render_world_overlays(
+        &mut self,
+        context: WorldOverlayContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<WorldOverlay>;
+}
+
+impl<F> WorldOverlayRenderer for F
+where
+    F: FnMut(WorldOverlayContext, &mut Window, &mut App) -> Vec<WorldOverlay> + 'static,
+{
+    fn render_world_overlays(
+        &mut self,
+        context: WorldOverlayContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<WorldOverlay> {
         self(context, window, cx)
     }
 }
@@ -1160,7 +1443,46 @@ pub struct GraphGroup<N: Eq + std::hash::Hash> {
     /// Optional per-group RGBA override; `None` uses [`style::GroupStyle::default_color`].
     pub color: Option<style::Color>,
     pub error: bool,
+    /// Whether the default header exposes label, layout, selection, color, and removal controls.
+    pub editable: bool,
     pub nodes: HashSet<N>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupControl {
+    Arrange,
+    SelectAll,
+    Ungroup,
+    Color,
+}
+
+impl GroupControl {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Arrange => "arrange",
+            Self::SelectAll => "select-all",
+            Self::Ungroup => "ungroup",
+            Self::Color => "color",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Arrange => "Auto-layout",
+            Self::SelectAll => "Select all in group",
+            Self::Ungroup => "Ungroup",
+            Self::Color => "Group color",
+        }
+    }
+
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::Arrange => "✦",
+            Self::SelectAll => "▣",
+            Self::Ungroup => "×",
+            Self::Color => "",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1204,6 +1526,13 @@ struct NodeDrag<N> {
     starts: Vec<(N, core::Point)>,
     moved: bool,
     alter_groups: bool,
+}
+
+#[derive(Clone)]
+struct MiddlePress<N> {
+    origin: core::Point,
+    node: Option<N>,
+    moved: bool,
 }
 
 #[derive(Clone)]
@@ -1735,7 +2064,9 @@ pub struct NodeGraph<
     drag: Option<NodeDrag<N>>,
     resize: Option<ResizeDrag<N, P>>,
     panning: Option<core::Point>,
+    middle_press: Option<MiddlePress<N>>,
     last_pointer_screen: Option<core::Point>,
+    hovered_node: Option<N>,
     hovered_port: Option<P>,
     port_presentations: HashMap<P, AnchorPresentation>,
     port_match_key: Option<PortMatchKey<T, N, P>>,
@@ -1747,11 +2078,12 @@ pub struct NodeGraph<
     node_type_registry_error: Option<RegistryError>,
     catalog_menu: Option<CatalogMenu<P>>,
     anchor_menu_builder: Option<AnchorMenuBuilder<P>>,
-    anchor_menu: Option<ActiveAnchorMenu<P>>,
+    anchor_menu: Option<ActiveAnchorMenu<P, C>>,
     catalog_scroll_handle: ScrollHandle,
     node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
     world_node_body_renderer: Option<Box<dyn WorldNodeBodyRenderer<T, N, P>>>,
     node_overlay_renderer: Option<Box<dyn NodeOverlayRenderer<T, N, P>>>,
+    world_overlay_renderer: Option<Box<dyn WorldOverlayRenderer>>,
     group_header_renderer: Option<Box<dyn GroupHeaderRenderer<N>>>,
     world_scene: world::WorldScene,
     world_control_owners: HashMap<String, N>,
@@ -1759,7 +2091,10 @@ pub struct NodeGraph<
     last_world_control: Option<(N, String)>,
     world_text_input: Option<(N, String, WorldTextInputState)>,
     groups: Vec<GraphGroup<N>>,
+    group_palette: Vec<u32>,
+    open_group_palette: Option<String>,
     auto_width_nodes: HashSet<N>,
+    background_node_types: HashSet<String>,
     render_geometry: RenderGeometry<N, P>,
     dangling_connections: Vec<DanglingConnection<P, C>>,
     dismissed_overlays: HashSet<String>,
@@ -1825,7 +2160,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             drag: None,
             resize: None,
             panning: None,
+            middle_press: None,
             last_pointer_screen: None,
+            hovered_node: None,
             hovered_port: None,
             port_presentations: HashMap::new(),
             port_match_key: None,
@@ -1842,6 +2179,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             node_body_renderer: None,
             world_node_body_renderer: None,
             node_overlay_renderer: None,
+            world_overlay_renderer: None,
             group_header_renderer: None,
             world_scene: world::WorldScene::new(),
             world_control_owners: HashMap::new(),
@@ -1849,7 +2187,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             last_world_control: None,
             world_text_input: None,
             groups: Vec::new(),
+            group_palette: Vec::new(),
+            open_group_palette: None,
             auto_width_nodes: HashSet::new(),
+            background_node_types: HashSet::new(),
             render_geometry: RenderGeometry::default(),
             dangling_connections: Vec::new(),
             dismissed_overlays: HashSet::new(),
@@ -1982,36 +2323,98 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     pub fn anchor_menu_items(&self, port_id: &P) -> Vec<AnchorMenuItem> {
+        self.anchor_menu_entries(port_id)
+            .into_iter()
+            .map(|(item, _)| item)
+            .collect()
+    }
+
+    fn anchor_menu_entries(&self, port_id: &P) -> Vec<(AnchorMenuItem, Option<C>)> {
         let Some(port) = self.graph.ports.get(port_id) else {
             return Vec::new();
         };
         if let Some(builder) = &self.anchor_menu_builder {
-            return builder.build(port_id, port.direction);
+            return builder
+                .build(port_id, port.direction)
+                .into_iter()
+                .map(|item| (item, None))
+                .collect();
         }
-        let has_connections =
-            self.graph
-                .connections
-                .values()
-                .any(|connection| connection.source == *port_id || connection.target == *port_id)
-                || self.dangling_connections.iter().any(|connection| {
-                    connection.source == *port_id || connection.target == *port_id
-                });
+        let mut live = self
+            .graph
+            .connections
+            .values()
+            .filter(|connection| connection.source == *port_id || connection.target == *port_id)
+            .map(|connection| {
+                let far_port_id = if connection.source == *port_id {
+                    &connection.target
+                } else {
+                    &connection.source
+                };
+                let far_port = self.graph.ports.get(far_port_id);
+                let far_node = far_port.and_then(|far_port| self.graph.nodes.get(&far_port.node));
+                let node_label = far_node
+                    .map(|node| node.title.as_str())
+                    .filter(|title| !title.is_empty())
+                    .map_or_else(|| format!("{:?}", far_port_id), ToOwned::to_owned);
+                let anchor_label = far_port
+                    .map(|far_port| far_port.label.as_str())
+                    .filter(|label| !label.is_empty())
+                    .map_or_else(|| format!("{:?}", far_port_id), ToOwned::to_owned);
+                let relation = if port.direction == PortDirection::Input {
+                    "from"
+                } else {
+                    "to"
+                };
+                (
+                    format!("Disconnect {relation} {node_label} \u{2192} {anchor_label}"),
+                    connection.id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        live.sort_by(|(left_label, left_id), (right_label, right_id)| {
+            left_label
+                .cmp(right_label)
+                .then_with(|| stable_hash(left_id).cmp(&stable_hash(right_id)))
+        });
         let has_broken = self
             .dangling_connections
             .iter()
             .any(|connection| connection.source == *port_id || connection.target == *port_id);
-        vec![
+        if live.is_empty() && !has_broken {
+            return Vec::new();
+        }
+        let mut items = vec![(
             AnchorMenuItem {
-                label: "Remove connections".into(),
+                label: "Disconnect all".into(),
                 action: AnchorMenuAction::RemoveConnections,
-                enabled: has_connections,
+                enabled: true,
             },
-            AnchorMenuItem {
-                label: "Remove broken connections".into(),
-                action: AnchorMenuAction::RemoveBrokenConnections,
-                enabled: has_broken,
-            },
-        ]
+            None,
+        )];
+        if live.len() > 1 {
+            items.extend(live.into_iter().map(|(label, connection_id)| {
+                (
+                    AnchorMenuItem {
+                        label,
+                        action: AnchorMenuAction::RemoveConnection,
+                        enabled: true,
+                    },
+                    Some(connection_id),
+                )
+            }));
+        }
+        if has_broken {
+            items.push((
+                AnchorMenuItem {
+                    label: "Remove broken connections".into(),
+                    action: AnchorMenuAction::RemoveBrokenConnections,
+                    enabled: true,
+                },
+                None,
+            ));
+        }
+        items
     }
 
     pub fn with_catalog(mut self, catalog: Vec<NodeCatalogItem<T>>) -> Self {
@@ -2285,6 +2688,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self
     }
 
+    pub fn with_world_overlay_renderer(mut self, renderer: impl WorldOverlayRenderer) -> Self {
+        self.world_overlay_renderer = Some(Box::new(renderer));
+        self
+    }
+
     pub fn with_group_header_renderer(mut self, renderer: impl GroupHeaderRenderer<N>) -> Self {
         self.group_header_renderer = Some(Box::new(renderer));
         self
@@ -2349,8 +2757,37 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self
     }
 
+    /// Render matching node shells before the connection layer. This preserves
+    /// annotation/comment surfaces that act as graph backgrounds while retaining
+    /// their normal node gestures and measured bodies.
+    pub fn with_background_node_types(
+        mut self,
+        node_types: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.background_node_types = node_types.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Configure the RGB choices exposed by editable group headers.
+    pub fn with_group_palette(mut self, colors: impl IntoIterator<Item = u32>) -> Self {
+        self.group_palette = colors
+            .into_iter()
+            .map(|color| color & 0x00ff_ffff)
+            .collect();
+        self.group_palette.dedup();
+        self
+    }
+
     pub fn set_groups(&mut self, groups: Vec<GraphGroup<N>>, cx: &mut Context<Self>) {
         self.groups = groups;
+        if self.open_group_palette.as_ref().is_some_and(|id| {
+            !self
+                .groups
+                .iter()
+                .any(|group| &group.id == id && group.editable)
+        }) {
+            self.open_group_palette = None;
+        }
         self.group_errors
             .retain(|id| self.groups.iter().any(|group| &group.id == id));
         cx.notify();
@@ -2358,6 +2795,82 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     pub fn groups(&self) -> &[GraphGroup<N>] {
         &self.groups
+    }
+
+    fn editable_group(&self, group_id: &str) -> Option<&GraphGroup<N>> {
+        self.groups
+            .iter()
+            .find(|group| group.id == group_id && group.editable)
+    }
+
+    fn request_group_arrange(&self, group_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(group) = self.editable_group(group_id) else {
+            return false;
+        };
+        let mut node_ids = group.nodes.iter().cloned().collect::<Vec<_>>();
+        node_ids.sort_by_cached_key(|id| format!("{id:?}"));
+        cx.emit(core::GraphEvent::GroupArrangeRequested {
+            group_id: group.id.clone(),
+            node_ids,
+        });
+        true
+    }
+
+    fn select_group_nodes(&mut self, group_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(group) = self.editable_group(group_id) else {
+            return false;
+        };
+        self.graph.selected_nodes = group
+            .nodes
+            .iter()
+            .filter(|id| self.graph.nodes.contains_key(*id))
+            .cloned()
+            .collect();
+        self.graph.selected_connections.clear();
+        self.emit_selection(cx);
+        cx.notify();
+        true
+    }
+
+    fn request_group_removal(&self, group_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(group) = self.editable_group(group_id) else {
+            return false;
+        };
+        cx.emit(core::GraphEvent::GroupsRemoved {
+            group_ids: vec![group.id.clone()],
+        });
+        true
+    }
+
+    fn toggle_group_palette(&mut self, group_id: &str, cx: &mut Context<Self>) -> bool {
+        if self.group_palette.is_empty() || self.editable_group(group_id).is_none() {
+            return false;
+        }
+        if self.open_group_palette.as_deref() == Some(group_id) {
+            self.open_group_palette = None;
+        } else {
+            self.open_group_palette = Some(group_id.to_owned());
+        }
+        cx.notify();
+        true
+    }
+
+    fn request_group_color(&mut self, group_id: &str, color: u32, cx: &mut Context<Self>) -> bool {
+        let color = color & 0x00ff_ffff;
+        let Some(group) = self.editable_group(group_id) else {
+            return false;
+        };
+        if !self.group_palette.contains(&color) {
+            return false;
+        }
+        let group_id = group.id.clone();
+        self.open_group_palette = None;
+        cx.emit(core::GraphEvent::GroupColorChanged {
+            group_id,
+            rgb: color,
+        });
+        cx.notify();
+        true
     }
 
     /// Mark a group as erroneous without changing the existing `GraphGroup` data API.
@@ -2568,25 +3081,24 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
-    /// Emit a catalog-backed create request at a window/client position.
+    /// Emit a consumer-owned create request at a window/client position.
     ///
     /// This deliberately does not mutate graph state: it matches `choose_catalog`,
     /// leaving node ownership and ID allocation with the consumer.
     pub fn request_create_node_at_client(
         &mut self,
         item_id: &str,
+        initial_values: BTreeMap<String, String>,
         client: core::Point,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.catalog.iter().any(|item| item.id == item_id) {
-            return false;
-        }
         let Some(position) = self.client_to_canvas(client) else {
             return false;
         };
         cx.emit(core::GraphEvent::CreateNode {
             item_id: item_id.to_owned(),
             position,
+            initial_values,
             connect_from: None,
             connect_to: None,
             connect_direction: None,
@@ -3267,6 +3779,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         Some(core::GraphEvent::CreateNode {
             item_id: item.id.clone(),
             position: menu.anchor_world,
+            initial_values: BTreeMap::new(),
             connect_from: menu.connect_from.clone(),
             connect_to,
             connect_direction,
@@ -3451,6 +3964,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             }
         }
         self.panning = None;
+        self.middle_press = None;
         self.draft = None;
         self.box_selection = None;
     }
@@ -3533,6 +4047,34 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .contains(world)
             .then(|| node.id.clone())
         })
+    }
+
+    fn begin_middle_gesture(&mut self, local: core::Point) {
+        self.middle_press = Some(MiddlePress {
+            origin: local,
+            node: self.node_at_screen(local),
+            moved: false,
+        });
+        self.panning = None;
+    }
+
+    fn finish_middle_gesture(&mut self, local: core::Point, cx: &mut Context<Self>) {
+        let press = self.middle_press.take();
+        self.panning = None;
+        let Some(press) = press else {
+            return;
+        };
+        if !press.moved
+            && let Some(node) = press.node
+            && self.node_at_screen(local).as_ref() == Some(&node)
+        {
+            cx.emit(core::GraphEvent::NodeMiddleClicked { node });
+        }
+    }
+
+    fn cancel_middle_gesture(&mut self) {
+        self.middle_press = None;
+        self.panning = None;
     }
 
     fn reset_node_width(&mut self, id: &N, theme: &NodeGraphTheme, cx: &mut Context<Self>) {
@@ -4373,7 +4915,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn detach_node_from_groups_for_alt_drag(&mut self, node_id: &N, cx: &mut Context<Self>) {
         let mut changes = Vec::new();
-        for group in &mut self.groups {
+        for group in self.groups.iter_mut().filter(|group| group.editable) {
             if group.nodes.contains(node_id) {
                 let mut node_ids: Vec<_> = group
                     .nodes
@@ -4417,7 +4959,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let dragged_set: HashSet<_> = dragged.iter().cloned().collect();
         let mut changes = Vec::new();
         let mut assigned_group = false;
-        for group in &mut self.groups {
+        for group in self.groups.iter_mut().filter(|group| group.editable) {
             let mut members = group
                 .nodes
                 .iter()
@@ -4506,11 +5048,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn open_anchor_menu(&mut self, port_id: P, position: core::Point, cx: &mut Context<Self>) {
         self.commit_group_editor(cx);
-        let items = self.anchor_menu_items(&port_id);
+        let entries = self.anchor_menu_entries(&port_id);
+        let (items, connection_ids): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         self.anchor_menu = (!items.is_empty()).then_some(ActiveAnchorMenu {
             port: port_id,
             position,
             items,
+            connection_ids,
         });
         self.catalog_menu = None;
         cx.notify();
@@ -4524,16 +5068,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             cx.notify();
             return;
         };
-        let broken_only = match item.action {
+        let broken_only = matches!(&item.action, AnchorMenuAction::RemoveBrokenConnections);
+        let specific_connection = match item.action {
             AnchorMenuAction::Custom(callback) => {
                 callback();
                 cx.notify();
                 return;
             }
-            AnchorMenuAction::RemoveConnections => false,
-            AnchorMenuAction::RemoveBrokenConnections => true,
+            AnchorMenuAction::RemoveConnection => {
+                menu.connection_ids.get(index).and_then(Clone::clone)
+            }
+            AnchorMenuAction::RemoveConnections | AnchorMenuAction::RemoveBrokenConnections => None,
         };
-        let mut strict_ids: Vec<C> = if broken_only {
+        let mut strict_ids: Vec<C> = if let Some(id) = specific_connection {
+            vec![id]
+        } else if broken_only {
             Vec::new()
         } else {
             self.graph
@@ -4693,6 +5242,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 baseline_connections,
             });
         }
+        cx.emit(core::GraphEvent::SelectionBoxChanged {
+            region: self.box_selection.as_ref().map(BoxSelection::rect),
+        });
         if before
             != (
                 self.graph.selected_nodes.clone(),
@@ -4711,6 +5263,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx: &mut Context<Self>,
     ) {
         self.last_pointer_screen = Some(local);
+        cx.emit(core::GraphEvent::PointerMoved {
+            position: self.graph.viewport.screen_to_world(local),
+        });
+        let hovered_node = self.node_at_screen(local);
+        if self.hovered_node != hovered_node {
+            self.hovered_node = hovered_node.clone();
+            cx.emit(core::GraphEvent::NodeHoverChanged { node: hovered_node });
+        }
         let hovered_port = self.port_at_screen(
             local,
             self.graph
@@ -4722,6 +5282,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
         // Hover changes group and anchor semantics even when no drag is active.
         cx.notify();
+        if let Some(press) = self.middle_press.as_mut()
+            && !press.moved
+            && press.origin.distance(local) > 4.0
+        {
+            press.moved = true;
+            self.panning = Some(press.origin);
+        }
         if let Some(previous) = self.panning.as_mut() {
             let old = *previous;
             *previous = local;
@@ -4778,6 +5345,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             )
         });
         if let Some((rect, baseline_nodes, baseline_connections)) = selection_state {
+            cx.emit(core::GraphEvent::SelectionBoxChanged { region: Some(rect) });
             let mut nodes = self.nodes_in_render_rect(rect);
             nodes.extend(baseline_nodes);
             let before = self.graph.selected_nodes.clone();
@@ -4863,7 +5431,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 }
             }
         }
-        self.box_selection = None;
+        if self.box_selection.take().is_some() {
+            cx.emit(core::GraphEvent::SelectionBoxChanged { region: None });
+        }
         if was_panning {
             return;
         }
@@ -4886,10 +5456,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .groups
             .iter()
             .filter(|group| {
-                group
-                    .nodes
-                    .iter()
-                    .any(|id| self.graph.selected_nodes.contains(id))
+                group.editable
+                    && group
+                        .nodes
+                        .iter()
+                        .any(|id| self.graph.selected_nodes.contains(id))
             })
             .map(|group| group.id.clone())
             .collect();
@@ -4901,6 +5472,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let Some(editor) = self.group_editor.take() else {
             return;
         };
+        if !self
+            .groups
+            .iter()
+            .any(|group| group.id == editor.id && group.editable)
+        {
+            return;
+        }
         let label = editor.query.text.trim();
         if label.is_empty() {
             return;
@@ -6050,6 +6628,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
 
         let mut group_labels = Vec::new();
+        let mut group_controls = Vec::new();
         let mut custom_group_headers = Vec::new();
         let render_groups = self.groups.clone();
         for group in &render_groups {
@@ -6154,24 +6733,38 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     cx,
                 );
                 custom_group_headers.push((origin, width, height, element));
-            } else if let Some(group_label) = group_label {
-                group_labels.push((origin, group.id.clone(), group_label, label_color, is_error));
+            } else {
+                if let Some(group_label) = group_label {
+                    group_labels.push((
+                        origin,
+                        group.id.clone(),
+                        group_label,
+                        label_color,
+                        is_error,
+                        group.editable,
+                    ));
+                }
+                if group.editable {
+                    group_controls.push((origin, width, height, group.clone(), color));
+                }
             }
         }
-        root = root.child(wire_layer);
+        let mut wire_layer = Some(wire_layer);
+        let mut above_wire = Vec::<AnyElement>::new();
         for (origin, width, height, header) in custom_group_headers {
-            root = root.child(
+            above_wire.push(
                 div()
                     .absolute()
                     .left(px(origin.x))
                     .top(px(origin.y))
                     .w(px(width))
                     .h(px(height))
-                    .child(header),
+                    .child(header)
+                    .into_any_element(),
             );
         }
         for marker in dangling_markers {
-            root = root.child(
+            above_wire.push(
                 div()
                     .absolute()
                     .left(px(marker.x - 3.0))
@@ -6179,15 +6772,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .text_size(px(11.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(dangling_color)
-                    .child("?"),
+                    .child("?")
+                    .into_any_element(),
             );
         }
-        for (origin, group_id, label, color, _is_error) in group_labels {
+        for (origin, group_id, label, color, _is_error, editable) in group_labels {
             let editing = self
                 .group_editor
                 .as_ref()
                 .is_some_and(|editor| editor.id == group_id);
-            root = root.child(
+            above_wire.push(
                 div()
                     .absolute()
                     .left(px(origin.x + viewport.scale_length(theme.group.label_left)))
@@ -6209,7 +6803,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 window.prevent_default();
                                 return;
                             }
-                            if event.click_count >= 2
+                            if editable
+                                && event.click_count >= 2
                                 && let Some(group) =
                                     this.groups.iter().find(|group| group.id == group_id)
                             {
@@ -6224,8 +6819,127 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 window.prevent_default();
                             }
                         }),
-                    ),
+                    )
+                    .into_any_element(),
             );
+        }
+
+        for (origin, width, height, group, color) in group_controls {
+            let control = |kind: GroupControl| {
+                div()
+                    .id(format!("node-group-control:{}:{}", group.id, kind.id()))
+                    .size(px(18.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.0))
+                    .text_color(rgb(0xffffff).opacity(0.42))
+                    .text_size(px(12.0))
+                    .cursor_pointer()
+                    .aria_label(kind.label())
+                    .child(kind.glyph())
+            };
+            let arrange_group_id = group.id.clone();
+            let select_group_id = group.id.clone();
+            let remove_group_id = group.id.clone();
+            let palette_group_id = group.id.clone();
+            let has_palette = !self.group_palette.is_empty();
+            above_wire.push(
+                div()
+                    .absolute()
+                    .left(px((origin.x + width - 64.0).max(origin.x + 54.0)))
+                    .top(px(origin.y + 3.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    })
+                    .child(control(GroupControl::Arrange).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.request_group_arrange(&arrange_group_id, cx);
+                        },
+                    )))
+                    .child(control(GroupControl::SelectAll).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.select_group_nodes(&select_group_id, cx);
+                        },
+                    )))
+                    .child(control(GroupControl::Ungroup).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.request_group_removal(&remove_group_id, cx);
+                        },
+                    )))
+                    .into_any_element(),
+            );
+
+            if has_palette {
+                above_wire.push(
+                    div()
+                        .id(format!(
+                            "node-group-control:{}:{}",
+                            group.id,
+                            GroupControl::Color.id()
+                        ))
+                        .absolute()
+                        .left(px(origin.x + 8.0))
+                        .top(px((origin.y + height - 24.0).max(origin.y + 24.0)))
+                        .size(px(16.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(0xffffff).opacity(0.28))
+                        .bg(rgb(color.rgb).opacity(0.6))
+                        .cursor_pointer()
+                        .aria_label(GroupControl::Color.label())
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_group_palette(&palette_group_id, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
+
+            if self.open_group_palette.as_ref() == Some(&group.id) {
+                let mut palette = div()
+                    .absolute()
+                    .left(px(origin.x + 28.0))
+                    .top(px((origin.y + height - 22.0).max(origin.y + 24.0)))
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .p(px(3.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(0x111827).opacity(0.92))
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    });
+                for rgb_value in self.group_palette.clone() {
+                    let group_id = group.id.clone();
+                    palette = palette.child(
+                        div()
+                            .id(format!("node-group-color:{group_id}:{rgb_value:06x}"))
+                            .size(px(14.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(0xffffff).opacity(if color.rgb == rgb_value {
+                                0.9
+                            } else {
+                                0.25
+                            }))
+                            .bg(rgb(rgb_value).opacity(0.75))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.request_group_color(&group_id, rgb_value, cx);
+                            })),
+                    );
+                }
+                above_wire.push(palette.into_any_element());
+            }
         }
 
         let mut node_overlays = Vec::new();
@@ -6240,8 +6954,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let mut frame_world_control_owners = HashMap::new();
         let mut frame_world_control_order = Vec::new();
         let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
-        nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
+        nodes.sort_by_cached_key(|node| {
+            (
+                node_paint_rank(&self.background_node_types, &node.node_type),
+                format!("{:?}", node.id),
+            )
+        });
         for mut node in nodes {
+            let background_node = self.background_node_types.contains(&node.node_type);
+            if !background_node && let Some(connection_layer) = wire_layer.take() {
+                root = root.child(connection_layer).children(above_wire.drain(..));
+            }
             let id = node.id.clone();
             let model_size = self.resolved_node_size(&id).unwrap_or(node.size);
             if let Some(size) = self.resolved_node_size(&id) {
@@ -6305,6 +7028,24 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .node_type_registry
                 .as_ref()
                 .and_then(|registry| registry.get(&node.node_type));
+            let catalog_presentation = registered_definition
+                .map(|definition| {
+                    (
+                        SharedString::from(definition.item.category.clone()),
+                        definition.item.category_color,
+                    )
+                })
+                .or_else(|| {
+                    self.catalog
+                        .iter()
+                        .find(|item| item.id == node.node_type)
+                        .map(|item| {
+                            (
+                                SharedString::from(item.category.clone()),
+                                item.category_color,
+                            )
+                        })
+                });
             let mut port_slot_elements = Vec::new();
             if let (Some(registry), Some(definition)) =
                 (self.node_type_registry.as_ref(), registered_definition)
@@ -6399,6 +7140,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 renderer.borrow_mut().render_node(
                     NodeBodyContext {
                         node: node.clone(),
+                        category: catalog_presentation
+                            .as_ref()
+                            .map(|(category, _)| category.clone()),
+                        category_color: catalog_presentation.as_ref().and_then(|(_, color)| *color),
                         ports: ports.clone().into(),
                         port_states: port_states.clone(),
                         port_presentations: port_presentations.clone(),
@@ -6437,6 +7182,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 renderer.render_node(
                     NodeBodyContext {
                         node: node.clone(),
+                        category: catalog_presentation
+                            .as_ref()
+                            .map(|(category, _)| category.clone()),
+                        category_color: catalog_presentation.as_ref().and_then(|(_, color)| *color),
                         ports: ports.clone().into(),
                         port_states: port_states.clone(),
                         port_presentations: port_presentations.clone(),
@@ -6921,6 +7670,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             }
         }
 
+        if let Some(connection_layer) = wire_layer.take() {
+            root = root.child(connection_layer).children(above_wire.drain(..));
+        }
+
         let mut default_port_scene = world::WorldScene::new();
         for port in self.graph.ports.values() {
             if body_anchored_nodes.contains(&port.node) {
@@ -7259,18 +8012,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         MouseButton::Middle,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             this.focus(window, cx);
-                            this.panning = Some(this.local_screen(event.position));
+                            this.begin_middle_gesture(this.local_screen(event.position));
                             cx.stop_propagation();
                             window.prevent_default();
                         }),
                     )
                     .on_mouse_up(
                         MouseButton::Middle,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.finish_middle_gesture(this.local_screen(event.position), cx);
+                            cx.stop_propagation();
+                        }),
                     )
                     .on_mouse_up_out(
                         MouseButton::Middle,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
+                        cx.listener(|this, _: &MouseUpEvent, _, _| this.cancel_middle_gesture()),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
@@ -7656,6 +8412,26 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .top_0()
             .size_full()
             .when(clip_overlay_content, |element| element.overflow_hidden());
+
+        if let Some(renderer) = self.world_overlay_renderer.as_mut() {
+            for overlay in renderer.render_world_overlays(
+                WorldOverlayContext {
+                    viewport,
+                    theme: Arc::clone(&theme),
+                },
+                window,
+                cx,
+            ) {
+                let position = viewport.world_to_screen(overlay.position) + overlay.screen_offset;
+                overlay_root = overlay_root.child(
+                    div()
+                        .absolute()
+                        .left(px(position.x))
+                        .top(px(position.y))
+                        .child(overlay.element),
+                );
+            }
+        }
 
         if !self.active_backdrop_overlays.is_empty() {
             let backdrop = theme.overlay.backdrop_background;
@@ -8186,6 +8962,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
 
         let root = div()
+            .id(("node-graph-root", cx.entity_id()))
             .relative()
             .size_full()
             .child(world_root)
@@ -8196,7 +8973,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let root_up_theme = Arc::clone(&theme);
         let root_up_out_theme = Arc::clone(&theme);
 
-        root.on_mouse_down(
+        root.on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            if !hovered {
+                if this.hovered_node.take().is_some() {
+                    cx.emit(core::GraphEvent::NodeHoverChanged { node: None });
+                }
+                cx.emit(core::GraphEvent::PointerLeft);
+            }
+        }))
+        .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
@@ -8223,7 +9008,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 this.anchor_menu = None;
                 this.focus(window, cx);
                 this.commit_group_editor(cx);
-                this.panning = Some(this.local_screen(event.position));
+                this.begin_middle_gesture(this.local_screen(event.position));
                 cx.stop_propagation();
                 window.prevent_default();
             }),
@@ -8236,15 +9021,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 let local = this.local_screen(event.position);
                 this.commit_group_editor(cx);
                 if event.click_count >= 2 && this.draft.is_none() {
-                    if let Some(group_id) = this.group_label_at(local, &root_down_theme)
-                        && let Some(group) = this.groups.iter().find(|group| group.id == group_id)
-                    {
-                        this.group_editor = Some(GroupEditor {
-                            id: group.id.clone(),
-                            query: WorldTextInputState::at_end(
-                                group.label.clone().unwrap_or_default(),
-                            ),
-                        });
+                    if let Some(group_id) = this.group_label_at(local, &root_down_theme) {
+                        if let Some(group) = this
+                            .groups
+                            .iter()
+                            .find(|group| group.id == group_id && group.editable)
+                        {
+                            this.group_editor = Some(GroupEditor {
+                                id: group.id.clone(),
+                                query: WorldTextInputState::at_end(
+                                    group.label.clone().unwrap_or_default(),
+                                ),
+                            });
+                        }
                     } else {
                         this.open_catalog(local, None);
                     }
@@ -8297,11 +9086,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         )
         .on_mouse_up(
             MouseButton::Middle,
-            cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
+            cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                this.finish_middle_gesture(this.local_screen(event.position), cx)
+            }),
         )
         .on_mouse_up_out(
             MouseButton::Middle,
-            cx.listener(|this, _: &MouseUpEvent, _, _| this.panning = None),
+            cx.listener(|this, _: &MouseUpEvent, _, _| this.cancel_middle_gesture()),
         )
         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
             this.handle_scroll_wheel(event, window, cx);
@@ -8896,6 +9687,25 @@ fn paint_dashed_route(
 mod tests {
     use super::*;
 
+    #[test]
+    fn default_shortcut_catalog_has_unique_sequences_and_typed_metadata() {
+        let mut sequences = HashSet::new();
+        for shortcut in default_shortcuts() {
+            assert!(sequences.insert(shortcut.sequence));
+            assert!(!shortcut.command.id().is_empty());
+            assert!(!shortcut.command.label().is_empty());
+            assert_eq!(shortcut.command.group(), "Node graph");
+        }
+    }
+
+    #[test]
+    fn world_overlay_retains_world_and_screen_offsets_separately() {
+        let overlay = WorldOverlay::new(core::Point::new(12.0, 34.0), div())
+            .with_screen_offset(core::Point::new(-4.0, 8.0));
+        assert_eq!(overlay.position, core::Point::new(12.0, 34.0));
+        assert_eq!(overlay.screen_offset, core::Point::new(-4.0, 8.0));
+    }
+
     #[derive(Clone, Debug, PartialEq)]
     struct Kind;
     impl PortType for Kind {
@@ -9117,6 +9927,47 @@ mod tests {
             editor.graph.selected_nodes.extend(["a".into(), "b".into()]);
             assert!(!editor.align_selected_nodes(SelectionAlignment::DistributeVertically, cx,));
         });
+    }
+
+    #[gpui::test]
+    fn middle_click_emits_for_a_node_but_middle_drag_only_pans(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        let clicked = Rc::new(RefCell::new(Vec::new()));
+        let observed = clicked.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if let core::GraphEvent::NodeMiddleClicked { node } = event {
+                        observed.borrow_mut().push(node.clone());
+                    }
+                },
+            )
+        });
+
+        editor.update(cx, |editor, cx| {
+            let point = core::Point::new(25.0, 25.0);
+            editor.begin_middle_gesture(point);
+            editor.finish_middle_gesture(point, cx);
+        });
+        assert_eq!(&*clicked.borrow(), &[String::from("a")]);
+
+        let before = editor.update(cx, |editor, _| editor.graph.viewport.pan);
+        editor.update(cx, |editor, cx| {
+            editor.begin_middle_gesture(core::Point::new(25.0, 25.0));
+            editor.handle_pointer_move(
+                core::Point::new(35.0, 25.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            editor.finish_middle_gesture(core::Point::new(35.0, 25.0), cx);
+        });
+        assert_eq!(&*clicked.borrow(), &[String::from("a")]);
+        assert_ne!(
+            editor.update(cx, |editor, _| editor.graph.viewport.pan),
+            before
+        );
     }
 
     #[test]
@@ -9499,18 +10350,78 @@ mod tests {
     fn default_anchor_menu_tracks_live_and_broken_connections() {
         let mut editor = NodeGraph::new_for_test(interactive_graph());
         let items = editor.anchor_menu_items(&"out".into());
-        assert!(items[0].enabled);
-        assert!(!items[1].enabled);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Disconnect all");
         editor.remove_port_to_tombstones(&"in".into()).unwrap();
         let items = editor.anchor_menu_items(&"out".into());
-        assert!(items[0].enabled);
-        assert!(items[1].enabled);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Disconnect all", "Remove broken connections"]
+        );
     }
 
     #[test]
-    fn node_drop_preserves_the_consumer_catalog_id() {
-        let drop = NodeDrop::new("color_source");
+    fn default_anchor_menu_names_each_far_endpoint_when_multiple_are_connected() {
+        let mut graph = interactive_graph();
+        graph.nodes.insert(
+            "c".into(),
+            Node {
+                id: "c".into(),
+                node_type: "c".into(),
+                title: "Camera Cue".into(),
+                position: core::Point::new(100.0, 100.0),
+                size: core::Size {
+                    width: 50.0,
+                    height: 50.0,
+                },
+            },
+        );
+        graph.ports.insert(
+            "cue".into(),
+            Port {
+                id: "cue".into(),
+                node: "c".into(),
+                label: "Trigger".into(),
+                direction: PortDirection::Input,
+                kind: Kind,
+                position: core::Point::new(100.0, 125.0),
+            },
+        );
+        graph.connections.insert(
+            "wire-2".into(),
+            Connection {
+                id: "wire-2".into(),
+                source: "out".into(),
+                target: "cue".into(),
+            },
+        );
+
+        let editor = NodeGraph::new_for_test(graph);
+        let items = editor.anchor_menu_items(&"out".into());
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Disconnect all",
+                "Disconnect to Camera Cue \u{2192} Trigger",
+                "Disconnect to b \u{2192} In",
+            ]
+        );
+    }
+
+    #[test]
+    fn node_drop_preserves_consumer_catalog_id_and_initial_values() {
+        let drop = NodeDrop::new("color_source").with_initial_value("channel", "red");
         assert_eq!(drop.item_id, "color_source");
+        assert_eq!(
+            drop.initial_values.get("channel").map(String::as_str),
+            Some("red")
+        );
     }
 
     #[test]
@@ -9811,6 +10722,7 @@ mod tests {
                     label: Some("Old".into()),
                     color: Some(style::Color::rgb(0)),
                     error: false,
+                    editable: true,
                     nodes: [String::from("a")].into_iter().collect(),
                 }]);
             editor.group_editor = Some(GroupEditor {
@@ -9823,6 +10735,130 @@ mod tests {
         editor.update(cx, |editor, _| {
             assert!(editor.group_editor.is_none());
             assert_eq!(editor.groups[0].label.as_deref(), Some("Renamed"));
+        });
+    }
+
+    #[gpui::test]
+    fn editable_group_header_actions_emit_typed_events_and_select_live_members(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        #[derive(Debug, PartialEq)]
+        enum Seen {
+            Arrange(String, Vec<String>),
+            Color(String, u32),
+            Remove(Vec<String>),
+        }
+
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let editor = cx.new(|_| {
+            NodeGraph::new_for_test(interactive_graph())
+                .with_group_palette([0x64748b, 0xef476f])
+                .with_groups(vec![GraphGroup {
+                    id: "group".into(),
+                    label: Some("Group".into()),
+                    color: Some(style::Color::rgb(0x64748b)),
+                    error: false,
+                    editable: true,
+                    nodes: [
+                        String::from("missing"),
+                        String::from("b"),
+                        String::from("a"),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }])
+        });
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let observed = seen.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    let event = match event {
+                        core::GraphEvent::GroupArrangeRequested { group_id, node_ids } => {
+                            Some(Seen::Arrange(group_id.clone(), node_ids.clone()))
+                        }
+                        core::GraphEvent::GroupColorChanged { group_id, rgb } => {
+                            Some(Seen::Color(group_id.clone(), *rgb))
+                        }
+                        core::GraphEvent::GroupsRemoved { group_ids } => {
+                            Some(Seen::Remove(group_ids.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some(event) = event {
+                        observed.borrow_mut().push(event);
+                    }
+                },
+            )
+        });
+
+        editor.update(cx, |editor, cx| {
+            assert!(editor.request_group_arrange("group", cx));
+            assert!(editor.select_group_nodes("group", cx));
+            assert_eq!(
+                editor.graph.selected_nodes,
+                [String::from("a"), String::from("b")].into_iter().collect()
+            );
+            assert!(editor.toggle_group_palette("group", cx));
+            assert!(editor.request_group_color("group", 0xef476f, cx));
+            assert!(editor.request_group_removal("group", cx));
+        });
+        assert_eq!(
+            &*seen.borrow(),
+            &[
+                Seen::Arrange(
+                    String::from("group"),
+                    vec![
+                        String::from("a"),
+                        String::from("b"),
+                        String::from("missing")
+                    ],
+                ),
+                Seen::Color(String::from("group"), 0xef476f),
+                Seen::Remove(vec![String::from("group")]),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn read_only_groups_reject_all_edit_paths(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let editor = cx.new(|_| {
+            NodeGraph::new_for_test(interactive_graph())
+                .with_group_palette([0x64748b])
+                .with_groups(vec![GraphGroup {
+                    id: "lifecycle".into(),
+                    label: Some("Build On".into()),
+                    color: Some(style::Color::rgb(0x64748b)),
+                    error: false,
+                    editable: false,
+                    nodes: [String::from("a")].into_iter().collect(),
+                }])
+        });
+        editor.update(cx, |editor, cx| {
+            editor.graph.selected_nodes.insert(String::from("a"));
+            assert!(editor.selected_group_ids().is_empty());
+            assert!(!editor.request_group_arrange("lifecycle", cx));
+            assert!(!editor.select_group_nodes("lifecycle", cx));
+            assert!(!editor.toggle_group_palette("lifecycle", cx));
+            assert!(!editor.request_group_color("lifecycle", 0x64748b, cx));
+            assert!(!editor.request_group_removal("lifecycle", cx));
+
+            editor.group_editor = Some(GroupEditor {
+                id: "lifecycle".into(),
+                query: WorldTextInputState::at_end("Changed"),
+            });
+            editor.commit_group_editor(cx);
+            assert_eq!(editor.groups[0].label.as_deref(), Some("Build On"));
+
+            editor.detach_node_from_groups_for_alt_drag(&String::from("a"), cx);
+            assert!(editor.groups[0].nodes.contains("a"));
+            assert!(
+                editor
+                    .update_group_memberships(&[String::from("a")], &NodeGraphTheme::default())
+                    .is_empty()
+            );
         });
     }
 
@@ -10006,6 +11042,7 @@ mod tests {
                 label: Some("Group".into()),
                 color: Some(style::Color::rgb(0)),
                 error: false,
+                editable: true,
                 nodes: [String::from("a"), String::from("b")].into_iter().collect(),
             }]);
         assert!(editor.selected_group_ids().is_empty());
@@ -10020,6 +11057,7 @@ mod tests {
             label: Some("Group".into()),
             color: Some(style::Color::rgb(0)),
             error: false,
+            editable: true,
             nodes: [String::from("b")].into_iter().collect(),
         }]);
         assert_eq!(
@@ -10044,6 +11082,7 @@ mod tests {
                 label: Some("Group".into()),
                 color: None,
                 error: false,
+                editable: true,
                 nodes: [String::from("a"), String::from("b")].into_iter().collect(),
             });
             editor.begin_node_drag(
@@ -10071,6 +11110,7 @@ mod tests {
                 label: Some("Group".into()),
                 color: Some(style::Color::rgb(0)),
                 error: false,
+                editable: true,
                 nodes: [String::from("b")].into_iter().collect(),
             }]);
         editor.graph.nodes.get_mut("a").unwrap().position = core::Point::new(80.0, 0.0);
@@ -10091,6 +11131,7 @@ mod tests {
                 label: Some("Group".into()),
                 color: Some(style::Color::rgb(0)),
                 error: false,
+                editable: true,
                 nodes: [String::from("a")].into_iter().collect(),
             }]);
         let changes =
@@ -10675,6 +11716,19 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn pointer_hover_tracks_the_topmost_node_and_clears_over_canvas(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        editor.update(cx, |editor, cx| {
+            let theme = Arc::clone(cx.node_graph_theme());
+            editor.handle_pointer_move(core::Point::new(25.0, 25.0), &theme, cx);
+            assert_eq!(editor.hovered_node.as_deref(), Some("a"));
+            editor.handle_pointer_move(core::Point::new(75.0, 25.0), &theme, cx);
+            assert_eq!(editor.hovered_node, None);
+        });
+    }
+
     #[test]
     fn box_selection_rect_normalizes_drag_direction() {
         let selection = BoxSelection::<String, String> {
@@ -10835,5 +11889,12 @@ mod tests {
             ),
             style::Color::rgb(0x4d4d4d)
         );
+    }
+
+    #[test]
+    fn configured_background_nodes_sort_before_connection_foreground_nodes() {
+        let background = HashSet::from([String::from("comment")]);
+        assert_eq!(node_paint_rank(&background, "comment"), 0);
+        assert_eq!(node_paint_rank(&background, "target-action"), 1);
     }
 }

@@ -1833,6 +1833,7 @@ fn launch(cx: &mut App) {
                         label: Some("Group 1".into()),
                         color: Some(gpui_node_graph::style::Color::rgb(0x8b5cf6)),
                         error: false,
+                        editable: true,
                         nodes: ["color_source_0".to_string(), "mix_1".to_string()]
                             .into_iter()
                             .collect(),
@@ -2030,6 +2031,7 @@ fn launch(cx: &mut App) {
                         GraphEvent::CreateNode {
                             item_id,
                             position,
+                            initial_values: _,
                             connect_from,
                             connect_to,
                             connect_direction,
@@ -2050,6 +2052,7 @@ fn launch(cx: &mut App) {
                                     label: Some(format!("Group {sequence}")),
                                     color: Some(gpui_node_graph::style::Color::rgb(0xa78bfa)),
                                     error: false,
+                                    editable: true,
                                     nodes: node_ids.iter().cloned().collect(),
                                 },
                                 cx,

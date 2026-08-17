@@ -7347,3 +7347,35 @@ dependencies = [
  "syn 3.0.3",
  "winnow 1.0.4",
 ]
+
+[[patch.unused]]
+name = "pulse-gpui"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "myko-gpui"
+version = "6.1.0"
+
+[[patch.unused]]
+name = "autosocket"
+version = "6.1.0"
+
+[[patch.unused]]
+name = "myko"
+version = "6.1.0"
+
+[[patch.unused]]
+name = "myko-leptos"
+version = "6.1.0"
+
+[[patch.unused]]
+name = "myko-macros"
+version = "6.1.0"
+
+[[patch.unused]]
+name = "myko-server"
+version = "6.1.0"
+
+[[patch.unused]]
+name = "gpui-mullion"
+version = "0.1.0"
