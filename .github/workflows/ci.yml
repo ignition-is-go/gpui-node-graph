@@ -4,6 +4,22 @@ on:
     branches: [main]
   pull_request:
 jobs:
+  publish-dry-run:
+    name: crates.io publish dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GPUI libraries
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Verify node-graph-core is publishable
+        run: cargo publish --dry-run --locked --allow-dirty -p node-graph-core
+      - name: Verify gpui-node-graph is publishable
+        run: cargo publish --dry-run --locked --allow-dirty -p gpui-node-graph --config 'patch.crates-io.node-graph-core.path="crates/node-graph-core"'
+
   test:
     strategy:
       matrix:
@@ -22,8 +38,8 @@ jobs:
       - name: Verify Linux window backends
         if: runner.os == 'Linux'
         run: |
-          cargo tree -e features -i gpui_linux | grep -F 'gpui_linux feature "wayland"'
-          cargo tree -e features -i gpui_linux | grep -F 'gpui_linux feature "x11"'
+          cargo tree -e features -i gpui-linux-gpui-unofficial | grep -F 'gpui-linux-gpui-unofficial feature "wayland"'
+          cargo tree -e features -i gpui-linux-gpui-unofficial | grep -F 'gpui-linux-gpui-unofficial feature "x11"'
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Sustain native GPUI demo under Xvfb

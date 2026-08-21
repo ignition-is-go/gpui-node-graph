@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod subway;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     hash::Hash,
 };
@@ -123,6 +123,26 @@ impl Viewport {
         let y =
             (Self::finite_coordinate(p.y) as f64 - viewport.pan.y as f64) / viewport.zoom as f64;
         Point::new(Self::finite_f32(x), Self::finite_f32(y))
+    }
+
+    /// Return a viewport with `world` projected to the center of `screen_size`,
+    /// preserving the current zoom.
+    pub fn centered_on(self, world: Point, screen_size: Size) -> Self {
+        let viewport = self.sanitized();
+        let center = Point::new(screen_size.width * 0.5, screen_size.height * 0.5);
+        Self {
+            pan: Point::new(
+                Self::finite_f32(
+                    center.x as f64
+                        - Self::finite_coordinate(world.x) as f64 * viewport.zoom as f64,
+                ),
+                Self::finite_f32(
+                    center.y as f64
+                        - Self::finite_coordinate(world.y) as f64 * viewport.zoom as f64,
+                ),
+            ),
+            zoom: viewport.zoom,
+        }
     }
     /// Scale a non-negative world-space length into a finite render-space length.
     pub fn scale_length(self, value: f32) -> f32 {
@@ -320,6 +340,26 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
         nodes: HashSet<N>,
         connections: HashSet<C>,
     },
+    /// The topmost node below the pointer changed. `None` means the pointer is
+    /// over blank canvas or has left the editor.
+    NodeHoverChanged {
+        node: Option<N>,
+    },
+    /// A middle-button click completed on a node without becoming a pan gesture.
+    /// Consumers can use this for secondary surfaces such as a floating inspector.
+    NodeMiddleClicked {
+        node: N,
+    },
+    /// Pointer position inside the graph canvas, expressed in graph/world space.
+    PointerMoved {
+        position: Point,
+    },
+    /// The pointer left the graph canvas.
+    PointerLeft,
+    /// In-progress marquee region in graph/world space.
+    SelectionBoxChanged {
+        region: Option<Rect>,
+    },
     NodesDeleted {
         ids: Vec<N>,
     },
@@ -333,6 +373,14 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
     Redo,
     GroupCreated {
         node_ids: Vec<N>,
+    },
+    GroupArrangeRequested {
+        group_id: String,
+        node_ids: Vec<N>,
+    },
+    GroupColorChanged {
+        group_id: String,
+        rgb: u32,
     },
     GroupMembershipChanged {
         group_id: String,
@@ -348,6 +396,8 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
     CreateNode {
         item_id: String,
         position: Point,
+        /// Opaque initial values supplied by consumer-owned creation chrome.
+        initial_values: BTreeMap<String, String>,
         connect_from: Option<P>,
         connect_to: Option<String>,
         /// Direction of the draft-origin port in `connect_from`.
@@ -803,6 +853,25 @@ mod tests {
         let before = v.screen_to_world(p);
         v.zoom_at(p, 2., 0.1, 5.);
         assert_eq!(before, v.screen_to_world(p));
+    }
+    #[test]
+    fn centered_viewport_projects_world_point_to_screen_center() {
+        let viewport = Viewport {
+            pan: Point::new(11.0, -7.0),
+            zoom: 2.0,
+        }
+        .centered_on(
+            Point::new(30.0, 40.0),
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        assert_eq!(
+            viewport.world_to_screen(Point::new(30.0, 40.0)),
+            Point::new(400.0, 300.0)
+        );
+        assert_eq!(viewport.zoom, 2.0);
     }
     #[test]
     fn orthogonal_has_right_angles() {

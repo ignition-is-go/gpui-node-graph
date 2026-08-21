@@ -8,8 +8,8 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git" }
-gpui_platform = { git = "https://github.com/zed-industries/zed.git", features = ["wayland", "x11"] }
-gpui_web = { git = "https://github.com/zed-industries/zed.git" }
-node-graph-core = { path = "crates/node-graph-core" }
-gpui-node-graph = { path = "crates/gpui-node-graph" }
+gpui = { package = "gpui-unofficial", version = "=1.16.1" }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.16.1", features = ["wayland", "x11"] }
+gpui_web = { package = "gpui-web-gpui-unofficial", version = "=1.16.1" }
+node-graph-core = { version = "0.1.0", path = "crates/node-graph-core" }
+gpui-node-graph = { version = "0.1.0", path = "crates/gpui-node-graph" }
