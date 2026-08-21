@@ -1,11 +1,17 @@
 [package]
-name="gpui-node-graph"
-version.workspace=true
-edition.workspace=true
-license.workspace=true
+name = "gpui-node-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native and WebAssembly node-graph editor for GPUI"
+repository = "https://github.com/ignition-is-go/gpui-node-graph"
+
+[package.metadata.flux]
+tasks = ["build", "publish"]
+
 [dependencies]
-gpui.workspace=true
-node-graph-core.workspace=true
+gpui.workspace = true
+node-graph-core.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

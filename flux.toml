@@ -1,0 +1,12 @@
+[channels]
+main = "production"
+
+[tasks.build]
+workspace_batchable = true
+cargo = ["cargo", "build"]
+
+[tasks.publish]
+cascade = "all"
+autoapply = "inherit"
+depends_on = ["build"]
+cargo = ["cargo", "publish"]
