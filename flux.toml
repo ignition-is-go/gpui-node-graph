@@ -3,10 +3,10 @@ main = "production"
 
 [tasks.build]
 workspace_batchable = true
-cargo = ["cargo", "build"]
+cargo = ["cargo", "build", "--locked"]
 
 [tasks.publish]
 cascade = "all"
 autoapply = "inherit"
 depends_on = ["build"]
-cargo = ["cargo", "publish"]
+cargo = ["cargo", "publish", "--locked"]
