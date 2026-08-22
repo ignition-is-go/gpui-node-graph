@@ -23,8 +23,15 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        os: [linux, macos, windows]
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: macos
+            runner: [self-hosted, macOS, ARM64, site-lucid-lab]
+          - os: windows
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
