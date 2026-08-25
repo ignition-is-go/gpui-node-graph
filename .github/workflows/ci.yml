@@ -23,7 +23,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [public-ci, macos-latest, windows-latest]
+        os: [public-ci, macos-latest, public-ci-windows]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
