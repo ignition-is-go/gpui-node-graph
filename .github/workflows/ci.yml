@@ -6,7 +6,7 @@ on:
 jobs:
   publish-dry-run:
     name: crates.io publish dry run
-    runs-on: ubuntu-latest
+    runs-on: public-ci
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -23,7 +23,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [public-ci, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +55,7 @@ jobs:
           test "$status" -eq 124
 
   wasm:
-    runs-on: ubuntu-latest
+    runs-on: public-ci
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
