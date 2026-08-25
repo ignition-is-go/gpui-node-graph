@@ -6,7 +6,7 @@ on:
 jobs:
   publish-dry-run:
     name: crates.io publish dry run
-    runs-on: ubuntu-latest
+    runs-on: public-ci
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -14,7 +14,7 @@ jobs:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux GPUI libraries
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: Verify node-graph-core is publishable
         run: cargo publish --dry-run --locked --allow-dirty -p node-graph-core
       - name: Verify gpui-node-graph is publishable
@@ -23,7 +23,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [public-ci, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
           components: rustfmt, clippy, rust-src
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb mesa-vulkan-drivers
+        run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb mesa-vulkan-drivers
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --all-targets
       - name: Verify Linux window backends
@@ -55,9 +55,10 @@ jobs:
           test "$status" -eq 124
 
   wasm:
-    runs-on: ubuntu-latest
+    runs-on: public-ci
     steps:
       - uses: actions/checkout@v4
+      - run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
