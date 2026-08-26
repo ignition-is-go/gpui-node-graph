@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 jobs:
   publish-dry-run:
     name: crates.io publish dry run
@@ -23,8 +24,14 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [public-ci, macos-latest, public-ci-windows]
-    runs-on: ${{ matrix.os }}
+        runner:
+          - {name: Linux, group: public-ci, labels: public-ci}
+          - {name: macOS, group: ephemeral-macos, labels: public-ci-macos}
+          - {name: Windows, group: ephemeral-windows, labels: public-ci-windows}
+    name: ${{ matrix.runner.name }}
+    runs-on:
+      group: ${{ matrix.runner.group }}
+      labels: ${{ matrix.runner.labels }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
