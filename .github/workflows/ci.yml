@@ -7,7 +7,7 @@ on:
 jobs:
   publish-dry-run:
     name: crates.io publish dry run
-    runs-on: public-ci
+    runs-on: ci-public-linux-ephemeral
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -25,9 +25,9 @@ jobs:
     strategy:
       matrix:
         runner:
-          - {name: Linux, group: public-ci, labels: public-ci}
-          - {name: macOS, group: ephemeral-macos, labels: public-ci-macos}
-          - {name: Windows, group: ephemeral-windows, labels: public-ci-windows}
+          - {name: Linux, group: ci-public-linux-ephemeral, labels: ci-public-linux-ephemeral}
+          - {name: macOS, group: ci-macos-ephemeral, labels: ci-macos-ephemeral}
+          - {name: Windows, group: ci-windows-ephemeral, labels: ci-windows-ephemeral}
     name: ${{ matrix.runner.name }}
     runs-on:
       group: ${{ matrix.runner.group }}
@@ -62,7 +62,7 @@ jobs:
           test "$status" -eq 124
 
   wasm:
-    runs-on: public-ci
+    runs-on: ci-public-linux-ephemeral
     steps:
       - uses: actions/checkout@v4
       - run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config
