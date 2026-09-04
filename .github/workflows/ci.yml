@@ -52,7 +52,7 @@ jobs:
           compiler-cache-secret-key: ${{ secrets.CI_CACHE_SECRET_KEY }}
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb mesa-vulkan-drivers
+        run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config fonts-dejavu-core libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb mesa-vulkan-drivers
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace --all-targets
       - name: Verify Linux window backends
