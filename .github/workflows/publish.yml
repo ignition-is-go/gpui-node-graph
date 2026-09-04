@@ -15,13 +15,18 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           fetch-tags: true
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+      - uses: ignition-is-go/pulse-actions/actions/setup-rust@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+        with:
+          compiler-cache-endpoint: ${{ secrets.CI_CACHE_ENDPOINT }}
+          compiler-cache-bucket: ${{ secrets.CI_CACHE_BUCKET }}
+          compiler-cache-access-key: ${{ secrets.CI_CACHE_ACCESS_KEY }}
+          compiler-cache-secret-key: ${{ secrets.CI_CACHE_SECRET_KEY }}
       - name: Install Linux GPUI libraries
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libfontconfig1-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
@@ -44,3 +49,5 @@ jobs:
       - run: cargo flux run publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+        if: always()
