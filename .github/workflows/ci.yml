@@ -9,17 +9,24 @@ jobs:
     name: crates.io publish dry run
     runs-on: ci-public-linux-ephemeral
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+      - uses: ignition-is-go/pulse-actions/actions/setup-rust@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: Swatinem/rust-cache@v2
+          compiler-cache-endpoint: ${{ secrets.CI_CACHE_ENDPOINT }}
+          compiler-cache-bucket: ${{ secrets.CI_CACHE_BUCKET }}
+          compiler-cache-access-key: ${{ secrets.CI_CACHE_ACCESS_KEY }}
+          compiler-cache-secret-key: ${{ secrets.CI_CACHE_SECRET_KEY }}
       - name: Install Linux GPUI libraries
         run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: Verify node-graph-core is publishable
         run: cargo publish --dry-run --locked --allow-dirty -p node-graph-core
       - name: Verify gpui-node-graph is publishable
         run: cargo publish --dry-run --locked --allow-dirty -p gpui-node-graph --config 'patch.crates-io.node-graph-core.path="crates/node-graph-core"'
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+        if: always()
 
   test:
     strategy:
@@ -33,10 +40,16 @@ jobs:
       group: ${{ matrix.runner.group }}
       labels: ${{ matrix.runner.labels }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+      - uses: ignition-is-go/pulse-actions/actions/setup-rust@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
         with:
+          toolchain: nightly
           components: rustfmt, clippy, rust-src
+          compiler-cache-endpoint: ${{ secrets.CI_CACHE_ENDPOINT }}
+          compiler-cache-bucket: ${{ secrets.CI_CACHE_BUCKET }}
+          compiler-cache-access-key: ${{ secrets.CI_CACHE_ACCESS_KEY }}
+          compiler-cache-secret-key: ${{ secrets.CI_CACHE_SECRET_KEY }}
       - name: Linux dependencies
         if: runner.os == 'Linux'
         run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-x11-dev libfontconfig1-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev xvfb mesa-vulkan-drivers
@@ -60,18 +73,28 @@ jobs:
           status=$?
           set -e
           test "$status" -eq 124
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+        if: always()
 
   wasm:
     runs-on: ci-public-linux-ephemeral
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+      - uses: ignition-is-go/pulse-actions/actions/setup-rust@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
         with:
+          toolchain: nightly
           targets: wasm32-unknown-unknown
           components: rust-src
-      - uses: taiki-e/install-action@v2
+          compiler-cache-endpoint: ${{ secrets.CI_CACHE_ENDPOINT }}
+          compiler-cache-bucket: ${{ secrets.CI_CACHE_BUCKET }}
+          compiler-cache-access-key: ${{ secrets.CI_CACHE_ACCESS_KEY }}
+          compiler-cache-secret-key: ${{ secrets.CI_CACHE_SECRET_KEY }}
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
         with:
           tool: trunk
       - run: cargo check --workspace --target wasm32-unknown-unknown
       - run: cd examples/demo && env -u NO_COLOR trunk build --release
+      - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+        if: always()
