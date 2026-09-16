@@ -1,5 +1,7 @@
 self-hosted-runner:
   labels:
-    - ci-public-linux-ephemeral
-    - ci-macos-ephemeral
-    - ci-windows-ephemeral
+    - site-lucid-lab
+    - ram-ge-8g
+    - ram-ge-16g
+    - ram-ge-24g
+    - disk-ge-100g
