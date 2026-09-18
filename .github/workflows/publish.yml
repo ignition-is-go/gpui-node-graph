@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
       - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
-      - uses: ignition-is-go/pulse-actions/actions/setup-rust@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
+      - uses: ignition-is-go/pulse-actions/actions/setup-rust@v1.1.1
         with:
           compiler-cache-endpoint: ${{ secrets.CI_CACHE_ENDPOINT }}
           compiler-cache-bucket: ${{ secrets.CI_CACHE_BUCKET }}
