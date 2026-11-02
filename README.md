@@ -78,7 +78,7 @@ singular connection requests. `multi_connection_specs`, `multi_connection_ids_fo
 
 World-space inline fields use `world::TextField` and `WorldPrimitive::TextInput`. Register the same control ID with `set_world_text_input`, then mirror `GraphEvent::NodeControlTextChanged` snapshots into the field. Text, selection, caret, padding, and marked-text geometry scale with the viewport. Shaped glyph positions drive `world_text_index_at` and platform IME bounds. Font features inherit from the surrounding GPUI text style, including `tnum` for tabular digits.
 
-`edit_world_text_key` shares the catalog's basic selection, deletion, and clipboard handling. The consumer owns validation, commit, cancel, and pointer-selection policy. Native and web platform input handlers own ordinary character insertion, paste, and composition. Do not insert the same printable key twice. Word/grapheme navigation, pointer-drag selection, and numeric scrubbing need consumer policies beyond this basic helper.
+`edit_world_text_key` shares the catalog's basic selection, deletion, and clipboard handling. The consumer owns validation, commit, cancel, and pointer-selection policy. `NodeControlPointerDragged` supplies a world-space origin/current position and incremental pane-space delta. `NodeControlPointerReleased` ends capture even when a child consumes mouse-up. Native and web platform input handlers own ordinary character insertion, paste, and composition. Do not insert the same printable key twice. Word/grapheme navigation, pointer-drag selection, and numeric scrubbing need consumer policies beyond this basic helper.
 
 Version 0.2 adds variants to the public world/screen primitive enums. Exhaustive matches must handle `TextInput`.
 

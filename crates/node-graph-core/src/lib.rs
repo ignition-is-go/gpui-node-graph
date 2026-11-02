@@ -293,6 +293,19 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
         world_position: Point,
         click_count: usize,
     },
+    /// A captured primary-pointer gesture inside a world-space control.
+    /// `delta` is incremental pane-space travel in logical pixels; positions are world units.
+    NodeControlPointerDragged {
+        node_id: N,
+        control_id: String,
+        origin: Point,
+        world_position: Point,
+        delta: Point,
+    },
+    NodeControlPointerReleased {
+        node_id: N,
+        control_id: String,
+    },
     /// A key press routed to the most recently activated world-space control.
     /// `text` is the produced character (when any), kept separate from the
     /// physical/logical key so editors work identically on native and WebAssembly.
