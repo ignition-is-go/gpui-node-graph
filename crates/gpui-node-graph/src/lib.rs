@@ -1127,6 +1127,8 @@ pub struct EditorConfig {
     pub min_zoom: f32,
     pub max_zoom: f32,
     pub zoom_step: f32,
+    /// Walk controls on Tab. Disable when the consumer owns field traversal.
+    pub control_tab_navigation: bool,
     pub grid_size: Option<f32>,
     /// Port snap radius in screen pixels.
     pub snap_distance: f32,
@@ -1158,6 +1160,7 @@ impl Default for EditorConfig {
             min_zoom: 0.1,
             max_zoom: 5.0,
             zoom_step: 0.3,
+            control_tab_navigation: true,
             grid_size: None,
             snap_distance: 22.0,
             fit_padding: 48.0,
@@ -5966,7 +5969,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 shift,
                 command,
             });
-            if key == "tab" {
+            if key == "tab" && self.config.control_tab_navigation {
                 self.blur_world_control(cx);
                 if !self.world_control_order.is_empty() {
                     let current =
