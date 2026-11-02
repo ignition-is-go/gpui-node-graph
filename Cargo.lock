@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-node-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui-unofficial",
  "node-graph-core",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-node-graph-demo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui-node-graph",
  "gpui-platform-gpui-unofficial",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "node-graph-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7429,43 +7429,3 @@ dependencies = [
  "syn 3.0.3",
  "winnow 1.0.4",
 ]
-
-[[patch.unused]]
-name = "pulse-gpui"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "hyphae-gpui"
-version = "3.1.1"
-
-[[patch.unused]]
-name = "myko-gpui"
-version = "6.1.0"
-
-[[patch.unused]]
-name = "autosocket"
-version = "6.1.0"
-
-[[patch.unused]]
-name = "myko"
-version = "6.1.0"
-
-[[patch.unused]]
-name = "myko-leptos"
-version = "6.1.0"
-
-[[patch.unused]]
-name = "myko-macros"
-version = "6.1.0"
-
-[[patch.unused]]
-name = "myko-server"
-version = "6.1.0"
-
-[[patch.unused]]
-name = "gpui-command-palette"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "gpui-mullion"
-version = "0.1.0"

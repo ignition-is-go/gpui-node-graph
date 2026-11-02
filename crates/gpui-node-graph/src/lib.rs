@@ -1,5 +1,6 @@
 mod wheel;
 mod windows;
+mod world_text;
 
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, BoxShadow, Context, DispatchPhase, Element, ElementId,
@@ -1581,6 +1582,7 @@ struct WorldTextPaint {
 struct WorldPaintState {
     scene: world::ScreenScene,
     text: Vec<WorldTextPaint>,
+    inputs: Vec<world_text::TextInputPaint>,
 }
 
 /// Return the reference SVG silhouette for a non-circular anchor dot in world units.
@@ -1657,6 +1659,7 @@ pub struct WorldSceneElement {
     id: ElementId,
     scene: world::WorldScene,
     viewport: Viewport,
+    text_layouts: Option<world_text::Layouts>,
 }
 
 impl WorldSceneElement {
@@ -1665,19 +1668,37 @@ impl WorldSceneElement {
             id: id.into(),
             scene,
             viewport,
+            text_layouts: None,
         }
+    }
+
+    fn with_text_layouts(mut self, layouts: world_text::Layouts) -> Self {
+        self.text_layouts = Some(layouts);
+        self
     }
 }
 
 impl gpui::RenderOnce for WorldSceneElement {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         let projected = self.scene.project(self.viewport);
+        let layouts = self.text_layouts;
         div().id(self.id).absolute().size_full().child(
             canvas(
                 move |_bounds, window, _cx| {
                     let mut text = Vec::new();
+                    let mut inputs = Vec::new();
+                    if let Some(layouts) = &layouts {
+                        layouts.borrow_mut().clear();
+                    }
                     let text_style = window.text_style();
                     for primitive in &projected.primitives {
+                        if let world::ScreenPrimitive::TextInput(field) = primitive {
+                            let input = world_text::TextInputPaint::new(field.clone(), window);
+                            if let Some(layouts) = &layouts {
+                                layouts.borrow_mut().insert(field.id.clone(), input.clone());
+                            }
+                            inputs.push(input);
+                        }
                         if let world::ScreenPrimitive::Text {
                             origin,
                             lines,
@@ -1716,6 +1737,7 @@ impl gpui::RenderOnce for WorldSceneElement {
                     WorldPaintState {
                         scene: projected,
                         text,
+                        inputs,
                     }
                 },
                 move |bounds, state, window, cx| {
@@ -1822,7 +1844,8 @@ impl gpui::RenderOnce for WorldSceneElement {
                                     }
                                 }
                             }
-                            world::ScreenPrimitive::Text { .. } => {}
+                            world::ScreenPrimitive::Text { .. }
+                            | world::ScreenPrimitive::TextInput(_) => {}
                         }
                     }
                     for text in &state.text {
@@ -1834,6 +1857,9 @@ impl gpui::RenderOnce for WorldSceneElement {
                             window,
                             cx,
                         );
+                    }
+                    for input in &state.inputs {
+                        input.paint(offset, window, cx);
                     }
                 },
             )
@@ -2091,6 +2117,7 @@ pub struct NodeGraph<
     world_control_order: Vec<(N, String)>,
     last_world_control: Option<(N, String)>,
     world_text_input: Option<(N, String, WorldTextInputState)>,
+    world_text_layouts: world_text::Layouts,
     groups: Vec<GraphGroup<N>>,
     group_palette: Vec<u32>,
     open_group_palette: Option<String>,
@@ -2187,6 +2214,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             world_control_order: Vec::new(),
             last_world_control: None,
             world_text_input: None,
+            world_text_layouts: Rc::new(RefCell::new(HashMap::new())),
             groups: Vec::new(),
             group_palette: Vec::new(),
             open_group_palette: None,
@@ -3020,6 +3048,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .as_ref()
             .map(|(node, control)| (node, control.as_str()))
     }
+    /// Resolve a pointer in world coordinates using the active field's shaped glyphs.
+    /// The returned offset uses UTF-16 code units, matching platform input state.
+    pub fn world_text_index_at(&self, control_id: &str, position: core::Point) -> Option<usize> {
+        self.world_text_layouts
+            .borrow()
+            .get(control_id)
+            .map(|layout| layout.index_at(self.graph.viewport.world_to_screen(position)))
+    }
+
     fn blur_world_control(&mut self, cx: &mut Context<Self>) {
         if let Some((node_id, control_id)) = self.last_world_control.take() {
             cx.emit(core::GraphEvent::NodeControlBlurred {
@@ -5520,8 +5557,40 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         shift: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.edit_text_key(key, character, command, shift, false, cx)
+    }
+
+    /// Apply ordinary text-editing keys to the active world-space document.
+    /// Uses the same Unicode selection, deletion, and clipboard behavior as the catalog.
+    /// Enter, Escape, and other consumer actions return false for the caller to handle.
+    pub fn edit_world_text_key(
+        &mut self,
+        key: &str,
+        character: Option<&str>,
+        command: bool,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.edit_text_key(key, character, command, shift, true, cx)
+    }
+
+    fn edit_text_key(
+        &mut self,
+        key: &str,
+        character: Option<&str>,
+        command: bool,
+        shift: bool,
+        world: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if (world && self.world_text_input.is_none())
+            || (!world && self.inline_text_state().is_none())
+            || (world && self.inline_text_state().is_some())
+        {
+            return false;
+        }
         if command && key == "c" {
-            if let Some(text) = self.inline_text_state().and_then(selected_text) {
+            if let Some(text) = self.active_input_state().and_then(selected_text) {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
             }
             return true;
@@ -5530,14 +5599,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .then(|| cx.read_from_clipboard().and_then(|item| item.text()))
             .flatten();
         let cut = if command && key == "x" {
-            self.inline_text_state().and_then(selected_text)
+            self.active_input_state().and_then(selected_text)
         } else {
             None
         };
         if let Some(text) = cut.as_ref() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
         }
-        let Some(state) = self.inline_text_state_mut() else {
+        let Some(state) = self.active_input_state_mut() else {
             return false;
         };
         let before = state.clone();
@@ -5594,10 +5663,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             _ => return false,
         }
         let changed = state.text != before.text;
-        if changed && let Some(menu) = self.catalog_menu.as_mut() {
-            menu.selected = 0;
+        if world {
+            self.emit_world_text_changed(cx);
+        } else {
+            if changed && let Some(menu) = self.catalog_menu.as_mut() {
+                menu.selected = 0;
+            }
+            cx.notify();
         }
-        cx.notify();
         true
     }
 
@@ -6074,6 +6147,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn active_text_world_rect(&self) -> Option<core::Rect> {
+        if self.inline_text_state().is_some() {
+            return None;
+        }
         let (node, control, _) = self.world_text_input.as_ref()?;
         if self.last_world_control.as_ref() != Some(&(node.clone(), control.clone())) {
             return None;
@@ -6198,6 +6274,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Entit
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let rect = self.active_text_world_rect()?;
+        if let Some((_, control, _)) = &self.world_text_input
+            && let Some(layout) = self.world_text_layouts.borrow().get(control)
+        {
+            let mut bounds = layout.range_bounds(range);
+            bounds.origin += self.canvas_bounds.get().origin;
+            return Some(bounds);
+        }
         let canvas = self.canvas_bounds.get();
         let len = self
             .world_text_input
@@ -6226,6 +6309,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Entit
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let rect = self.active_text_world_rect()?;
+        if let Some((_, control, _)) = &self.world_text_input
+            && let Some(layout) = self.world_text_layouts.borrow().get(control)
+        {
+            return Some(layout.index_at(self.local_screen(point)));
+        }
         let local = self.local_screen(point);
         let world = self.graph.viewport.screen_to_world(local);
         let fraction =
@@ -7972,11 +8060,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .absolute()
                     .size_full()
                     .occlude()
-                    .child(WorldSceneElement::new(
-                        ("node-graph-world-scene", cx.entity().entity_id()),
-                        frame_world_scene,
-                        viewport,
-                    ))
+                    .child(
+                        WorldSceneElement::new(
+                            ("node-graph-world-scene", cx.entity().entity_id()),
+                            frame_world_scene,
+                            viewport,
+                        )
+                        .with_text_layouts(self.world_text_layouts.clone()),
+                    )
                     .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
                         let local = this.local_screen(event.position);
                         this.handle_pointer_move(local, &world_move_theme, cx);
@@ -10418,6 +10509,70 @@ mod tests {
             drop.initial_values.get("channel").map(String::as_str),
             Some("red")
         );
+    }
+
+    #[gpui::test]
+    fn world_text_editing_keys_preserve_unicode_and_share_clipboard_behavior(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let editor = cx.new(|cx| NodeGraph::new(interactive_graph(), cx));
+            editor.update(cx, |editor, cx| {
+                editor.set_world_text_input(
+                    "a".into(),
+                    "a:factor",
+                    WorldTextInputState::new("a💡b", 4..4),
+                    cx,
+                );
+                assert!(editor.edit_world_text_key("left", None, false, false, cx));
+                assert_eq!(editor.world_text_input().unwrap().2.selection, 3..3);
+                assert!(editor.edit_world_text_key("backspace", None, false, false, cx));
+                assert_eq!(editor.world_text_input().unwrap().2.text, "ab");
+                assert!(editor.edit_world_text_key("a", None, true, false, cx));
+                assert!(editor.edit_world_text_key("c", None, true, false, cx));
+                assert!(editor.edit_world_text_key("end", None, false, false, cx));
+                assert!(editor.edit_world_text_key("v", None, true, false, cx));
+                assert_eq!(editor.world_text_input().unwrap().2.text, "abab");
+                assert!(!editor.edit_world_text_key("enter", None, false, false, cx));
+                assert!(!editor.edit_world_text_key("escape", None, false, false, cx));
+            });
+        });
+    }
+
+    #[test]
+    fn inline_document_takes_geometry_ownership_from_world_field() {
+        let mut editor = NodeGraph::new_for_test(interactive_graph());
+        editor.last_world_control = Some(("a".into(), "field".into()));
+        editor.world_text_input = Some((
+            "a".into(),
+            "field".into(),
+            WorldTextInputState::new("node", 4..4),
+        ));
+        let bounds = core::Rect {
+            origin: core::Point::new(20.0, 30.0),
+            size: core::Size {
+                width: 80.0,
+                height: 20.0,
+            },
+        };
+        editor
+            .world_scene
+            .push_hit_region(world::WorldHitRegion::new(
+                "field",
+                world::HitRole::Control,
+                world::HitShape::Rect(bounds),
+            ));
+        assert_eq!(editor.active_text_world_rect(), Some(bounds));
+        editor.catalog_menu = Some(CatalogMenu {
+            anchor_world: core::Point::default(),
+            query: WorldTextInputState::new("search", 6..6),
+            selected: 0,
+            connect_from: None,
+        });
+        assert_eq!(editor.active_input_state().unwrap().text, "search");
+        assert_eq!(editor.active_text_world_rect(), None);
+        editor.catalog_menu = None;
+        assert_eq!(editor.active_text_world_rect(), Some(bounds));
     }
 
     #[test]
