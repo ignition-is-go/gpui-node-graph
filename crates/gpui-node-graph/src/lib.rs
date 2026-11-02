@@ -1,3 +1,4 @@
+mod wheel;
 mod windows;
 
 use gpui::{
@@ -3992,13 +3993,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     ) {
         let delta = event.delta.pixel_delta(window.line_height());
         let delta_y = f32::from(delta.y);
-        if delta_y.abs() <= f32::EPSILON {
+        let Some(factor) = wheel::zoom_factor(delta_y, self.config.zoom_step) else {
             return;
-        }
-        let factor = if delta_y < 0.0 {
-            self.config.zoom_step.exp()
-        } else {
-            (-self.config.zoom_step).exp()
         };
         let local = self.local_screen(event.position);
         let previous = self.graph.viewport;
