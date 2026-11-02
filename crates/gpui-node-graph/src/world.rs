@@ -226,6 +226,8 @@ pub struct WorldHitRegion {
     /// Human-readable name for projected semantic controls.
     pub accessible_label: Option<String>,
     pub accessible_role: AccessibleControlRole,
+    /// Opt in to auxiliary-button gestures instead of canvas panning/inspection.
+    pub middle_pointer: bool,
     pub accessible_value: Option<String>,
     pub accessible_numeric_value: Option<f64>,
     pub accessible_min_numeric_value: Option<f64>,
@@ -241,12 +243,18 @@ impl WorldHitRegion {
             shape,
             accessible_label: None,
             accessible_role: AccessibleControlRole::Button,
+            middle_pointer: false,
             accessible_value: None,
             accessible_numeric_value: None,
             accessible_min_numeric_value: None,
             accessible_max_numeric_value: None,
             accessible_numeric_value_step: None,
         }
+    }
+
+    pub fn with_middle_pointer(mut self, enabled: bool) -> Self {
+        self.middle_pointer = enabled;
+        self
     }
 
     pub fn with_accessible_label(mut self, label: impl Into<String>) -> Self {

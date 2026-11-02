@@ -1972,6 +1972,7 @@ fn launch(cx: &mut App) {
                             control_id,
                             world_position,
                             click_count,
+                            button: gpui_node_graph::core::ControlPointerButton::Primary,
                         } => {
                             if let Some(node) = editor.graph.nodes.get(node_id) {
                                 event_controls.borrow_mut().pointer_activate(

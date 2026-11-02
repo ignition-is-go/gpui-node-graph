@@ -2085,6 +2085,7 @@ struct WorldControlPointer<N> {
     control_id: String,
     origin: core::Point,
     last_screen: core::Point,
+    button: core::ControlPointerButton,
 }
 
 pub struct NodeGraph<
@@ -2952,12 +2953,36 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.notify();
     }
 
-    fn begin_world_control_pointer(&mut self, node_id: N, control_id: String, local: core::Point) {
+    fn control_owns_other_button(&self, button: MouseButton) -> bool {
+        self.world_control_pointer.as_ref().is_some_and(|pointer| {
+            !matches!(
+                (pointer.button, button),
+                (core::ControlPointerButton::Primary, MouseButton::Left)
+                    | (core::ControlPointerButton::Middle, MouseButton::Middle)
+            )
+        })
+    }
+
+    fn begin_world_control_pointer(
+        &mut self,
+        node_id: N,
+        control_id: String,
+        local: core::Point,
+        button: core::ControlPointerButton,
+    ) {
+        if self
+            .world_control_pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.button != button)
+        {
+            return;
+        }
         self.world_control_pointer = Some(WorldControlPointer {
             node_id,
             control_id,
             origin: self.graph.viewport.screen_to_world(local),
             last_screen: local,
+            button,
         });
     }
 
@@ -4102,6 +4127,42 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         })
     }
 
+    fn begin_middle_control(
+        &mut self,
+        local: core::Point,
+        clicks: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(hit) = self
+            .world_scene
+            .hit_test_screen(local, self.graph.viewport)
+            .filter(|hit| hit.middle_pointer && matches!(hit.role, world::HitRole::Control))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(node_id) = self.world_control_owners.get(&hit.id).cloned() else {
+            return false;
+        };
+        self.panning = None;
+        self.middle_press = None;
+        self.activate_world_control(node_id.clone(), hit.id.clone(), cx);
+        self.begin_world_control_pointer(
+            node_id.clone(),
+            hit.id.clone(),
+            local,
+            core::ControlPointerButton::Middle,
+        );
+        cx.emit(core::GraphEvent::NodeControlPointerActivated {
+            node_id,
+            control_id: hit.id,
+            world_position: self.graph.viewport.screen_to_world(local),
+            click_count: clicks,
+            button: core::ControlPointerButton::Middle,
+        });
+        true
+    }
+
     fn begin_middle_gesture(&mut self, local: core::Point) {
         self.middle_press = Some(MiddlePress {
             origin: local,
@@ -4112,6 +4173,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn finish_middle_gesture(&mut self, local: core::Point, cx: &mut Context<Self>) {
+        if self.release_control_button(core::ControlPointerButton::Middle, cx) {
+            return;
+        }
         let press = self.middle_press.take();
         self.panning = None;
         let Some(press) = press else {
@@ -5332,6 +5396,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                     origin: pointer.origin,
                     world_position: self.graph.viewport.screen_to_world(local),
                     delta,
+                    button: pointer.button,
                 });
             }
             return;
@@ -5438,11 +5503,28 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    fn release_control_button(
+        &mut self,
+        button: core::ControlPointerButton,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .world_control_pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.button == button)
+        {
+            return false;
+        }
+        self.release_world_control_pointer(cx);
+        true
+    }
+
     fn release_world_control_pointer(&mut self, cx: &mut Context<Self>) {
         if let Some(pointer) = self.world_control_pointer.take() {
             cx.emit(core::GraphEvent::NodeControlPointerReleased {
                 node_id: pointer.node_id,
                 control_id: pointer.control_id,
+                button: pointer.button,
             });
         }
     }
@@ -5453,7 +5535,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         theme: &NodeGraphTheme,
         cx: &mut Context<Self>,
     ) {
-        self.release_world_control_pointer(cx);
+        self.release_control_button(core::ControlPointerButton::Primary, cx);
         let was_panning = self.panning.take().is_some();
         if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
             && let Some(size) = self.graph.nodes.get(&resize.id).map(|node| node.size)
@@ -6928,6 +7010,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             if editing {
                                 this.focus(window, cx);
                                 cx.stop_propagation();
@@ -7639,6 +7726,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         cx.listener({
                             let theme = Arc::clone(&theme);
                             move |this, event: &MouseDownEvent, window, cx| {
+                                if this.control_owns_other_button(event.button) {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
@@ -7656,12 +7748,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                         id.clone(),
                                         hit.id.clone(),
                                         local,
+                                        core::ControlPointerButton::Primary,
                                     );
                                     cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                         node_id: id.clone(),
                                         control_id: hit.id,
                                         world_position: this.graph.viewport.screen_to_world(local),
                                         click_count: event.click_count,
+                                        button: core::ControlPointerButton::Primary,
                                     });
                                     cx.notify();
                                     return;
@@ -7773,6 +7867,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                if this.control_owns_other_button(event.button) {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
@@ -7969,6 +8068,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if this.control_owns_other_button(event.button) {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            return;
+                        }
                         cx.stop_propagation();
                         window.prevent_default();
                         this.focus(window, cx);
@@ -8029,6 +8133,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         cx.listener({
                             let id = id.clone();
                             move |this, event: &MouseDownEvent, window, cx| {
+                                if this.control_owns_other_button(event.button) {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
@@ -8130,6 +8239,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             cx.stop_propagation();
                             window.prevent_default();
                             this.focus(window, cx);
@@ -8150,8 +8264,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Middle,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             this.focus(window, cx);
-                            this.begin_middle_gesture(this.local_screen(event.position));
+                            let local = this.local_screen(event.position);
+                            if !this.begin_middle_control(local, event.click_count, cx) {
+                                this.begin_middle_gesture(local);
+                            }
                             cx.stop_propagation();
                             window.prevent_default();
                         }),
@@ -8165,11 +8287,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     )
                     .on_mouse_up_out(
                         MouseButton::Middle,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| this.cancel_middle_gesture()),
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            this.release_control_button(core::ControlPointerButton::Middle, cx);
+                            this.cancel_middle_gesture();
+                        }),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             this.focus(window, cx);
                             let local = this.local_screen(event.position);
                             this.dismiss_overlays_before_world_pointer(local, cx);
@@ -8197,12 +8327,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     node_id.clone(),
                                     hit.id.clone(),
                                     local,
+                                    core::ControlPointerButton::Primary,
                                 );
                                 cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                     node_id,
                                     control_id: hit.id,
                                     world_position: this.graph.viewport.screen_to_world(local),
                                     click_count: event.click_count,
+                                    button: core::ControlPointerButton::Primary,
                                 });
                                 cx.notify();
                                 return;
@@ -8346,6 +8478,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             cx.stop_propagation();
                             window.prevent_default();
                             this.focus(window, cx);
@@ -8370,12 +8507,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 pointer_node_id.clone(),
                                 pointer_control_id.clone(),
                                 local,
+                                core::ControlPointerButton::Primary,
                             );
                             cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                 node_id: pointer_node_id.clone(),
                                 control_id: pointer_control_id.clone(),
                                 world_position: this.graph.viewport.screen_to_world(local),
                                 click_count: event.click_count,
+                                button: core::ControlPointerButton::Primary,
                             });
                         }),
                     ),
@@ -8785,6 +8924,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        if this.control_owns_other_button(event.button) {
+                                            cx.stop_propagation();
+                                            window.prevent_default();
+                                            return;
+                                        }
                                         cx.stop_propagation();
                                         window.prevent_default();
                                         this.focus(window, cx);
@@ -9110,10 +9254,64 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             overlay_root = overlay_root.child(menu_element);
         }
 
+        let control_capture = {
+            let graph = cx.entity();
+            let theme = Arc::clone(&theme);
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let moving = graph.clone();
+                    let move_theme = Arc::clone(&theme);
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        moving.update(cx, |this, cx| {
+                            if this.world_control_pointer.is_some() {
+                                let local = this.local_screen(event.position);
+                                this.handle_pointer_move(local, &move_theme, cx);
+                                cx.stop_propagation();
+                            }
+                        });
+                    });
+                    let pressing = graph.clone();
+                    window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture
+                            && pressing.read(cx).control_owns_other_button(event.button)
+                        {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        }
+                    });
+                    let releasing = graph.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        releasing.update(cx, |this, cx| match event.button {
+                            MouseButton::Left => {
+                                this.release_control_button(
+                                    core::ControlPointerButton::Primary,
+                                    cx,
+                                );
+                            }
+                            MouseButton::Middle => {
+                                this.release_control_button(core::ControlPointerButton::Middle, cx);
+                            }
+                            _ => {}
+                        });
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
+        };
+
         let root = div()
             .id(("node-graph-root", cx.entity_id()))
             .relative()
             .size_full()
+            .child(control_capture)
             .child(world_root)
             .child(overlay_root);
         let root_right_theme = Arc::clone(&theme);
@@ -9122,12 +9320,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let root_up_theme = Arc::clone(&theme);
         let root_up_out_theme = Arc::clone(&theme);
 
-        root.capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
-            if event.button == MouseButton::Left {
-                this.release_world_control_pointer(cx);
-            }
-        }))
-        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+        root.on_hover(cx.listener(|this, hovered: &bool, _, cx| {
             if !hovered {
                 if this.hovered_node.take().is_some() {
                     cx.emit(core::GraphEvent::NodeHoverChanged { node: None });
@@ -9138,6 +9331,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                if this.control_owns_other_button(event.button) {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 cx.stop_propagation();
                 window.prevent_default();
                 this.focus(window, cx);
@@ -9159,10 +9357,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_down(
             MouseButton::Middle,
             cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if this.control_owns_other_button(event.button) {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 this.anchor_menu = None;
                 this.focus(window, cx);
                 this.commit_group_editor(cx);
-                this.begin_middle_gesture(this.local_screen(event.position));
+                let local = this.local_screen(event.position);
+                if !this.begin_middle_control(local, event.click_count, cx) {
+                    this.begin_middle_gesture(local);
+                }
                 cx.stop_propagation();
                 window.prevent_default();
             }),
@@ -9170,6 +9376,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                if this.control_owns_other_button(event.button) {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 this.anchor_menu = None;
                 this.focus(window, cx);
                 let local = this.local_screen(event.position);
@@ -9246,7 +9457,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         )
         .on_mouse_up_out(
             MouseButton::Middle,
-            cx.listener(|this, _: &MouseUpEvent, _, _| this.cancel_middle_gesture()),
+            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.release_control_button(core::ControlPointerButton::Middle, cx);
+                this.cancel_middle_gesture();
+            }),
         )
         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
             this.handle_scroll_wheel(event, window, cx);
@@ -10579,7 +10793,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn control_release_survives_a_child_consuming_mouse_up(cx: &mut gpui::TestAppContext) {
+    fn control_capture_survives_a_child_consuming_pointer_events(cx: &mut gpui::TestAppContext) {
         cx.update(|app| {
             let mut theme = NodeGraphTheme::default();
             theme.overlay.panel_pointer_events = false;
@@ -10602,7 +10816,24 @@ mod tests {
                                 .debug_selector(|| "consumes-control-release".into())
                                 .w(px(80.0))
                                 .h(px(30.0))
-                                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    canvas(
+                                        |_, _, _| (),
+                                        |_, _, window, _| {
+                                            window.on_mouse_event(
+                                                |_: &MouseMoveEvent, phase, _, cx| {
+                                                    if phase == DispatchPhase::Capture {
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            );
+                                        },
+                                    )
+                                    .absolute()
+                                    .size_full(),
+                                ),
                         )]
                     },
                 )
@@ -10634,15 +10865,100 @@ mod tests {
                 "a".into(),
                 "field".into(),
                 core::Point::new(f32::from(position.x), f32::from(position.y)),
+                core::ControlPointerButton::Primary,
             );
+            cx.notify();
         });
+        cx.simulate_mouse_move(
+            position + point(px(5.0), px(0.0)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
         cx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_move(
             position + point(px(5.0), px(0.0)),
             None,
             gpui::Modifiers::default(),
         );
-        assert_eq!(*events.borrow(), vec!["released"]);
+        assert_eq!(*events.borrow(), vec!["drag", "released"]);
+    }
+
+    #[gpui::test]
+    fn middle_pointer_is_opt_in_and_releases_only_its_own_button(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        let _subscription = cx.update(|app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerActivated {
+                        button: core::ControlPointerButton::Middle,
+                        ..
+                    } => captured.borrow_mut().push("middle-down"),
+                    core::GraphEvent::NodeControlPointerDragged {
+                        button: core::ControlPointerButton::Middle,
+                        ..
+                    } => captured.borrow_mut().push("middle-drag"),
+                    core::GraphEvent::NodeControlPointerReleased {
+                        button: core::ControlPointerButton::Middle,
+                        ..
+                    } => captured.borrow_mut().push("middle-up"),
+                    core::GraphEvent::NodeMiddleClicked { .. } => {
+                        captured.borrow_mut().push("inspect")
+                    }
+                    _ => {}
+                },
+            )
+        });
+        editor.update(cx, |editor, cx| {
+            let bounds = core::Rect {
+                origin: core::Point::new(20.0, 20.0),
+                size: core::Size {
+                    width: 100.0,
+                    height: 20.0,
+                },
+            };
+            editor
+                .world_scene
+                .push_hit_region(world::WorldHitRegion::new(
+                    "number",
+                    world::HitRole::Control,
+                    world::HitShape::Rect(bounds),
+                ));
+            editor
+                .world_control_owners
+                .insert("number".into(), "a".into());
+            let start = core::Point::new(30.0, 30.0);
+            assert!(!editor.begin_middle_control(start, 1, cx));
+            editor.world_scene.hit_regions[0].middle_pointer = true;
+            assert!(editor.begin_middle_control(start, 1, cx));
+            assert!(editor.control_owns_other_button(MouseButton::Left));
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "other".into(),
+                start,
+                core::ControlPointerButton::Primary,
+            );
+            assert!(!editor.release_control_button(core::ControlPointerButton::Primary, cx));
+            editor.handle_pointer_move(
+                core::Point::new(300.0, 400.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            editor.finish_middle_gesture(core::Point::new(300.0, 400.0), cx);
+            editor.handle_pointer_move(
+                core::Point::new(310.0, 400.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            assert_eq!(editor.graph.viewport, core::Viewport::default());
+            assert_eq!(editor.graph.nodes["a"].position, core::Point::default());
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec!["middle-down", "middle-drag", "middle-up"]
+        );
     }
 
     #[gpui::test]
@@ -10687,6 +11003,7 @@ mod tests {
                 "a".into(),
                 "field".into(),
                 core::Point::new(30.0, 40.0),
+                core::ControlPointerButton::Primary,
             );
             editor.handle_pointer_move(
                 core::Point::new(50.0, 30.0),
