@@ -6612,9 +6612,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         };
         let wire_move_theme = Arc::clone(&theme);
         let wire_up_theme = Arc::clone(&theme);
+        let bounds_graph = cx.weak_entity();
         let wire_layer = canvas(
-            move |bounds, _, _| {
-                canvas_bounds.set(bounds);
+            move |bounds, _, cx| {
+                let previous = canvas_bounds.replace(bounds);
+                if previous.size != bounds.size {
+                    let graph = bounds_graph.clone();
+                    cx.defer(move |cx| {
+                        let _ = graph.update(cx, |_, cx| cx.notify());
+                    });
+                }
             },
             move |bounds, _, window, _cx| {
                 let graph = captured_graph.clone();
@@ -10066,6 +10073,49 @@ mod tests {
             assert!(!shortcut.command.id().is_empty());
             assert!(!shortcut.command.label().is_empty());
             assert_eq!(shortcut.command.group(), "Node graph");
+        }
+    }
+
+    #[gpui::test]
+    fn adaptive_overlay_repositions_after_canvas_resize(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            NodeGraph::new(interactive_graph(), cx)
+                .with_world_node_body_renderer(|_| world::WorldScene::default())
+                .with_node_overlay_renderer(
+                    |context: WorldNodeBodyContext<Kind, String, String>,
+                     _: &mut Window,
+                     _: &mut App| {
+                        if context.node.id != "a" {
+                            return Vec::new();
+                        }
+                        vec![
+                            NodeOverlay::new(
+                                core::Point::new(86.0, 187.0),
+                                div()
+                                    .id("resize-popup")
+                                    .debug_selector(|| "resize-popup".into())
+                                    .w(px(314.))
+                                    .h(px(117.)),
+                            )
+                            .adaptive(
+                                "resize-popup",
+                                core::Size {
+                                    width: 314.,
+                                    height: 117.,
+                                },
+                            ),
+                        ]
+                    },
+                )
+        });
+        for (width, expected_x) in [(900., 86.), (300., 0.), (900., 86.)] {
+            cx.simulate_resize(gpui::size(px(width), px(650.)));
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds("resize-popup").unwrap().origin.x,
+                px(expected_x)
+            );
         }
     }
 
