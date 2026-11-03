@@ -5953,6 +5953,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .focus_handle
+            .as_ref()
+            .is_some_and(|focus| !focus.is_focused(window))
+        {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         let shift = event.keystroke.modifiers.shift;
@@ -10117,6 +10124,56 @@ mod tests {
                 px(expected_x)
             );
         }
+    }
+
+    #[gpui::test]
+    fn child_editor_keys_are_not_world_control_keys(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let window = cx.add_window(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        let editor = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let keys = Rc::new(RefCell::new(Vec::new()));
+        let observed = keys.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if let core::GraphEvent::NodeControlKeyDown { key, .. } = event {
+                        observed.borrow_mut().push(key.clone());
+                    }
+                },
+            )
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                editor.last_world_control = Some(("a".into(), "field".into()));
+                let other_focus = cx.focus_handle();
+                other_focus.focus(window, cx);
+                let event = KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("t").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                editor.handle_key_down(&event, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(keys.borrow().is_empty());
+        window
+            .update(cx, |editor, window, cx| {
+                editor.focus_handle().focus(window, cx);
+                editor.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("t").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*keys.borrow(), vec!["t"]);
     }
 
     #[test]
