@@ -268,6 +268,12 @@ pub enum GraphMutation<N: Eq + Hash, P, C: Eq + Hash, T> {
     ReconcileNodePorts { change: PortChange<N, P, T> },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlPointerButton {
+    Primary,
+    Middle,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
     MutationRequested {
@@ -292,6 +298,22 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
         control_id: String,
         world_position: Point,
         click_count: usize,
+        button: ControlPointerButton,
+    },
+    /// A captured pointer gesture inside a world-space control.
+    /// `delta` is incremental pane-space travel in logical pixels; positions are world units.
+    NodeControlPointerDragged {
+        node_id: N,
+        control_id: String,
+        origin: Point,
+        world_position: Point,
+        delta: Point,
+        button: ControlPointerButton,
+    },
+    NodeControlPointerReleased {
+        node_id: N,
+        control_id: String,
+        button: ControlPointerButton,
     },
     /// A key press routed to the most recently activated world-space control.
     /// `text` is the produced character (when any), kept separate from the

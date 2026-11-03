@@ -1,4 +1,6 @@
+mod wheel;
 mod windows;
+mod world_text;
 
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, BoxShadow, Context, DispatchPhase, Element, ElementId,
@@ -1125,6 +1127,8 @@ pub struct EditorConfig {
     pub min_zoom: f32,
     pub max_zoom: f32,
     pub zoom_step: f32,
+    /// Walk controls on Tab. Disable when the consumer owns field traversal.
+    pub control_tab_navigation: bool,
     pub grid_size: Option<f32>,
     /// Port snap radius in screen pixels.
     pub snap_distance: f32,
@@ -1156,6 +1160,7 @@ impl Default for EditorConfig {
             min_zoom: 0.1,
             max_zoom: 5.0,
             zoom_step: 0.3,
+            control_tab_navigation: true,
             grid_size: None,
             snap_distance: 22.0,
             fit_padding: 48.0,
@@ -1580,6 +1585,7 @@ struct WorldTextPaint {
 struct WorldPaintState {
     scene: world::ScreenScene,
     text: Vec<WorldTextPaint>,
+    inputs: Vec<world_text::TextInputPaint>,
 }
 
 /// Return the reference SVG silhouette for a non-circular anchor dot in world units.
@@ -1656,6 +1662,7 @@ pub struct WorldSceneElement {
     id: ElementId,
     scene: world::WorldScene,
     viewport: Viewport,
+    text_layouts: Option<world_text::Layouts>,
 }
 
 impl WorldSceneElement {
@@ -1664,19 +1671,37 @@ impl WorldSceneElement {
             id: id.into(),
             scene,
             viewport,
+            text_layouts: None,
         }
+    }
+
+    fn with_text_layouts(mut self, layouts: world_text::Layouts) -> Self {
+        self.text_layouts = Some(layouts);
+        self
     }
 }
 
 impl gpui::RenderOnce for WorldSceneElement {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         let projected = self.scene.project(self.viewport);
+        let layouts = self.text_layouts;
         div().id(self.id).absolute().size_full().child(
             canvas(
                 move |_bounds, window, _cx| {
                     let mut text = Vec::new();
+                    let mut inputs = Vec::new();
+                    if let Some(layouts) = &layouts {
+                        layouts.borrow_mut().clear();
+                    }
                     let text_style = window.text_style();
                     for primitive in &projected.primitives {
+                        if let world::ScreenPrimitive::TextInput(field) = primitive {
+                            let input = world_text::TextInputPaint::new(field.clone(), window);
+                            if let Some(layouts) = &layouts {
+                                layouts.borrow_mut().insert(field.id.clone(), input.clone());
+                            }
+                            inputs.push(input);
+                        }
                         if let world::ScreenPrimitive::Text {
                             origin,
                             lines,
@@ -1715,6 +1740,7 @@ impl gpui::RenderOnce for WorldSceneElement {
                     WorldPaintState {
                         scene: projected,
                         text,
+                        inputs,
                     }
                 },
                 move |bounds, state, window, cx| {
@@ -1821,7 +1847,8 @@ impl gpui::RenderOnce for WorldSceneElement {
                                     }
                                 }
                             }
-                            world::ScreenPrimitive::Text { .. } => {}
+                            world::ScreenPrimitive::Text { .. }
+                            | world::ScreenPrimitive::TextInput(_) => {}
                         }
                     }
                     for text in &state.text {
@@ -1833,6 +1860,9 @@ impl gpui::RenderOnce for WorldSceneElement {
                             window,
                             cx,
                         );
+                    }
+                    for input in &state.inputs {
+                        input.paint(offset, window, cx);
                     }
                 },
             )
@@ -2053,6 +2083,14 @@ impl WorldTextInputState {
     }
 }
 
+struct WorldControlPointer<N> {
+    node_id: N,
+    control_id: String,
+    origin: core::Point,
+    last_screen: core::Point,
+    button: core::ControlPointerButton,
+}
+
 pub struct NodeGraph<
     T: PortType,
     N: core::NodeId = String,
@@ -2089,7 +2127,9 @@ pub struct NodeGraph<
     world_control_owners: HashMap<String, N>,
     world_control_order: Vec<(N, String)>,
     last_world_control: Option<(N, String)>,
+    world_control_pointer: Option<WorldControlPointer<N>>,
     world_text_input: Option<(N, String, WorldTextInputState)>,
+    world_text_layouts: world_text::Layouts,
     groups: Vec<GraphGroup<N>>,
     group_palette: Vec<u32>,
     open_group_palette: Option<String>,
@@ -2185,7 +2225,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             world_control_owners: HashMap::new(),
             world_control_order: Vec::new(),
             last_world_control: None,
+            world_control_pointer: None,
             world_text_input: None,
+            world_text_layouts: Rc::new(RefCell::new(HashMap::new())),
             groups: Vec::new(),
             group_palette: Vec::new(),
             open_group_palette: None,
@@ -2914,6 +2956,39 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.notify();
     }
 
+    fn control_owns_other_button(&self, button: MouseButton) -> bool {
+        self.world_control_pointer.as_ref().is_some_and(|pointer| {
+            !matches!(
+                (pointer.button, button),
+                (core::ControlPointerButton::Primary, MouseButton::Left)
+                    | (core::ControlPointerButton::Middle, MouseButton::Middle)
+            )
+        })
+    }
+
+    fn begin_world_control_pointer(
+        &mut self,
+        node_id: N,
+        control_id: String,
+        local: core::Point,
+        button: core::ControlPointerButton,
+    ) {
+        if self
+            .world_control_pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.button != button)
+        {
+            return;
+        }
+        self.world_control_pointer = Some(WorldControlPointer {
+            node_id,
+            control_id,
+            origin: self.graph.viewport.screen_to_world(local),
+            last_screen: local,
+            button,
+        });
+    }
+
     fn activate_world_control(&mut self, node_id: N, control_id: String, cx: &mut Context<Self>) {
         if self.last_world_control.as_ref() != Some(&(node_id.clone(), control_id.clone())) {
             self.blur_world_control(cx);
@@ -3019,7 +3094,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .as_ref()
             .map(|(node, control)| (node, control.as_str()))
     }
+    /// Resolve a pointer in world coordinates using the active field's shaped glyphs.
+    /// The returned offset uses UTF-16 code units, matching platform input state.
+    pub fn world_text_index_at(&self, control_id: &str, position: core::Point) -> Option<usize> {
+        self.world_text_layouts
+            .borrow()
+            .get(control_id)
+            .map(|layout| layout.index_at(self.graph.viewport.world_to_screen(position)))
+    }
+
     fn blur_world_control(&mut self, cx: &mut Context<Self>) {
+        self.world_control_pointer = None;
         if let Some((node_id, control_id)) = self.last_world_control.take() {
             cx.emit(core::GraphEvent::NodeControlBlurred {
                 node_id,
@@ -3950,6 +4035,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn cancel_gestures(&mut self) {
+        self.world_control_pointer = None;
         if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
             let _ = self.graph.move_nodes(&drag.starts);
         }
@@ -3992,13 +4078,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     ) {
         let delta = event.delta.pixel_delta(window.line_height());
         let delta_y = f32::from(delta.y);
-        if delta_y.abs() <= f32::EPSILON {
+        let Some(factor) = wheel::zoom_factor(delta_y, self.config.zoom_step) else {
             return;
-        }
-        let factor = if delta_y < 0.0 {
-            self.config.zoom_step.exp()
-        } else {
-            (-self.config.zoom_step).exp()
         };
         let local = self.local_screen(event.position);
         let previous = self.graph.viewport;
@@ -4049,6 +4130,42 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         })
     }
 
+    fn begin_middle_control(
+        &mut self,
+        local: core::Point,
+        clicks: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(hit) = self
+            .world_scene
+            .hit_test_screen(local, self.graph.viewport)
+            .filter(|hit| hit.middle_pointer && matches!(hit.role, world::HitRole::Control))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(node_id) = self.world_control_owners.get(&hit.id).cloned() else {
+            return false;
+        };
+        self.panning = None;
+        self.middle_press = None;
+        self.activate_world_control(node_id.clone(), hit.id.clone(), cx);
+        self.begin_world_control_pointer(
+            node_id.clone(),
+            hit.id.clone(),
+            local,
+            core::ControlPointerButton::Middle,
+        );
+        cx.emit(core::GraphEvent::NodeControlPointerActivated {
+            node_id,
+            control_id: hit.id,
+            world_position: self.graph.viewport.screen_to_world(local),
+            click_count: clicks,
+            button: core::ControlPointerButton::Middle,
+        });
+        true
+    }
+
     fn begin_middle_gesture(&mut self, local: core::Point) {
         self.middle_press = Some(MiddlePress {
             origin: local,
@@ -4059,6 +4176,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn finish_middle_gesture(&mut self, local: core::Point, cx: &mut Context<Self>) {
+        if self.release_control_button(core::ControlPointerButton::Middle, cx) {
+            return;
+        }
         let press = self.middle_press.take();
         self.panning = None;
         let Some(press) = press else {
@@ -5266,6 +5386,24 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.emit(core::GraphEvent::PointerMoved {
             position: self.graph.viewport.screen_to_world(local),
         });
+        if let Some(pointer) = &mut self.world_control_pointer {
+            let delta = core::Point::new(
+                local.x - pointer.last_screen.x,
+                local.y - pointer.last_screen.y,
+            );
+            pointer.last_screen = local;
+            if delta.x != 0.0 || delta.y != 0.0 {
+                cx.emit(core::GraphEvent::NodeControlPointerDragged {
+                    node_id: pointer.node_id.clone(),
+                    control_id: pointer.control_id.clone(),
+                    origin: pointer.origin,
+                    world_position: self.graph.viewport.screen_to_world(local),
+                    delta,
+                    button: pointer.button,
+                });
+            }
+            return;
+        }
         let hovered_node = self.node_at_screen(local);
         if self.hovered_node != hovered_node {
             self.hovered_node = hovered_node.clone();
@@ -5368,12 +5506,39 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
+    fn release_control_button(
+        &mut self,
+        button: core::ControlPointerButton,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .world_control_pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.button == button)
+        {
+            return false;
+        }
+        self.release_world_control_pointer(cx);
+        true
+    }
+
+    fn release_world_control_pointer(&mut self, cx: &mut Context<Self>) {
+        if let Some(pointer) = self.world_control_pointer.take() {
+            cx.emit(core::GraphEvent::NodeControlPointerReleased {
+                node_id: pointer.node_id,
+                control_id: pointer.control_id,
+                button: pointer.button,
+            });
+        }
+    }
+
     fn finish_left_gesture(
         &mut self,
         preserve_click_draft: bool,
         theme: &NodeGraphTheme,
         cx: &mut Context<Self>,
     ) {
+        self.release_control_button(core::ControlPointerButton::Primary, cx);
         let was_panning = self.panning.take().is_some();
         if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
             && let Some(size) = self.graph.nodes.get(&resize.id).map(|node| node.size)
@@ -5524,8 +5689,40 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         shift: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.edit_text_key(key, character, command, shift, false, cx)
+    }
+
+    /// Apply ordinary text-editing keys to the active world-space document.
+    /// Uses the same Unicode selection, deletion, and clipboard behavior as the catalog.
+    /// Enter, Escape, and other consumer actions return false for the caller to handle.
+    pub fn edit_world_text_key(
+        &mut self,
+        key: &str,
+        character: Option<&str>,
+        command: bool,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.edit_text_key(key, character, command, shift, true, cx)
+    }
+
+    fn edit_text_key(
+        &mut self,
+        key: &str,
+        character: Option<&str>,
+        command: bool,
+        shift: bool,
+        world: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if (world && self.world_text_input.is_none())
+            || (!world && self.inline_text_state().is_none())
+            || (world && self.inline_text_state().is_some())
+        {
+            return false;
+        }
         if command && key == "c" {
-            if let Some(text) = self.inline_text_state().and_then(selected_text) {
+            if let Some(text) = self.active_input_state().and_then(selected_text) {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
             }
             return true;
@@ -5534,14 +5731,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .then(|| cx.read_from_clipboard().and_then(|item| item.text()))
             .flatten();
         let cut = if command && key == "x" {
-            self.inline_text_state().and_then(selected_text)
+            self.active_input_state().and_then(selected_text)
         } else {
             None
         };
         if let Some(text) = cut.as_ref() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
         }
-        let Some(state) = self.inline_text_state_mut() else {
+        let Some(state) = self.active_input_state_mut() else {
             return false;
         };
         let before = state.clone();
@@ -5598,10 +5795,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             _ => return false,
         }
         let changed = state.text != before.text;
-        if changed && let Some(menu) = self.catalog_menu.as_mut() {
-            menu.selected = 0;
+        if world {
+            self.emit_world_text_changed(cx);
+        } else {
+            if changed && let Some(menu) = self.catalog_menu.as_mut() {
+                menu.selected = 0;
+            }
+            cx.notify();
         }
-        cx.notify();
         true
     }
 
@@ -5752,6 +5953,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .focus_handle
+            .as_ref()
+            .is_some_and(|focus| !focus.is_focused(window))
+        {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         let shift = event.keystroke.modifiers.shift;
@@ -5768,7 +5976,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 shift,
                 command,
             });
-            if key == "tab" {
+            if key == "tab" && self.config.control_tab_navigation {
                 self.blur_world_control(cx);
                 if !self.world_control_order.is_empty() {
                     let current =
@@ -6078,6 +6286,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn active_text_world_rect(&self) -> Option<core::Rect> {
+        if self.inline_text_state().is_some() {
+            return None;
+        }
         let (node, control, _) = self.world_text_input.as_ref()?;
         if self.last_world_control.as_ref() != Some(&(node.clone(), control.clone())) {
             return None;
@@ -6202,6 +6413,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Entit
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let rect = self.active_text_world_rect()?;
+        if let Some((_, control, _)) = &self.world_text_input
+            && let Some(layout) = self.world_text_layouts.borrow().get(control)
+        {
+            let mut bounds = layout.range_bounds(range);
+            bounds.origin += self.canvas_bounds.get().origin;
+            return Some(bounds);
+        }
         let canvas = self.canvas_bounds.get();
         let len = self
             .world_text_input
@@ -6230,6 +6448,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Entit
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let rect = self.active_text_world_rect()?;
+        if let Some((_, control, _)) = &self.world_text_input
+            && let Some(layout) = self.world_text_layouts.borrow().get(control)
+        {
+            return Some(layout.index_at(self.local_screen(point)));
+        }
         let local = self.local_screen(point);
         let world = self.graph.viewport.screen_to_world(local);
         let fraction =
@@ -6396,9 +6619,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         };
         let wire_move_theme = Arc::clone(&theme);
         let wire_up_theme = Arc::clone(&theme);
+        let bounds_graph = cx.weak_entity();
         let wire_layer = canvas(
-            move |bounds, _, _| {
-                canvas_bounds.set(bounds);
+            move |bounds, _, cx| {
+                let previous = canvas_bounds.replace(bounds);
+                if previous.size != bounds.size {
+                    let graph = bounds_graph.clone();
+                    cx.defer(move |cx| {
+                        let _ = graph.update(cx, |_, cx| cx.notify());
+                    });
+                }
             },
             move |bounds, _, window, _cx| {
                 let graph = captured_graph.clone();
@@ -6797,6 +7027,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             if editing {
                                 this.focus(window, cx);
                                 cx.stop_propagation();
@@ -7508,6 +7743,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         cx.listener({
                             let theme = Arc::clone(&theme);
                             move |this, event: &MouseDownEvent, window, cx| {
+                                if this.control_owns_other_button(event.button) {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
@@ -7521,11 +7761,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     && this.world_control_owners.get(&hit.id) == Some(&id)
                                 {
                                     this.activate_world_control(id.clone(), hit.id.clone(), cx);
+                                    this.begin_world_control_pointer(
+                                        id.clone(),
+                                        hit.id.clone(),
+                                        local,
+                                        core::ControlPointerButton::Primary,
+                                    );
                                     cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                         node_id: id.clone(),
                                         control_id: hit.id,
                                         world_position: this.graph.viewport.screen_to_world(local),
                                         click_count: event.click_count,
+                                        button: core::ControlPointerButton::Primary,
                                     });
                                     cx.notify();
                                     return;
@@ -7637,6 +7884,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                if this.control_owns_other_button(event.button) {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
@@ -7833,6 +8085,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if this.control_owns_other_button(event.button) {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            return;
+                        }
                         cx.stop_propagation();
                         window.prevent_default();
                         this.focus(window, cx);
@@ -7893,6 +8150,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         cx.listener({
                             let id = id.clone();
                             move |this, event: &MouseDownEvent, window, cx| {
+                                if this.control_owns_other_button(event.button) {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 window.prevent_default();
                                 this.focus(window, cx);
@@ -7976,11 +8238,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .absolute()
                     .size_full()
                     .occlude()
-                    .child(WorldSceneElement::new(
-                        ("node-graph-world-scene", cx.entity().entity_id()),
-                        frame_world_scene,
-                        viewport,
-                    ))
+                    .child(
+                        WorldSceneElement::new(
+                            ("node-graph-world-scene", cx.entity().entity_id()),
+                            frame_world_scene,
+                            viewport,
+                        )
+                        .with_text_layouts(self.world_text_layouts.clone()),
+                    )
                     .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
                         let local = this.local_screen(event.position);
                         this.handle_pointer_move(local, &world_move_theme, cx);
@@ -7991,6 +8256,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             cx.stop_propagation();
                             window.prevent_default();
                             this.focus(window, cx);
@@ -8011,8 +8281,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Middle,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             this.focus(window, cx);
-                            this.begin_middle_gesture(this.local_screen(event.position));
+                            let local = this.local_screen(event.position);
+                            if !this.begin_middle_control(local, event.click_count, cx) {
+                                this.begin_middle_gesture(local);
+                            }
                             cx.stop_propagation();
                             window.prevent_default();
                         }),
@@ -8026,11 +8304,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     )
                     .on_mouse_up_out(
                         MouseButton::Middle,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| this.cancel_middle_gesture()),
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            this.release_control_button(core::ControlPointerButton::Middle, cx);
+                            this.cancel_middle_gesture();
+                        }),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             this.focus(window, cx);
                             let local = this.local_screen(event.position);
                             this.dismiss_overlays_before_world_pointer(local, cx);
@@ -8054,11 +8340,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 this.focus(window, cx);
                                 this.commit_group_editor(cx);
                                 this.activate_world_control(node_id.clone(), hit.id.clone(), cx);
+                                this.begin_world_control_pointer(
+                                    node_id.clone(),
+                                    hit.id.clone(),
+                                    local,
+                                    core::ControlPointerButton::Primary,
+                                );
                                 cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                     node_id,
                                     control_id: hit.id,
                                     world_position: this.graph.viewport.screen_to_world(local),
                                     click_count: event.click_count,
+                                    button: core::ControlPointerButton::Primary,
                                 });
                                 cx.notify();
                                 return;
@@ -8202,6 +8495,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if this.control_owns_other_button(event.button) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                return;
+                            }
                             cx.stop_propagation();
                             window.prevent_default();
                             this.focus(window, cx);
@@ -8222,11 +8520,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 pointer_control_id.clone(),
                                 cx,
                             );
+                            this.begin_world_control_pointer(
+                                pointer_node_id.clone(),
+                                pointer_control_id.clone(),
+                                local,
+                                core::ControlPointerButton::Primary,
+                            );
                             cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                 node_id: pointer_node_id.clone(),
                                 control_id: pointer_control_id.clone(),
                                 world_position: this.graph.viewport.screen_to_world(local),
                                 click_count: event.click_count,
+                                button: core::ControlPointerButton::Primary,
                             });
                         }),
                     ),
@@ -8636,6 +8941,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        if this.control_owns_other_button(event.button) {
+                                            cx.stop_propagation();
+                                            window.prevent_default();
+                                            return;
+                                        }
                                         cx.stop_propagation();
                                         window.prevent_default();
                                         this.focus(window, cx);
@@ -8961,10 +9271,64 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             overlay_root = overlay_root.child(menu_element);
         }
 
+        let control_capture = {
+            let graph = cx.entity();
+            let theme = Arc::clone(&theme);
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let moving = graph.clone();
+                    let move_theme = Arc::clone(&theme);
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        moving.update(cx, |this, cx| {
+                            if this.world_control_pointer.is_some() {
+                                let local = this.local_screen(event.position);
+                                this.handle_pointer_move(local, &move_theme, cx);
+                                cx.stop_propagation();
+                            }
+                        });
+                    });
+                    let pressing = graph.clone();
+                    window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture
+                            && pressing.read(cx).control_owns_other_button(event.button)
+                        {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        }
+                    });
+                    let releasing = graph.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        releasing.update(cx, |this, cx| match event.button {
+                            MouseButton::Left => {
+                                this.release_control_button(
+                                    core::ControlPointerButton::Primary,
+                                    cx,
+                                );
+                            }
+                            MouseButton::Middle => {
+                                this.release_control_button(core::ControlPointerButton::Middle, cx);
+                            }
+                            _ => {}
+                        });
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
+        };
+
         let root = div()
             .id(("node-graph-root", cx.entity_id()))
             .relative()
             .size_full()
+            .child(control_capture)
             .child(world_root)
             .child(overlay_root);
         let root_right_theme = Arc::clone(&theme);
@@ -8984,6 +9348,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                if this.control_owns_other_button(event.button) {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 cx.stop_propagation();
                 window.prevent_default();
                 this.focus(window, cx);
@@ -9005,10 +9374,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_down(
             MouseButton::Middle,
             cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if this.control_owns_other_button(event.button) {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 this.anchor_menu = None;
                 this.focus(window, cx);
                 this.commit_group_editor(cx);
-                this.begin_middle_gesture(this.local_screen(event.position));
+                let local = this.local_screen(event.position);
+                if !this.begin_middle_control(local, event.click_count, cx) {
+                    this.begin_middle_gesture(local);
+                }
                 cx.stop_propagation();
                 window.prevent_default();
             }),
@@ -9016,6 +9393,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                if this.control_owns_other_button(event.button) {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    return;
+                }
                 this.anchor_menu = None;
                 this.focus(window, cx);
                 let local = this.local_screen(event.position);
@@ -9092,7 +9474,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         )
         .on_mouse_up_out(
             MouseButton::Middle,
-            cx.listener(|this, _: &MouseUpEvent, _, _| this.cancel_middle_gesture()),
+            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.release_control_button(core::ControlPointerButton::Middle, cx);
+                this.cancel_middle_gesture();
+            }),
         )
         .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
             this.handle_scroll_wheel(event, window, cx);
@@ -9696,6 +10081,99 @@ mod tests {
             assert!(!shortcut.command.label().is_empty());
             assert_eq!(shortcut.command.group(), "Node graph");
         }
+    }
+
+    #[gpui::test]
+    fn adaptive_overlay_repositions_after_canvas_resize(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            NodeGraph::new(interactive_graph(), cx)
+                .with_world_node_body_renderer(|_| world::WorldScene::default())
+                .with_node_overlay_renderer(
+                    |context: WorldNodeBodyContext<Kind, String, String>,
+                     _: &mut Window,
+                     _: &mut App| {
+                        if context.node.id != "a" {
+                            return Vec::new();
+                        }
+                        vec![
+                            NodeOverlay::new(
+                                core::Point::new(86.0, 187.0),
+                                div()
+                                    .id("resize-popup")
+                                    .debug_selector(|| "resize-popup".into())
+                                    .w(px(314.))
+                                    .h(px(117.)),
+                            )
+                            .adaptive(
+                                "resize-popup",
+                                core::Size {
+                                    width: 314.,
+                                    height: 117.,
+                                },
+                            ),
+                        ]
+                    },
+                )
+        });
+        for (width, expected_x) in [(900., 86.), (300., 0.), (900., 86.)] {
+            cx.simulate_resize(gpui::size(px(width), px(650.)));
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds("resize-popup").unwrap().origin.x,
+                px(expected_x)
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn child_editor_keys_are_not_world_control_keys(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let window = cx.add_window(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        let editor = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let keys = Rc::new(RefCell::new(Vec::new()));
+        let observed = keys.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if let core::GraphEvent::NodeControlKeyDown { key, .. } = event {
+                        observed.borrow_mut().push(key.clone());
+                    }
+                },
+            )
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                editor.last_world_control = Some(("a".into(), "field".into()));
+                let other_focus = cx.focus_handle();
+                other_focus.focus(window, cx);
+                let event = KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("t").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                editor.handle_key_down(&event, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(keys.borrow().is_empty());
+        window
+            .update(cx, |editor, window, cx| {
+                editor.focus_handle().focus(window, cx);
+                editor.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("t").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*keys.borrow(), vec!["t"]);
     }
 
     #[test]
@@ -10422,6 +10900,326 @@ mod tests {
             drop.initial_values.get("channel").map(String::as_str),
             Some("red")
         );
+    }
+
+    #[gpui::test]
+    fn control_capture_survives_a_child_consuming_pointer_events(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            let mut theme = NodeGraphTheme::default();
+            theme.overlay.panel_pointer_events = false;
+            set_node_graph_theme(app, theme);
+        });
+        let (editor, cx) = cx.add_window_view(|_, cx| {
+            NodeGraph::new(interactive_graph(), cx)
+                .with_world_node_body_renderer(|_| world::WorldScene::default())
+                .with_node_overlay_renderer(
+                    |context: WorldNodeBodyContext<Kind, String, String>,
+                     _: &mut Window,
+                     _: &mut App| {
+                        if context.node.id != "a" {
+                            return Vec::new();
+                        }
+                        vec![NodeOverlay::new(
+                            core::Point::new(200.0, 100.0),
+                            div()
+                                .id("consumes-control-release")
+                                .debug_selector(|| "consumes-control-release".into())
+                                .w(px(80.0))
+                                .h(px(30.0))
+                                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    canvas(
+                                        |_, _, _| (),
+                                        |_, _, window, _| {
+                                            window.on_mouse_event(
+                                                |_: &MouseMoveEvent, phase, _, cx| {
+                                                    if phase == DispatchPhase::Capture {
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            );
+                                        },
+                                    )
+                                    .absolute()
+                                    .size_full(),
+                                ),
+                        )]
+                    },
+                )
+        });
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds("consumes-control-release")
+            .expect("retained overlay");
+        let position = bounds.center();
+        cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        editor.update(cx, |editor, cx| {
+            let entity = cx.entity();
+            cx.subscribe(
+                &entity,
+                move |_, _, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerReleased { .. } => {
+                        captured.borrow_mut().push("released")
+                    }
+                    core::GraphEvent::NodeControlPointerDragged { .. } => {
+                        captured.borrow_mut().push("drag")
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "field".into(),
+                core::Point::new(f32::from(position.x), f32::from(position.y)),
+                core::ControlPointerButton::Primary,
+            );
+            cx.notify();
+        });
+        cx.simulate_mouse_move(
+            position + point(px(5.0), px(0.0)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            position + point(px(5.0), px(0.0)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(*events.borrow(), vec!["drag", "released"]);
+    }
+
+    #[gpui::test]
+    fn middle_pointer_is_opt_in_and_releases_only_its_own_button(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        let _subscription = cx.update(|app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerActivated {
+                        button: core::ControlPointerButton::Middle,
+                        ..
+                    } => captured.borrow_mut().push("middle-down"),
+                    core::GraphEvent::NodeControlPointerDragged {
+                        button: core::ControlPointerButton::Middle,
+                        ..
+                    } => captured.borrow_mut().push("middle-drag"),
+                    core::GraphEvent::NodeControlPointerReleased {
+                        button: core::ControlPointerButton::Middle,
+                        ..
+                    } => captured.borrow_mut().push("middle-up"),
+                    core::GraphEvent::NodeMiddleClicked { .. } => {
+                        captured.borrow_mut().push("inspect")
+                    }
+                    _ => {}
+                },
+            )
+        });
+        editor.update(cx, |editor, cx| {
+            let bounds = core::Rect {
+                origin: core::Point::new(20.0, 20.0),
+                size: core::Size {
+                    width: 100.0,
+                    height: 20.0,
+                },
+            };
+            editor
+                .world_scene
+                .push_hit_region(world::WorldHitRegion::new(
+                    "number",
+                    world::HitRole::Control,
+                    world::HitShape::Rect(bounds),
+                ));
+            editor
+                .world_control_owners
+                .insert("number".into(), "a".into());
+            let start = core::Point::new(30.0, 30.0);
+            assert!(!editor.begin_middle_control(start, 1, cx));
+            editor.world_scene.hit_regions[0].middle_pointer = true;
+            assert!(editor.begin_middle_control(start, 1, cx));
+            assert!(editor.control_owns_other_button(MouseButton::Left));
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "other".into(),
+                start,
+                core::ControlPointerButton::Primary,
+            );
+            assert!(!editor.release_control_button(core::ControlPointerButton::Primary, cx));
+            editor.handle_pointer_move(
+                core::Point::new(300.0, 400.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            editor.finish_middle_gesture(core::Point::new(300.0, 400.0), cx);
+            editor.handle_pointer_move(
+                core::Point::new(310.0, 400.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            assert_eq!(editor.graph.viewport, core::Viewport::default());
+            assert_eq!(editor.graph.nodes["a"].position, core::Point::default());
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec!["middle-down", "middle-drag", "middle-up"]
+        );
+    }
+
+    #[gpui::test]
+    fn captured_control_drag_reports_world_positions_and_screen_travel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        let _subscription = cx.update(|app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerDragged {
+                        control_id,
+                        origin,
+                        world_position,
+                        delta,
+                        ..
+                    } => captured.borrow_mut().push((
+                        control_id.clone(),
+                        *origin,
+                        *world_position,
+                        *delta,
+                    )),
+                    core::GraphEvent::NodeControlPointerReleased { control_id, .. } => {
+                        captured.borrow_mut().push((
+                            control_id.clone(),
+                            core::Point::default(),
+                            core::Point::default(),
+                            core::Point::default(),
+                        ))
+                    }
+                    _ => {}
+                },
+            )
+        });
+        editor.update(cx, |editor, cx| {
+            editor.graph.viewport.zoom = 2.0;
+            editor.graph.viewport.pan = core::Point::new(10.0, 20.0);
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "field".into(),
+                core::Point::new(30.0, 40.0),
+                core::ControlPointerButton::Primary,
+            );
+            editor.handle_pointer_move(
+                core::Point::new(50.0, 30.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            editor.handle_pointer_move(
+                core::Point::new(70.0, 90.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            editor.finish_left_gesture(false, &NodeGraphTheme::default(), cx);
+            editor.handle_pointer_move(
+                core::Point::new(80.0, 100.0),
+                &NodeGraphTheme::default(),
+                cx,
+            );
+            assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (
+                    "field".into(),
+                    core::Point::new(10.0, 10.0),
+                    core::Point::new(20.0, 5.0),
+                    core::Point::new(20.0, -10.0)
+                ),
+                (
+                    "field".into(),
+                    core::Point::new(10.0, 10.0),
+                    core::Point::new(30.0, 35.0),
+                    core::Point::new(20.0, 60.0)
+                ),
+                (
+                    "field".into(),
+                    core::Point::default(),
+                    core::Point::default(),
+                    core::Point::default()
+                ),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn world_text_editing_keys_preserve_unicode_and_share_clipboard_behavior(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let editor = cx.new(|cx| NodeGraph::new(interactive_graph(), cx));
+            editor.update(cx, |editor, cx| {
+                editor.set_world_text_input(
+                    "a".into(),
+                    "a:factor",
+                    WorldTextInputState::new("a💡b", 4..4),
+                    cx,
+                );
+                assert!(editor.edit_world_text_key("left", None, false, false, cx));
+                assert_eq!(editor.world_text_input().unwrap().2.selection, 3..3);
+                assert!(editor.edit_world_text_key("backspace", None, false, false, cx));
+                assert_eq!(editor.world_text_input().unwrap().2.text, "ab");
+                assert!(editor.edit_world_text_key("a", None, true, false, cx));
+                assert!(editor.edit_world_text_key("c", None, true, false, cx));
+                assert!(editor.edit_world_text_key("end", None, false, false, cx));
+                assert!(editor.edit_world_text_key("v", None, true, false, cx));
+                assert_eq!(editor.world_text_input().unwrap().2.text, "abab");
+                assert!(!editor.edit_world_text_key("enter", None, false, false, cx));
+                assert!(!editor.edit_world_text_key("escape", None, false, false, cx));
+            });
+        });
+    }
+
+    #[test]
+    fn inline_document_takes_geometry_ownership_from_world_field() {
+        let mut editor = NodeGraph::new_for_test(interactive_graph());
+        editor.last_world_control = Some(("a".into(), "field".into()));
+        editor.world_text_input = Some((
+            "a".into(),
+            "field".into(),
+            WorldTextInputState::new("node", 4..4),
+        ));
+        let bounds = core::Rect {
+            origin: core::Point::new(20.0, 30.0),
+            size: core::Size {
+                width: 80.0,
+                height: 20.0,
+            },
+        };
+        editor
+            .world_scene
+            .push_hit_region(world::WorldHitRegion::new(
+                "field",
+                world::HitRole::Control,
+                world::HitShape::Rect(bounds),
+            ));
+        assert_eq!(editor.active_text_world_rect(), Some(bounds));
+        editor.catalog_menu = Some(CatalogMenu {
+            anchor_world: core::Point::default(),
+            query: WorldTextInputState::new("search", 6..6),
+            selected: 0,
+            connect_from: None,
+        });
+        assert_eq!(editor.active_input_state().unwrap().text, "search");
+        assert_eq!(editor.active_text_world_rect(), None);
+        editor.catalog_menu = None;
+        assert_eq!(editor.active_text_world_rect(), Some(bounds));
     }
 
     #[test]

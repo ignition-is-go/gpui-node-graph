@@ -70,9 +70,70 @@ impl<const N: usize> From<[&str; N]> for TextLines {
     }
 }
 
+/// A single-line, clipped text field in the coordinate plane of its primitive.
+/// Text offsets use UTF-16 code units, matching native/web platform input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextField {
+    pub id: String,
+    pub bounds: core::Rect,
+    pub text: String,
+    pub selection: std::ops::Range<usize>,
+    pub selection_reversed: bool,
+    pub marked: Option<std::ops::Range<usize>>,
+    pub font_family: Option<String>,
+    pub font_size: f32,
+    pub font_weight: u16,
+    pub line_height: f32,
+    pub padding_x: f32,
+    pub caret_width: f32,
+    pub color: WorldColor,
+    pub selection_color: WorldColor,
+    pub caret_color: WorldColor,
+    pub align_right: bool,
+    pub focused: bool,
+}
+
+impl TextField {
+    pub fn new(id: impl Into<String>, bounds: core::Rect, text: impl Into<String>) -> Self {
+        let text = text.into();
+        let end = text.encode_utf16().count();
+        Self {
+            id: id.into(),
+            bounds,
+            text,
+            selection: end..end,
+            selection_reversed: false,
+            marked: None,
+            font_family: None,
+            font_size: 11.0,
+            font_weight: 400,
+            line_height: 16.0,
+            padding_x: 4.0,
+            caret_width: 1.0,
+            color: WorldColor::rgb(0xeeeeee),
+            selection_color: WorldColor::rgba(0x00bfc4, 0.3),
+            caret_color: WorldColor::rgb(0xeeeeee),
+            align_right: false,
+            focused: true,
+        }
+    }
+
+    fn project(&self, transform: Transform) -> Self {
+        Self {
+            bounds: transform.rect(self.bounds),
+            font_size: transform.length(self.font_size),
+            line_height: transform.length(self.line_height),
+            padding_x: transform.length(self.padding_x),
+            caret_width: transform.length(self.caret_width),
+            ..self.clone()
+        }
+    }
+}
+
 /// A paint command whose every length is expressed in world units.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorldPrimitive {
+    TextInput(TextField),
     Quad {
         bounds: core::Rect,
         fill: WorldColor,
@@ -165,6 +226,8 @@ pub struct WorldHitRegion {
     /// Human-readable name for projected semantic controls.
     pub accessible_label: Option<String>,
     pub accessible_role: AccessibleControlRole,
+    /// Opt in to auxiliary-button gestures instead of canvas panning/inspection.
+    pub middle_pointer: bool,
     pub accessible_value: Option<String>,
     pub accessible_numeric_value: Option<f64>,
     pub accessible_min_numeric_value: Option<f64>,
@@ -180,12 +243,18 @@ impl WorldHitRegion {
             shape,
             accessible_label: None,
             accessible_role: AccessibleControlRole::Button,
+            middle_pointer: false,
             accessible_value: None,
             accessible_numeric_value: None,
             accessible_min_numeric_value: None,
             accessible_max_numeric_value: None,
             accessible_numeric_value_step: None,
         }
+    }
+
+    pub fn with_middle_pointer(mut self, enabled: bool) -> Self {
+        self.middle_pointer = enabled;
+        self
     }
 
     pub fn with_accessible_label(mut self, label: impl Into<String>) -> Self {
@@ -355,6 +424,7 @@ impl From<&Transform> for Transform {
 impl WorldPrimitive {
     pub fn project(&self, transform: Transform) -> ScreenPrimitive {
         match self {
+            Self::TextInput(field) => ScreenPrimitive::TextInput(field.project(transform)),
             Self::Quad {
                 bounds,
                 fill,
@@ -427,6 +497,7 @@ impl WorldPrimitive {
 /// A projected paint command.  Its geometry is in screen pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenPrimitive {
+    TextInput(TextField),
     Quad {
         bounds: core::Rect,
         fill: WorldColor,
@@ -769,5 +840,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["body", "port:a"]
         );
+    }
+}
+
+#[cfg(test)]
+mod text_field_tests {
+    use super::*;
+
+    #[test]
+    fn text_field_projection_scales_geometry_without_reflowing_or_changing_utf16_state() {
+        let mut field = TextField::new(
+            "field",
+            core::Rect {
+                origin: core::Point::new(12.0, 24.0),
+                size: core::Size {
+                    width: 160.0,
+                    height: 20.0,
+                },
+            },
+            "a💡b",
+        );
+        field.selection = 1..3;
+        field.marked = Some(1..3);
+        field.font_family = Some("Inter".into());
+        let original = field.clone();
+        for zoom in [0.1, 0.740818, 1.0, 1.349859, 2.0, 5.0] {
+            let projected = WorldPrimitive::TextInput(field.clone())
+                .project(Transform::new(core::Point::new(7.0, -3.0), zoom));
+            let ScreenPrimitive::TextInput(projected) = projected else {
+                panic!("text field primitive")
+            };
+            assert!((projected.bounds.origin.x - (12.0 * zoom + 7.0)).abs() < 0.00001);
+            assert!((projected.bounds.origin.y - (24.0 * zoom - 3.0)).abs() < 0.00001);
+            assert_eq!(projected.bounds.size.width, 160.0 * zoom);
+            assert_eq!(projected.font_size, 11.0 * zoom);
+            assert_eq!(projected.padding_x, 4.0 * zoom);
+            assert_eq!(projected.caret_width, zoom);
+            assert_eq!(projected.text, "a💡b");
+            assert_eq!(projected.selection, 1..3);
+            assert_eq!(projected.marked, Some(1..3));
+            assert_eq!(projected.font_family.as_deref(), Some("Inter"));
+        }
+        assert_eq!(field, original);
     }
 }
