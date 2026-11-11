@@ -12,6 +12,7 @@ tasks = ["build", "publish"]
 [dependencies]
 gpui.workspace = true
 node-graph-core.workspace = true
+unicode-segmentation = "1"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

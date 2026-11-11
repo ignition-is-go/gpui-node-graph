@@ -1845,6 +1845,7 @@ fn launch(cx: &mut App) {
                         GraphEvent::NodeControlActivated {
                             node_id,
                             control_id,
+                            ..
                         } if !control_id.ends_with(":mix-amount") => {
                             if let Some((direction, count)) =
                                 event_controls.borrow_mut().activate(node_id, control_id)
@@ -1955,6 +1956,7 @@ fn launch(cx: &mut App) {
                         GraphEvent::NodeControlActivated {
                             node_id,
                             control_id,
+                            ..
                         } if control_id.ends_with(":mix-amount") => {
                             let mut overlays = event_overlays.borrow_mut();
                             if editor.is_overlay_dismissed("mix-amount") {

@@ -274,6 +274,24 @@ pub enum ControlPointerButton {
     Middle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlPointerCancelReason {
+    FocusLost,
+    WindowDeactivated,
+    GraphReplaced,
+    Explicit,
+    Superseded,
+    PointerCancelled,
+    CaptureLost,
+    ButtonChanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlActivationSource {
+    Pointer,
+    Accessibility,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
     MutationRequested {
@@ -292,6 +310,13 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
     NodeControlActivated {
         node_id: N,
         control_id: String,
+        source: ControlActivationSource,
+    },
+    /// Advisory context request; it does not activate or capture the control.
+    NodeControlContextMenuRequested {
+        node_id: N,
+        control_id: String,
+        world_position: Point,
     },
     NodeControlPointerActivated {
         node_id: N,
@@ -314,6 +339,13 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
         node_id: N,
         control_id: String,
         button: ControlPointerButton,
+        world_position: Option<Point>,
+    },
+    NodeControlPointerCancelled {
+        node_id: N,
+        control_id: String,
+        button: ControlPointerButton,
+        reason: ControlPointerCancelReason,
     },
     /// A key press routed to the most recently activated world-space control.
     /// `text` is the produced character (when any), kept separate from the
@@ -323,6 +355,14 @@ pub enum GraphEvent<N: Eq + Hash, P, C: Eq + Hash, T> {
         control_id: String,
         key: String,
         text: Option<String>,
+        shift: bool,
+        command: bool,
+    },
+    /// A key release routed to the focused world-space control.
+    NodeControlKeyUp {
+        node_id: N,
+        control_id: String,
+        key: String,
         shift: bool,
         command: bool,
     },

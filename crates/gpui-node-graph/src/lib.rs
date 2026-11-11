@@ -1,14 +1,15 @@
 mod wheel;
 mod windows;
+mod world_label;
 mod world_text;
 
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, BoxShadow, Context, DispatchPhase, Element, ElementId,
     ElementInputHandler, EntityInputHandler, FocusHandle, FontWeight, Global, GlobalElementId,
-    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Render, ScrollHandle, ScrollWheelEvent, ShapedLine,
-    SharedString, TextAlign, TextRun, UTF16Selection, WeakEntity, Window, canvas, div, point,
-    prelude::*, px, quad, rgb,
+    InspectorElementId, KeyDownEvent, KeyUpEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollHandle, ScrollWheelEvent,
+    ShapedLine, SharedString, TextAlign, TextRun, UTF16Selection, WeakEntity, Window, canvas, div,
+    point, prelude::*, px, quad, rgb,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -640,10 +641,19 @@ impl NodeOverlay {
     }
 }
 
+/// Selects whether the graph shell or the retained body paints the whole card.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NodeChrome {
+    #[default]
+    Theme,
+    BodyOwned,
+}
+
 pub struct NodeBody {
     pub element: AnyElement,
     pub overlays: Vec<NodeOverlay>,
     pub ports: PortPresentation,
+    pub chrome: NodeChrome,
 }
 
 impl NodeBody {
@@ -652,7 +662,13 @@ impl NodeBody {
             element: element.into_any_element(),
             overlays: Vec::new(),
             ports: PortPresentation::DefaultOverlay,
+            chrome: NodeChrome::Theme,
         }
+    }
+
+    pub fn with_chrome(mut self, chrome: NodeChrome) -> Self {
+        self.chrome = chrome;
+        self
     }
 
     pub fn with_overlay(mut self, overlay: NodeOverlay) -> Self {
@@ -764,7 +780,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
                 window.prevent_default();
                 let _ = graph_down.update(cx, |editor, cx| editor.engage_port(&down_id, cx));
             })
-            .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+            .on_mouse_up(MouseButton::Left, move |event, _, cx| {
                 cx.stop_propagation();
                 let _ = graph_up.update(cx, |editor, cx| {
                     if editor
@@ -774,7 +790,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
                     {
                         editor.finish_draft(&up_id, cx);
                     }
-                    editor.finish_left_gesture(true, &theme_up, cx);
+                    editor.finish_left_gesture(
+                        true,
+                        &theme_up,
+                        Some(editor.local_screen(event.position)),
+                        cx,
+                    );
                 });
             });
         let graph = self.graph.clone();
@@ -1534,6 +1555,12 @@ struct NodeDrag<N> {
 }
 
 #[derive(Clone)]
+struct PanGesture {
+    previous: core::Point,
+    button: MouseButton,
+}
+
+#[derive(Clone)]
 struct MiddlePress<N> {
     origin: core::Point,
     node: Option<N>,
@@ -1561,6 +1588,7 @@ struct ResizeDrag<N, P> {
 
 #[derive(Clone)]
 struct DraftConnection<P, C> {
+    pressed: bool,
     origin: P,
     current_screen: core::Point,
     snap_target: Option<P>,
@@ -1577,6 +1605,7 @@ struct BoxSelection<N, C> {
     baseline_connections: HashSet<C>,
 }
 struct WorldTextPaint {
+    clip: Option<core::Rect>,
     origin: core::Point,
     line_height: f32,
     line: ShapedLine,
@@ -1586,6 +1615,24 @@ struct WorldPaintState {
     scene: world::ScreenScene,
     text: Vec<WorldTextPaint>,
     inputs: Vec<world_text::TextInputPaint>,
+    text_cursor_hitbox: Option<gpui::Hitbox>,
+}
+
+fn text_cursor_bounds_at(scene: &world::ScreenScene, local: core::Point) -> Option<core::Rect> {
+    let hit = scene.hit_test(local)?;
+    if hit.role != world::HitRole::Control {
+        return None;
+    }
+    let field = scene.primitives.iter().rev().find_map(|primitive| {
+        if let world::ScreenPrimitive::TextInput(field) = primitive
+            && field.id == hit.id
+        {
+            Some(field)
+        } else {
+            None
+        }
+    })?;
+    field.bounds.contains(local).then_some(field.bounds)
 }
 
 /// Return the reference SVG silhouette for a non-circular anchor dot in world units.
@@ -1687,14 +1734,36 @@ impl gpui::RenderOnce for WorldSceneElement {
         let layouts = self.text_layouts;
         div().id(self.id).absolute().size_full().child(
             canvas(
-                move |_bounds, window, _cx| {
+                move |bounds, window, _cx| {
                     let mut text = Vec::new();
                     let mut inputs = Vec::new();
+                    let text_cursor_hitbox = layouts.as_ref().and_then(|_| {
+                        let pointer = window.mouse_position() - bounds.origin;
+                        let local = core::Point::new(f32::from(pointer.x), f32::from(pointer.y));
+                        text_cursor_bounds_at(&projected, local).map(|field| {
+                            window.insert_hitbox(
+                                Bounds::new(
+                                    bounds.origin + point(px(field.origin.x), px(field.origin.y)),
+                                    gpui::size(px(field.size.width), px(field.size.height)),
+                                ),
+                                gpui::HitboxBehavior::Normal,
+                            )
+                        })
+                    });
                     if let Some(layouts) = &layouts {
                         layouts.borrow_mut().clear();
                     }
                     let text_style = window.text_style();
                     for primitive in &projected.primitives {
+                        if let world::ScreenPrimitive::InlineText(inline) = primitive {
+                            text.extend(world_label::inline_paint_data(inline, window));
+                        }
+                        if let world::ScreenPrimitive::TextRow(row) = primitive {
+                            text.extend(world_label::row_paint_data(row, window));
+                        }
+                        if let world::ScreenPrimitive::TextLabel(label) = primitive {
+                            text.push(world_label::paint_data(label, window));
+                        }
                         if let world::ScreenPrimitive::TextInput(field) = primitive {
                             let input = world_text::TextInputPaint::new(field.clone(), window);
                             if let Some(layouts) = &layouts {
@@ -1722,6 +1791,7 @@ impl gpui::RenderOnce for WorldSceneElement {
                                     ..Default::default()
                                 };
                                 text.push(WorldTextPaint {
+                                    clip: None,
                                     origin: core::Point::new(
                                         origin.x,
                                         origin.y + *line_height * index as f32,
@@ -1741,13 +1811,63 @@ impl gpui::RenderOnce for WorldSceneElement {
                         scene: projected,
                         text,
                         inputs,
+                        text_cursor_hitbox,
                     }
                 },
                 move |bounds, state, window, cx| {
+                    if let Some(hitbox) = &state.text_cursor_hitbox {
+                        window.set_cursor_style(gpui::CursorStyle::IBeam, hitbox);
+                    }
                     let offset =
                         core::Point::new(f32::from(bounds.origin.x), f32::from(bounds.origin.y));
                     for primitive in &state.scene.primitives {
                         match primitive {
+                            world::ScreenPrimitive::VectorPath {
+                                origin,
+                                scale,
+                                commands,
+                                fill,
+                            } => {
+                                let at = |p: core::Point| {
+                                    point(
+                                        px(origin.x + offset.x + p.x * scale),
+                                        px(origin.y + offset.y + p.y * scale),
+                                    )
+                                };
+                                let mut builder = PathBuilder::fill();
+                                for command in commands.iter() {
+                                    match command {
+                                        world::VectorCommand::Move(p) => builder.move_to(at(*p)),
+                                        world::VectorCommand::Line(p) => builder.line_to(at(*p)),
+                                        world::VectorCommand::Cubic {
+                                            control_a,
+                                            control_b,
+                                            end,
+                                        } => builder.cubic_bezier_to(
+                                            at(*end),
+                                            at(*control_a),
+                                            at(*control_b),
+                                        ),
+                                        world::VectorCommand::Arc {
+                                            radii,
+                                            rotation,
+                                            large,
+                                            sweep,
+                                            end,
+                                        } => builder.arc_to(
+                                            point(px(radii.x * scale), px(radii.y * scale)),
+                                            px(*rotation),
+                                            *large,
+                                            *sweep,
+                                            at(*end),
+                                        ),
+                                        world::VectorCommand::Close => builder.close(),
+                                    }
+                                }
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, rgb(fill.rgb).opacity(fill.alpha));
+                                }
+                            }
                             world::ScreenPrimitive::Quad {
                                 bounds: rect,
                                 fill,
@@ -1765,6 +1885,87 @@ impl gpui::RenderOnce for WorldSceneElement {
                                     px(*corner_radius),
                                     rgb(fill.rgb).opacity(fill.alpha),
                                     px(0.0),
+                                    gpui::transparent_black(),
+                                    BorderStyle::default(),
+                                ));
+                            }
+                            world::ScreenPrimitive::HorizontalGradient(gradient) => {
+                                let Some(stops) = gradient
+                                    .stops
+                                    .iter()
+                                    .copied()
+                                    .map(|stop| {
+                                        let stop = stop.normalized()?;
+                                        let [r, g, b, a] = stop.rgba;
+                                        Some(gpui::linear_color_stop(
+                                            gpui::Rgba { r, g, b, a },
+                                            stop.position,
+                                        ))
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                                else {
+                                    continue;
+                                };
+                                let Ok(ramp) = gpui::HorizontalGradient::new(stops) else {
+                                    continue;
+                                };
+                                let rect = gradient.bounds;
+                                let bounds = Bounds::new(
+                                    point(
+                                        px(rect.origin.x + offset.x),
+                                        px(rect.origin.y + offset.y),
+                                    ),
+                                    gpui::size(px(rect.size.width), px(rect.size.height)),
+                                );
+                                let corners = gradient.corner_radii;
+                                let borders = gradient.border_widths;
+                                window.paint_horizontal_gradient(
+                                    quad(
+                                        bounds,
+                                        gpui::Corners {
+                                            top_left: px(corners.top_left),
+                                            top_right: px(corners.top_right),
+                                            bottom_right: px(corners.bottom_right),
+                                            bottom_left: px(corners.bottom_left),
+                                        },
+                                        gpui::transparent_black(),
+                                        gpui::Edges {
+                                            top: px(borders.top),
+                                            right: px(borders.right),
+                                            bottom: px(borders.bottom),
+                                            left: px(borders.left),
+                                        },
+                                        rgb(gradient.border.rgb).opacity(gradient.border.alpha),
+                                        BorderStyle::default(),
+                                    ),
+                                    &ramp,
+                                );
+                            }
+                            world::ScreenPrimitive::Checkerboard {
+                                bounds: rect,
+                                base,
+                                alternate,
+                                foreground,
+                                cell_size,
+                                corner_radius,
+                            } => {
+                                let paint_bounds = Bounds::new(
+                                    point(
+                                        px(rect.origin.x + offset.x),
+                                        px(rect.origin.y + offset.y),
+                                    ),
+                                    gpui::size(px(rect.size.width), px(rect.size.height)),
+                                );
+                                window.paint_quad(quad(
+                                    paint_bounds,
+                                    px(*corner_radius),
+                                    gpui::checkerboard_with_foreground(
+                                        rgb(base.rgb).opacity(base.alpha),
+                                        rgb(alternate.rgb).opacity(alternate.alpha),
+                                        rgb(foreground.rgb).opacity(foreground.alpha),
+                                        *cell_size,
+                                    ),
+                                    px(0.),
                                     gpui::transparent_black(),
                                     BorderStyle::default(),
                                 ));
@@ -1848,18 +2049,39 @@ impl gpui::RenderOnce for WorldSceneElement {
                                 }
                             }
                             world::ScreenPrimitive::Text { .. }
+                            | world::ScreenPrimitive::TextLabel(_)
+                            | world::ScreenPrimitive::TextRow(_)
+                            | world::ScreenPrimitive::InlineText(_)
                             | world::ScreenPrimitive::TextInput(_) => {}
                         }
                     }
                     for text in &state.text {
-                        let _ = text.line.paint(
-                            point(px(text.origin.x + offset.x), px(text.origin.y + offset.y)),
-                            px(text.line_height),
-                            TextAlign::Left,
-                            None,
-                            window,
-                            cx,
-                        );
+                        let paint = |window: &mut Window, cx: &mut App| {
+                            let _ = text.line.paint(
+                                point(px(text.origin.x + offset.x), px(text.origin.y + offset.y)),
+                                px(text.line_height),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        };
+                        if let Some(clip) = text.clip {
+                            window.with_content_mask(
+                                Some(gpui::ContentMask {
+                                    bounds: Bounds::new(
+                                        point(
+                                            px(clip.origin.x + offset.x),
+                                            px(clip.origin.y + offset.y),
+                                        ),
+                                        gpui::size(px(clip.size.width), px(clip.size.height)),
+                                    ),
+                                }),
+                                |window| paint(window, cx),
+                            );
+                        } else {
+                            paint(window, cx);
+                        }
                     }
                     for input in &state.inputs {
                         input.paint(offset, window, cx);
@@ -1947,6 +2169,144 @@ impl IntoElement for NodeScaleElement {
 }
 
 type BoundsCallback = Box<dyn FnMut(Bounds<Pixels>, &mut App)>;
+
+type OverlayHitboxes = Rc<RefCell<HashMap<String, gpui::Hitbox>>>;
+enum PanelPlacement {
+    Positioned {
+        anchor: core::Rect,
+        placement: OverlayPlacement,
+        screen_offset: core::Point,
+    },
+    Adaptive {
+        node_origin: core::Point,
+        node_width: f32,
+        offset: core::Point,
+        behavior: OverlayBehavior,
+    },
+}
+
+impl PanelPlacement {
+    fn resolve(&self, panel_size: core::Size, canvas_size: core::Size) -> core::Point {
+        match self {
+            Self::Positioned {
+                anchor,
+                placement,
+                screen_offset,
+            } => {
+                resolve_positioned_overlay(*anchor, *placement, panel_size, canvas_size)
+                    + *screen_offset
+            }
+            Self::Adaptive {
+                node_origin,
+                node_width,
+                offset,
+                behavior,
+            } => resolve_overlay_position(
+                *node_origin,
+                *node_width,
+                *offset,
+                behavior,
+                panel_size,
+                canvas_size,
+            ),
+        }
+    }
+}
+
+struct PositionedOverlay {
+    child: AnyElement,
+    placement: PanelPlacement,
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pointer_target: (String, OverlayHitboxes),
+}
+
+impl IntoElement for PositionedOverlay {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for PositionedOverlay {
+    type RequestLayoutState = LayoutId;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, LayoutId) {
+        let child = self.child.request_layout(window, cx);
+        let style = gpui::Style {
+            position: gpui::Position::Absolute,
+            display: gpui::Display::Flex,
+            inset: gpui::Edges {
+                top: px(0.).into(),
+                left: px(0.).into(),
+                ..gpui::Edges::auto()
+            },
+            ..Default::default()
+        };
+        (window.request_layout(style, [child], cx), child)
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        child_layout: &mut LayoutId,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child_bounds = window.layout_bounds(*child_layout);
+        let canvas = self.canvas_bounds.get();
+        let position = self.placement.resolve(
+            core::Size {
+                width: f32::from(child_bounds.size.width),
+                height: f32::from(child_bounds.size.height),
+            },
+            core::Size {
+                width: f32::from(canvas.size.width),
+                height: f32::from(canvas.size.height),
+            },
+        );
+        let origin = canvas.origin + point(px(position.x), px(position.y));
+        window.with_element_offset(origin - child_bounds.origin, |window| {
+            self.child.prepaint(window, cx);
+            let bounds = window.layout_bounds(*child_layout);
+            let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
+            self.pointer_target
+                .1
+                .borrow_mut()
+                .insert(self.pointer_target.0.clone(), hitbox);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut LayoutId,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+    }
+}
 
 struct MeasuredElement {
     child: Option<AnyElement>,
@@ -2101,7 +2461,7 @@ pub struct NodeGraph<
     pub config: EditorConfig,
     drag: Option<NodeDrag<N>>,
     resize: Option<ResizeDrag<N, P>>,
-    panning: Option<core::Point>,
+    panning: Option<PanGesture>,
     middle_press: Option<MiddlePress<N>>,
     last_pointer_screen: Option<core::Point>,
     hovered_node: Option<N>,
@@ -2143,16 +2503,19 @@ pub struct NodeGraph<
     active_outside_overlays: HashSet<String>,
     active_backdrop_overlays: HashSet<String>,
     active_overlay_dismiss_callbacks: HashMap<String, Rc<dyn Fn()>>,
-    active_overlay_bounds: Vec<core::Rect>,
-    measured_overlay_sizes: HashMap<String, core::Size>,
+    overlay_hitboxes: OverlayHitboxes,
     overlay_placements: HashMap<String, OverlayPlacement>,
     overlay_anchor_controls: HashMap<String, String>,
+    overlay_dismiss_triggers: HashMap<String, String>,
+    overlay_stack_orders: HashMap<String, u64>,
     overlay_pane_anchors: HashMap<String, core::Rect>,
     route_cache: RefCell<RouteCache<C>>,
     group_editor: Option<GroupEditor>,
     group_errors: HashSet<String>,
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
+    window_activation: Option<(gpui::WindowId, gpui::Subscription)>,
+    pointer_cancellation: Option<(gpui::WindowId, gpui::Subscription)>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
 }
 
@@ -2241,16 +2604,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             active_outside_overlays: HashSet::new(),
             active_backdrop_overlays: HashSet::new(),
             active_overlay_dismiss_callbacks: HashMap::new(),
-            active_overlay_bounds: Vec::new(),
-            measured_overlay_sizes: HashMap::new(),
+            overlay_hitboxes: Rc::default(),
             overlay_placements: HashMap::new(),
             overlay_anchor_controls: HashMap::new(),
+            overlay_dismiss_triggers: HashMap::new(),
+            overlay_stack_orders: HashMap::new(),
             overlay_pane_anchors: HashMap::new(),
             route_cache: RefCell::new(RouteCache::default()),
             group_editor: None,
             group_errors: HashSet::new(),
             box_selection: None,
             focus_handle: None,
+            window_activation: None,
+            pointer_cancellation: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
         })
     }
@@ -2301,6 +2667,46 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.overlay_anchor_controls
             .insert(overlay_id.into(), control_id.into());
         self
+    }
+
+    /// Release placement and measurement state when an owned overlay target disappears.
+    pub fn remove_overlay_configuration(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.overlay_anchor_controls.remove(id);
+        self.overlay_dismiss_triggers.remove(id);
+        self.overlay_stack_orders.remove(id);
+        self.overlay_placements.remove(id);
+        self.overlay_pane_anchors.remove(id);
+        self.dismissed_overlays.remove(id);
+        self.active_dismissible_overlays.remove(id);
+        self.active_escape_overlays.remove(id);
+        self.active_outside_overlays.remove(id);
+        self.active_backdrop_overlays.remove(id);
+        self.active_overlay_dismiss_callbacks.remove(id);
+        self.overlay_hitboxes.borrow_mut().remove(id);
+        cx.notify();
+    }
+
+    /// Order retained overlays across all graph nodes; higher values paint last.
+    pub fn set_overlay_stack_order(
+        &mut self,
+        id: impl Into<String>,
+        order: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay_stack_orders.insert(id.into(), order);
+        cx.notify();
+    }
+
+    /// Keeps the owning trigger outside the overlay's outside-click dismissal region.
+    pub fn set_overlay_dismiss_trigger(
+        &mut self,
+        id: impl Into<String>,
+        control: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay_dismiss_triggers
+            .insert(id.into(), control.into());
+        cx.notify();
     }
 
     pub fn set_overlay_anchor_control(
@@ -2497,9 +2903,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.pending_port_changes.clear();
         if self.node_type_registry.is_some() {
             self.refresh_node_types(cx)?;
-        } else {
-            cx.notify();
         }
+        cx.notify();
         Ok(())
     }
 
@@ -2972,6 +3377,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         control_id: String,
         local: core::Point,
         button: core::ControlPointerButton,
+        cx: &mut Context<Self>,
     ) {
         if self
             .world_control_pointer
@@ -2980,6 +3386,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         {
             return;
         }
+        self.cancel_world_control_pointer(core::ControlPointerCancelReason::Superseded, cx);
         self.world_control_pointer = Some(WorldControlPointer {
             node_id,
             control_id,
@@ -2989,7 +3396,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         });
     }
 
-    fn activate_world_control(&mut self, node_id: N, control_id: String, cx: &mut Context<Self>) {
+    fn activate_world_control(
+        &mut self,
+        node_id: N,
+        control_id: String,
+        source: core::ControlActivationSource,
+        cx: &mut Context<Self>,
+    ) {
         if self.last_world_control.as_ref() != Some(&(node_id.clone(), control_id.clone())) {
             self.blur_world_control(cx);
         }
@@ -2997,6 +3410,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.emit(core::GraphEvent::NodeControlActivated {
             node_id,
             control_id,
+            source,
         });
         cx.notify();
     }
@@ -3103,8 +3517,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .map(|layout| layout.index_at(self.graph.viewport.world_to_screen(position)))
     }
 
-    fn blur_world_control(&mut self, cx: &mut Context<Self>) {
-        self.world_control_pointer = None;
+    /// Clear world-control focus, capture, and the active text document.
+    pub fn blur_world_control(&mut self, cx: &mut Context<Self>) {
+        self.cancel_world_control_pointer(core::ControlPointerCancelReason::FocusLost, cx);
         if let Some((node_id, control_id)) = self.last_world_control.take() {
             cx.emit(core::GraphEvent::NodeControlBlurred {
                 node_id,
@@ -3922,7 +4337,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.port_presentations
             .retain(|port, _| self.graph.ports.contains_key(port));
         self.prune_resolved_tombstones();
-        self.cancel_gestures();
+        self.cancel_gestures(core::ControlPointerCancelReason::GraphReplaced, cx);
         cx.emit(core::GraphEvent::GraphReconciled);
         self.emit_selection(cx);
         cx.emit(core::GraphEvent::ViewportChanged {
@@ -3940,6 +4355,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx: &mut Context<Self>,
     ) -> Result<(), GraphValidationError> {
         let events = self.graph.reconcile(snapshot)?;
+        if self
+            .last_world_control
+            .as_ref()
+            .is_some_and(|(node, _)| !self.graph.nodes.contains_key(node))
+            || self
+                .world_text_input
+                .as_ref()
+                .is_some_and(|(node, _, _)| !self.graph.nodes.contains_key(node))
+        {
+            self.blur_world_control(cx);
+        }
         self.pending_port_changes.clear();
         if self
             .draft
@@ -4034,8 +4460,80 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
-    fn cancel_gestures(&mut self) {
-        self.world_control_pointer = None;
+    fn cancel_platform_pointer(
+        &mut self,
+        event: &gpui::PointerCancellation,
+        cx: &mut Context<Self>,
+    ) {
+        let reason = match event.reason {
+            gpui::PointerCancellationReason::Cancelled => {
+                core::ControlPointerCancelReason::PointerCancelled
+            }
+            gpui::PointerCancellationReason::CaptureLost => {
+                core::ControlPointerCancelReason::CaptureLost
+            }
+            gpui::PointerCancellationReason::FocusLost => {
+                core::ControlPointerCancelReason::FocusLost
+            }
+            gpui::PointerCancellationReason::ButtonChanged => {
+                core::ControlPointerCancelReason::ButtonChanged
+            }
+        };
+        let button = match event.button {
+            MouseButton::Left => Some(core::ControlPointerButton::Primary),
+            MouseButton::Middle => Some(core::ControlPointerButton::Middle),
+            _ => None,
+        };
+        if self
+            .world_control_pointer
+            .as_ref()
+            .is_some_and(|pointer| Some(pointer.button) == button)
+        {
+            self.cancel_world_control_pointer(reason, cx);
+        }
+        if self
+            .panning
+            .as_ref()
+            .is_some_and(|pan| pan.button == event.button)
+        {
+            self.panning = None;
+        }
+        match event.button {
+            MouseButton::Left => {
+                if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
+                    let _ = self.graph.move_nodes(&drag.starts);
+                }
+                if let Some(resize) = self.resize.take().filter(|resize| resize.moved) {
+                    if let Some(node) = self.graph.nodes.get_mut(&resize.id) {
+                        node.size.width = resize.start_size.width;
+                    }
+                    for (id, position) in resize.start_ports {
+                        if let Some(port) = self.graph.ports.get_mut(&id) {
+                            port.position = position;
+                        }
+                    }
+                }
+                if self.box_selection.take().is_some() {
+                    cx.emit(core::GraphEvent::SelectionBoxChanged { region: None });
+                }
+                if self.draft.as_ref().is_some_and(|draft| draft.pressed) {
+                    self.draft = None;
+                }
+            }
+            MouseButton::Middle => {
+                self.middle_press = None;
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn cancel_gestures(
+        &mut self,
+        reason: core::ControlPointerCancelReason,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_world_control_pointer(reason, cx);
         if let Some(drag) = self.drag.take().filter(|drag| drag.moved) {
             let _ = self.graph.move_nodes(&drag.starts);
         }
@@ -4130,6 +4628,83 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         })
     }
 
+    fn block_primary_pointer(
+        &mut self,
+        local: core::Point,
+        clicks: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let blocked = self
+            .world_scene
+            .primary_hit_at_screen(local, self.graph.viewport, clicks)
+            .is_some_and(|hit| {
+                hit.role == world::HitRole::PointerBarrier
+                    && self.node_at_screen(local).as_ref() == self.world_control_owners.get(&hit.id)
+            });
+        if blocked {
+            self.blur_world_control(cx);
+            cx.stop_propagation();
+            window.prevent_default();
+        }
+        blocked
+    }
+
+    fn route_world_control_context_menu(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        theme: &NodeGraphTheme,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.control_owns_other_button(MouseButton::Right)
+            || self
+                .overlay_hitboxes
+                .borrow()
+                .values()
+                .any(|hitbox| hitbox.bounds.contains(&position))
+        {
+            return true;
+        }
+        let local = self.local_screen(position);
+        let Some(hit) = self
+            .world_scene
+            .hit_test_screen(local, self.graph.viewport)
+            .cloned()
+        else {
+            return false;
+        };
+        if hit.auxiliary_pointer_barrier {
+            return true;
+        }
+        if self
+            .port_at_screen(
+                local,
+                self.graph
+                    .viewport
+                    .scale_length(theme.anchor.dot_size * 0.5),
+            )
+            .is_some()
+            || hit.role != world::HitRole::Control
+            || !hit.requests_context_menu_at(self.graph.viewport.screen_to_world(local))
+        {
+            return false;
+        }
+        let Some(node_id) = self.world_control_owners.get(&hit.id).cloned() else {
+            return false;
+        };
+        if self.node_at_screen(local).as_ref() != Some(&node_id) {
+            return false;
+        }
+        self.anchor_menu = None;
+        cx.emit(core::GraphEvent::NodeControlContextMenuRequested {
+            node_id,
+            control_id: hit.id,
+            world_position: self.graph.viewport.screen_to_world(local),
+        });
+        cx.notify();
+        true
+    }
+
     fn begin_middle_control(
         &mut self,
         local: core::Point,
@@ -4139,22 +4714,37 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let Some(hit) = self
             .world_scene
             .hit_test_screen(local, self.graph.viewport)
-            .filter(|hit| hit.middle_pointer && matches!(hit.role, world::HitRole::Control))
+            .filter(|hit| {
+                hit.middle_pointer != world::MiddlePointerBehavior::PassThrough
+                    && (matches!(hit.role, world::HitRole::Control)
+                        || hit.middle_pointer == world::MiddlePointerBehavior::Block)
+            })
             .cloned()
         else {
             return false;
         };
+        if hit.middle_pointer == world::MiddlePointerBehavior::Block {
+            self.panning = None;
+            self.middle_press = None;
+            return true;
+        }
         let Some(node_id) = self.world_control_owners.get(&hit.id).cloned() else {
             return false;
         };
         self.panning = None;
         self.middle_press = None;
-        self.activate_world_control(node_id.clone(), hit.id.clone(), cx);
+        self.activate_world_control(
+            node_id.clone(),
+            hit.id.clone(),
+            core::ControlActivationSource::Pointer,
+            cx,
+        );
         self.begin_world_control_pointer(
             node_id.clone(),
             hit.id.clone(),
             local,
             core::ControlPointerButton::Middle,
+            cx,
         );
         cx.emit(core::GraphEvent::NodeControlPointerActivated {
             node_id,
@@ -4176,7 +4766,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn finish_middle_gesture(&mut self, local: core::Point, cx: &mut Context<Self>) {
-        if self.release_control_button(core::ControlPointerButton::Middle, cx) {
+        if self.release_control_button(core::ControlPointerButton::Middle, Some(local), cx) {
             return;
         }
         let press = self.middle_press.take();
@@ -4347,6 +4937,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 .resolved_port_position(id)
                 .map(|position| self.graph.viewport.world_to_screen(position));
             if let Some(draft) = self.draft.as_mut() {
+                draft.pressed = true;
                 draft.snap_target = compatible.then(|| id.clone());
                 if let Some(screen) = screen {
                     draft.current_screen = screen;
@@ -4399,6 +4990,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 .unwrap_or(self.graph.ports[&origin].position),
         );
         self.draft = Some(DraftConnection {
+            pressed: true,
             origin,
             current_screen,
             snap_target: None,
@@ -5296,19 +5888,63 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     fn dismiss_overlays_before_world_pointer(
         &mut self,
         local: core::Point,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .overlay_hitboxes
+            .borrow()
+            .iter()
+            .find(|(_, hitbox)| hitbox.is_hovered(window))
+            .map(|(id, _)| id.clone());
+        self.dismiss_overlays_at_target(local, target.as_deref(), cx);
+    }
+
+    fn dismiss_overlays_at_target(
+        &mut self,
+        local: core::Point,
+        target: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         if self.active_outside_overlays.is_empty()
-            || self.active_overlay_bounds.iter().any(|bounds| {
-                local.x >= bounds.origin.x
-                    && local.y >= bounds.origin.y
-                    && local.x <= bounds.origin.x + bounds.size.width
-                    && local.y <= bounds.origin.y + bounds.size.height
-            })
+            || (target.is_none()
+                && self
+                    .world_scene
+                    .hit_test_screen(local, self.graph.viewport)
+                    .is_some_and(|hit| hit.preserves_overlays))
         {
             return;
         }
-        self.dismiss_outside_overlays(cx);
+        let ids = self
+            .active_outside_overlays
+            .iter()
+            .filter(|id| {
+                if target == Some(id.as_str()) {
+                    return false;
+                }
+                if target.is_some() {
+                    return true;
+                }
+                !self
+                    .overlay_dismiss_triggers
+                    .get(*id)
+                    .and_then(|control| {
+                        self.world_scene
+                            .hit_regions
+                            .iter()
+                            .rev()
+                            .find(|hit| &hit.id == control)
+                    })
+                    .is_some_and(|hit| {
+                        hit.shape
+                            .project(self.graph.viewport.into())
+                            .bounds()
+                            .contains(local)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.dismiss_overlay_ids(ids, cx);
     }
 
     fn begin_canvas_selection(
@@ -5425,11 +6061,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             && press.origin.distance(local) > 4.0
         {
             press.moved = true;
-            self.panning = Some(press.origin);
+            self.panning = Some(PanGesture {
+                previous: press.origin,
+                button: MouseButton::Middle,
+            });
         }
         if let Some(previous) = self.panning.as_mut() {
-            let old = *previous;
-            *previous = local;
+            let old = previous.previous;
+            previous.previous = local;
             if self.graph.viewport.pan_between(old, local) {
                 cx.emit(core::GraphEvent::ViewportChanged {
                     viewport: self.graph.viewport,
@@ -5509,6 +6148,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     fn release_control_button(
         &mut self,
         button: core::ControlPointerButton,
+        local: Option<core::Point>,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self
@@ -5518,16 +6158,37 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         {
             return false;
         }
-        self.release_world_control_pointer(cx);
+        self.release_world_control_pointer(local, cx);
         true
     }
 
-    fn release_world_control_pointer(&mut self, cx: &mut Context<Self>) {
+    /// Cancel the captured control gesture without changing keyboard focus.
+    pub fn cancel_world_control_pointer(
+        &mut self,
+        reason: core::ControlPointerCancelReason,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pointer) = self.world_control_pointer.take() {
+            cx.emit(core::GraphEvent::NodeControlPointerCancelled {
+                node_id: pointer.node_id,
+                control_id: pointer.control_id,
+                button: pointer.button,
+                reason,
+            });
+        }
+    }
+
+    fn release_world_control_pointer(
+        &mut self,
+        local: Option<core::Point>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(pointer) = self.world_control_pointer.take() {
             cx.emit(core::GraphEvent::NodeControlPointerReleased {
                 node_id: pointer.node_id,
                 control_id: pointer.control_id,
                 button: pointer.button,
+                world_position: local.map(|local| self.graph.viewport.screen_to_world(local)),
             });
         }
     }
@@ -5536,9 +6197,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         &mut self,
         preserve_click_draft: bool,
         theme: &NodeGraphTheme,
+        local: Option<core::Point>,
         cx: &mut Context<Self>,
     ) {
-        self.release_control_button(core::ControlPointerButton::Primary, cx);
+        self.release_control_button(core::ControlPointerButton::Primary, local, cx);
+        if let Some(draft) = self.draft.as_mut() {
+            draft.pressed = false;
+        }
         let was_panning = self.panning.take().is_some();
         if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
             && let Some(size) = self.graph.nodes.get(&resize.id).map(|node| node.size)
@@ -5844,6 +6509,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
+    /// Open node creation through the editor's catalog action and clear world-control focus.
+    pub fn open_node_catalog(&mut self, cx: &mut Context<Self>) {
+        self.blur_world_control(cx);
+        self.perform_editor_action(EditorAction::OpenCatalog, cx);
+        cx.notify();
+    }
+
     fn perform_editor_action(&mut self, action: EditorAction, cx: &mut Context<Self>) {
         match action {
             EditorAction::OpenCatalog => {
@@ -5887,6 +6559,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 }
             }
             EditorAction::Cancel => {
+                self.cancel_world_control_pointer(core::ControlPointerCancelReason::Explicit, cx);
                 if let Some((node_id, control_id)) = self.last_world_control.clone() {
                     cx.emit(core::GraphEvent::NodeControlKeyDown {
                         node_id,
@@ -5904,7 +6577,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                     if !self.active_escape_overlays.is_empty() {
                         self.dismiss_escape_overlays(cx);
                     } else {
-                        self.cancel_gestures();
+                        self.cancel_gestures(core::ControlPointerCancelReason::Explicit, cx);
                         self.graph.selected_nodes.clear();
                         self.graph.selected_connections.clear();
                         self.emit_selection(cx);
@@ -5947,6 +6620,27 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.notify();
     }
 
+    fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .focus_handle
+            .as_ref()
+            .is_some_and(|focus| !focus.is_focused(window))
+        {
+            return;
+        }
+        if let Some((node_id, control_id)) = self.last_world_control.clone() {
+            cx.emit(core::GraphEvent::NodeControlKeyUp {
+                node_id,
+                control_id,
+                key: event.keystroke.key.clone(),
+                shift: event.keystroke.modifiers.shift,
+                command: event.keystroke.modifiers.control || event.keystroke.modifiers.platform,
+            });
+            cx.stop_propagation();
+            window.prevent_default();
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -5964,6 +6658,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         let shift = event.keystroke.modifiers.shift;
         if let Some((node_id, control_id)) = self.last_world_control.clone() {
+            if key == "escape" {
+                self.cancel_world_control_pointer(core::ControlPointerCancelReason::Explicit, cx);
+            }
             cx.emit(core::GraphEvent::NodeControlKeyDown {
                 node_id: node_id.clone(),
                 control_id: control_id.clone(),
@@ -6495,6 +7192,37 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         if self.focus_handle.is_none() {
             self.focus_handle = Some(cx.focus_handle().tab_stop(true));
         }
+        let window_id = window.window_handle().window_id();
+        if self
+            .window_activation
+            .as_ref()
+            .is_none_or(|(id, _)| *id != window_id)
+        {
+            self.window_activation = Some((
+                window_id,
+                cx.observe_window_activation(window, |editor, window, cx| {
+                    if !window.is_window_active() {
+                        editor.cancel_world_control_pointer(
+                            core::ControlPointerCancelReason::WindowDeactivated,
+                            cx,
+                        );
+                        editor.blur_world_control(cx);
+                    }
+                }),
+            ));
+        }
+        if self
+            .pointer_cancellation
+            .as_ref()
+            .is_none_or(|(id, _)| *id != window_id)
+        {
+            self.pointer_cancellation = Some((
+                window_id,
+                cx.observe_pointer_cancellation(window, |editor, event, _, cx| {
+                    editor.cancel_platform_pointer(event, cx);
+                }),
+            ));
+        }
         let focus_handle = self.focus_handle().clone();
         // Read exactly once for this root render, then share the same immutable aggregate.
         let theme = Arc::clone(cx.node_graph_theme());
@@ -6663,7 +7391,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             || local.x > f32::from(canvas.size.width)
                             || local.y > f32::from(canvas.size.height);
                         if outside {
-                            editor.finish_left_gesture(false, &wire_up_theme, cx);
+                            editor.finish_left_gesture(false, &wire_up_theme, Some(local), cx);
                         }
                     });
                 });
@@ -6751,7 +7479,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             )
             .bg(rgb(theme.editor.background.rgb).opacity(theme.editor.background.alpha))
             .track_focus(&focus_handle)
-            .key_context("NodeGraph")
+            .key_context(
+                if focused
+                    && self.last_world_control.is_none()
+                    && self.world_text_input.is_none()
+                    && self.inline_text_state().is_none()
+                {
+                    NODE_GRAPH_KEY_CONTEXT
+                } else {
+                    "NodeGraphInput"
+                },
+            )
             .on_action(cx.listener(|this, _: &actions::OpenCatalog, _, cx| {
                 this.perform_editor_action(EditorAction::OpenCatalog, cx);
             }))
@@ -6835,7 +7573,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .on_action(cx.listener(|this, _: &actions::SmartGrid, _, cx| {
                 this.perform_editor_action(EditorAction::Align(SelectionAlignment::SmartGrid), cx);
             }))
-            .on_key_down(cx.listener(Self::handle_key_down));
+            .on_key_down(cx.listener(Self::handle_key_down))
+            .on_key_up(cx.listener(Self::handle_key_up));
 
         for (position, number) in automap_badges {
             let preview = theme.connection.automap_preview;
@@ -7183,7 +7922,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         self.active_outside_overlays.clear();
         self.active_backdrop_overlays.clear();
         self.active_overlay_dismiss_callbacks.clear();
-        self.active_overlay_bounds.clear();
+        self.overlay_hitboxes.borrow_mut().clear();
         let mut body_anchored_nodes = HashSet::new();
         let mut frame_world_scene = world::WorldScene::new();
         let mut frame_world_control_owners = HashMap::new();
@@ -7201,13 +7940,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 root = root.child(connection_layer).children(above_wire.drain(..));
             }
             let id = node.id.clone();
+            let requested_width = node.size.width;
             let model_size = self.resolved_node_size(&id).unwrap_or(node.size);
             if let Some(size) = self.resolved_node_size(&id) {
                 node.size = size;
             }
             let position = viewport.world_to_screen(node.position);
             let selected = self.graph.selected_nodes.contains(&id);
-            let visible = self.node_is_visible(&node);
             let resize_id = id.clone();
             let has_registered_body = self
                 .node_type_registry
@@ -7219,6 +7958,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let has_custom_body = has_registered_body
                 || self.node_body_renderer.is_some()
                 || self.world_node_body_renderer.is_some();
+            if has_custom_body && !self.auto_width_nodes.contains(&id) {
+                node.size.width = requested_width;
+            }
+            let visible = self.node_is_visible(&node);
             let mut ports: Vec<_> = self
                 .graph
                 .ports
@@ -7361,8 +8104,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         theme: theme.clone(),
                     });
                 for hit in &scene.hit_regions {
-                    if matches!(hit.role, world::HitRole::Control) {
+                    if matches!(
+                        hit.role,
+                        world::HitRole::Control | world::HitRole::PointerBarrier
+                    ) {
                         frame_world_control_owners.insert(hit.id.clone(), id.clone());
+                    }
+                    if hit.role == world::HitRole::Control {
                         frame_world_control_order.push((id.clone(), hit.id.clone()));
                     }
                 }
@@ -7405,8 +8153,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     theme: theme.clone(),
                 });
                 for hit in &scene.hit_regions {
-                    if matches!(hit.role, world::HitRole::Control) {
+                    if matches!(
+                        hit.role,
+                        world::HitRole::Control | world::HitRole::PointerBarrier
+                    ) {
                         frame_world_control_owners.insert(hit.id.clone(), id.clone());
+                    }
+                    if hit.role == world::HitRole::Control {
                         frame_world_control_order.push((id.clone(), hit.id.clone()));
                     }
                 }
@@ -7475,8 +8228,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             for overlay in body.overlays.drain(..) {
                 let screen_offset =
                     overlay_screen_offset(overlay.offset, viewport) + overlay.screen_offset;
-                let mut overlay_position = position + screen_offset;
-                let mut measurement_id = None;
+                let overlay_position = position + screen_offset;
+                let mut adaptive = None;
                 if let Some(behavior) = &overlay.behavior {
                     if self.dismissed_overlays.contains(&behavior.id) {
                         continue;
@@ -7500,18 +8253,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     if behavior.show_backdrop {
                         self.active_backdrop_overlays.insert(behavior.id.clone());
                     }
-                    measurement_id = Some(behavior.id.clone());
-                    let panel_size = self
-                        .measured_overlay_sizes
-                        .get(&behavior.id)
-                        .copied()
-                        .unwrap_or(behavior.estimated_size);
-                    let canvas = self.canvas_bounds.get();
-                    let canvas_size = core::Size {
-                        width: f32::from(canvas.size.width),
-                        height: f32::from(canvas.size.height),
-                    };
-                    overlay_position = if let Some(placement) =
+                    let placement = if let Some(placement) =
                         self.overlay_placements.get(&behavior.id).copied()
                     {
                         let anchor = self
@@ -7537,27 +8279,24 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     height: viewport.scale_length(placement.anchor_size.height),
                                 },
                             });
-                        resolve_positioned_overlay(anchor, placement, panel_size, canvas_size)
-                            + overlay.screen_offset
+                        PanelPlacement::Positioned {
+                            anchor,
+                            placement,
+                            screen_offset: overlay.screen_offset,
+                        }
                     } else {
-                        resolve_overlay_position(
-                            position,
-                            viewport.scale_length(node.size.width),
-                            screen_offset,
-                            behavior,
-                            panel_size,
-                            canvas_size,
-                        )
+                        PanelPlacement::Adaptive {
+                            node_origin: position,
+                            node_width: viewport.scale_length(node.size.width),
+                            offset: screen_offset,
+                            behavior: behavior.clone(),
+                        }
                     };
-                    if behavior.dismiss_on_outside_click {
-                        self.active_overlay_bounds.push(core::Rect {
-                            origin: overlay_position,
-                            size: panel_size,
-                        });
-                    }
+                    adaptive = Some((behavior.id.clone(), placement));
                 }
-                node_overlays.push((overlay_position, overlay.element, measurement_id));
+                node_overlays.push((overlay_position, overlay.element, adaptive));
             }
+            let themed_chrome = body.chrome == NodeChrome::Theme;
             let graph = cx.weak_entity();
             let measured_node = id.clone();
             let raw_body_element = body.element;
@@ -7607,7 +8346,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 raw_body_element
             };
             let node_background = theme.node.background;
-            let header_accent_color = (!has_custom_body)
+            let header_accent_color = (themed_chrome && !has_custom_body)
                 .then(|| {
                     self.catalog
                         .iter()
@@ -7644,7 +8383,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .collect::<Vec<_>>();
             // GPUI has no outline primitive. A zero-offset, zero-blur outer shadow is
             // the non-layout-shifting equivalent for the solid Leptos selection outline.
-            if selected
+            if themed_chrome
+                && selected
                 && selected_outline.width > 0.0
                 && selected_outline.style == style::LineStyle::Solid
             {
@@ -7675,9 +8415,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         element.min_w(px(viewport.scale_length(theme.node.min_width)))
                     })
                     .h(px(viewport.scale_length(model_size.height)))
-                    .rounded(px(viewport.scale_length(node_radius)))
-                    .shadow(node_shadows)
-                    .overflow_hidden()
+                    .when(themed_chrome, |element| {
+                        element
+                            .rounded(px(viewport.scale_length(node_radius)))
+                            .shadow(node_shadows)
+                            .overflow_hidden()
+                            .bg(rgb(node_background.rgb).opacity(node_background.alpha))
+                    })
                     .opacity(if dragging {
                         theme.node.opacity_dragging
                     } else {
@@ -7699,7 +8443,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         element.cursor_ew_resize()
                     })
                     .when(
-                        node_border.width > 0.0 && node_border.style != style::LineStyle::None,
+                        themed_chrome
+                            && node_border.width > 0.0
+                            && node_border.style != style::LineStyle::None,
                         |element| {
                             element
                                 .border(px(viewport.scale_length(node_border.width)))
@@ -7712,7 +8458,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         },
                     )
                     .when(
-                        selected
+                        themed_chrome
+                            && selected
                             && selected_outline.width > 0.0
                             && selected_outline.style == style::LineStyle::Dashed,
                         |element| {
@@ -7725,7 +8472,6 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 )
                         },
                     )
-                    .bg(rgb(node_background.rgb).opacity(node_background.alpha))
                     .text_color(
                         rgb(theme.node.header_color.rgb).opacity(theme.node.header_color.alpha),
                     )
@@ -7750,22 +8496,35 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 }
                                 cx.stop_propagation();
                                 window.prevent_default();
-                                this.focus(window, cx);
                                 let local = this.local_screen(event.position);
-                                this.dismiss_overlays_before_world_pointer(local, cx);
+                                this.dismiss_overlays_before_world_pointer(local, window, cx);
+                                if this.block_primary_pointer(local, event.click_count, window, cx)
+                                {
+                                    return;
+                                }
+                                this.focus(window, cx);
                                 if let Some(hit) = this
                                     .world_scene
-                                    .hit_test_screen(local, this.graph.viewport)
+                                    .primary_control_at_screen(
+                                        local,
+                                        this.graph.viewport,
+                                        event.click_count,
+                                    )
                                     .cloned()
-                                    && matches!(hit.role, world::HitRole::Control)
                                     && this.world_control_owners.get(&hit.id) == Some(&id)
                                 {
-                                    this.activate_world_control(id.clone(), hit.id.clone(), cx);
+                                    this.activate_world_control(
+                                        id.clone(),
+                                        hit.id.clone(),
+                                        core::ControlActivationSource::Pointer,
+                                        cx,
+                                    );
                                     this.begin_world_control_pointer(
                                         id.clone(),
                                         hit.id.clone(),
                                         local,
                                         core::ControlPointerButton::Primary,
+                                        cx,
                                     );
                                     cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                         node_id: id.clone(),
@@ -8111,7 +8870,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         )
                         .on_mouse_up(
                             MouseButton::Left,
-                            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                            cx.listener(move |this, event: &MouseUpEvent, _, cx| {
                                 cx.stop_propagation();
                                 if this
                                     .draft
@@ -8120,7 +8879,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 {
                                     this.finish_draft(&label_up_id, cx);
                                 }
-                                this.finish_left_gesture(true, &label_up_theme, cx);
+                                this.finish_left_gesture(
+                                    true,
+                                    &label_up_theme,
+                                    Some(this.local_screen(event.position)),
+                                    cx,
+                                );
                             }),
                         )
                 })
@@ -8177,14 +8941,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     )
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
                             cx.stop_propagation();
                             if this.draft.as_ref().is_some_and(|draft| draft.origin != id) {
                                 this.finish_draft(&id, cx);
                             }
                             // The port stops bubbling, so it must also terminate any
                             // node, box, pan, or draft gesture owned by the root.
-                            this.finish_left_gesture(true, &dot_up_theme, cx);
+                            this.finish_left_gesture(
+                                true,
+                                &dot_up_theme,
+                                Some(this.local_screen(event.position)),
+                                cx,
+                            );
                         }),
                     ),
             );
@@ -8256,13 +9025,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            if this.control_owns_other_button(event.button) {
-                                cx.stop_propagation();
-                                window.prevent_default();
-                                return;
-                            }
                             cx.stop_propagation();
                             window.prevent_default();
+                            if this.route_world_control_context_menu(
+                                event.position,
+                                &world_right_theme,
+                                cx,
+                            ) {
+                                return;
+                            }
                             this.focus(window, cx);
                             let local = this.local_screen(event.position);
                             if let Some(port_id) = this.port_at_screen(
@@ -8304,8 +9075,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     )
                     .on_mouse_up_out(
                         MouseButton::Middle,
-                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                            this.release_control_button(core::ControlPointerButton::Middle, cx);
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.release_control_button(
+                                core::ControlPointerButton::Middle,
+                                Some(this.local_screen(event.position)),
+                                cx,
+                            );
                             this.cancel_middle_gesture();
                         }),
                     )
@@ -8317,11 +9092,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 window.prevent_default();
                                 return;
                             }
-                            this.focus(window, cx);
                             let local = this.local_screen(event.position);
-                            this.dismiss_overlays_before_world_pointer(local, cx);
+                            this.dismiss_overlays_before_world_pointer(local, window, cx);
+                            if this.block_primary_pointer(local, event.click_count, window, cx) {
+                                return;
+                            }
+                            this.focus(window, cx);
                             if event.modifiers.control {
-                                this.panning = Some(local);
+                                this.panning = Some(PanGesture {
+                                    previous: local,
+                                    button: MouseButton::Left,
+                                });
                                 this.box_selection = None;
                                 cx.stop_propagation();
                                 window.prevent_default();
@@ -8329,9 +9110,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             }
                             if let Some(hit) = this
                                 .world_scene
-                                .hit_test_screen(local, this.graph.viewport)
+                                .primary_control_at_screen(
+                                    local,
+                                    this.graph.viewport,
+                                    event.click_count,
+                                )
                                 .cloned()
-                                && matches!(hit.role, world::HitRole::Control)
                                 && let Some(node_id) = this.node_at_screen(local)
                                 && this.world_control_owners.get(&hit.id) == Some(&node_id)
                             {
@@ -8339,12 +9123,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 window.prevent_default();
                                 this.focus(window, cx);
                                 this.commit_group_editor(cx);
-                                this.activate_world_control(node_id.clone(), hit.id.clone(), cx);
+                                this.activate_world_control(
+                                    node_id.clone(),
+                                    hit.id.clone(),
+                                    core::ControlActivationSource::Pointer,
+                                    cx,
+                                );
                                 this.begin_world_control_pointer(
                                     node_id.clone(),
                                     hit.id.clone(),
                                     local,
                                     core::ControlPointerButton::Primary,
+                                    cx,
                                 );
                                 cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                     node_id,
@@ -8427,7 +9217,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                     Some(port == draft.origin)
                                 })
                                 .unwrap_or(false);
-                            this.finish_left_gesture(preserve_click_draft, &world_up_theme, cx);
+                            this.finish_left_gesture(
+                                preserve_click_draft,
+                                &world_up_theme,
+                                Some(local),
+                                cx,
+                            );
                         }),
                     ),
             );
@@ -8488,6 +9283,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             this.activate_world_control(
                                 a11y_node_id.clone(),
                                 a11y_control_id.clone(),
+                                core::ControlActivationSource::Accessibility,
                                 cx,
                             );
                         });
@@ -8500,12 +9296,27 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 window.prevent_default();
                                 return;
                             }
+                            let local = this.local_screen(event.position);
+                            if this.block_primary_pointer(local, event.click_count, window, cx) {
+                                return;
+                            }
+                            if !this
+                                .world_scene
+                                .primary_control_at_screen(
+                                    local,
+                                    this.graph.viewport,
+                                    event.click_count,
+                                )
+                                .is_some_and(|region| region.id == pointer_control_id)
+                            {
+                                return;
+                            }
                             cx.stop_propagation();
                             window.prevent_default();
                             this.focus(window, cx);
                             this.commit_group_editor(cx);
                             let local = this.local_screen(event.position);
-                            this.dismiss_overlays_before_world_pointer(local, cx);
+                            this.dismiss_overlays_before_world_pointer(local, window, cx);
                             if let Some(port_id) = this.port_at_screen(
                                 local,
                                 this.graph
@@ -8518,6 +9329,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             this.activate_world_control(
                                 pointer_node_id.clone(),
                                 pointer_control_id.clone(),
+                                core::ControlActivationSource::Pointer,
                                 cx,
                             );
                             this.begin_world_control_pointer(
@@ -8525,6 +9337,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                                 pointer_control_id.clone(),
                                 local,
                                 core::ControlPointerButton::Primary,
+                                cx,
                             );
                             cx.emit(core::GraphEvent::NodeControlPointerActivated {
                                 node_id: pointer_node_id.clone(),
@@ -8767,13 +9580,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             );
         }
 
-        for (position, overlay, measurement_id) in node_overlays {
+        node_overlays.sort_by_key(|(_, _, adaptive)| {
+            adaptive
+                .as_ref()
+                .and_then(|(id, _)| self.overlay_stack_orders.get(id))
+                .copied()
+                .unwrap_or(0)
+        });
+        for (position, overlay, adaptive) in node_overlays {
             let panel = theme.overlay.panel_background;
             let panel_border = theme.overlay.panel_border;
             let panel = div()
-                .absolute()
-                .left(px(position.x))
-                .top(px(position.y))
                 .bg(rgb(panel.rgb).opacity(panel.alpha))
                 .border(px(visible_border_width(panel_border)))
                 .when(panel_border.style == style::LineStyle::Dashed, |element| {
@@ -8787,43 +9604,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     element.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 })
                 .child(overlay);
-            if let Some(measurement_id) = measurement_id {
-                let graph = cx.weak_entity();
-                overlay_root =
-                    overlay_root.child(MeasuredElement::new(panel, move |bounds, cx| {
-                        let measured = core::Size {
-                            width: f32::from(bounds.size.width),
-                            height: f32::from(bounds.size.height),
-                        };
-                        if !measured.width.is_finite()
-                            || !measured.height.is_finite()
-                            || measured.width <= 0.0
-                            || measured.height <= 0.0
-                        {
-                            return;
-                        }
-                        let graph = graph.clone();
-                        let measurement_id = measurement_id.clone();
-                        cx.defer(move |cx| {
-                            let _ = graph.update(cx, |editor, cx| {
-                                let changed = editor
-                                    .measured_overlay_sizes
-                                    .get(&measurement_id)
-                                    .is_none_or(|current| {
-                                        (current.width - measured.width).abs() > 0.1
-                                            || (current.height - measured.height).abs() > 0.1
-                                    });
-                                if changed {
-                                    editor
-                                        .measured_overlay_sizes
-                                        .insert(measurement_id, measured);
-                                    cx.notify();
-                                }
-                            });
-                        });
-                    }));
+            if let Some((id, placement)) = adaptive {
+                overlay_root = overlay_root.child(PositionedOverlay {
+                    child: panel.into_any_element(),
+                    placement,
+                    canvas_bounds: self.canvas_bounds.clone(),
+                    pointer_target: (id, self.overlay_hitboxes.clone()),
+                });
             } else {
-                overlay_root = overlay_root.child(panel);
+                overlay_root =
+                    overlay_root.child(panel.absolute().left(px(position.x)).top(px(position.y)));
             }
         }
 
@@ -9293,12 +10083,32 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     });
                     let pressing = graph.clone();
                     window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                        if phase == DispatchPhase::Capture
-                            && pressing.read(cx).control_owns_other_button(event.button)
-                        {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        if pressing.read(cx).control_owns_other_button(event.button) {
                             cx.stop_propagation();
                             window.prevent_default();
+                            return;
                         }
+                        pressing.update(cx, |this, cx| {
+                            let local = this.local_screen(event.position);
+                            this.dismiss_overlays_before_world_pointer(local, window, cx);
+                            if matches!(event.button, MouseButton::Middle | MouseButton::Right)
+                                && !this
+                                    .overlay_hitboxes
+                                    .borrow()
+                                    .values()
+                                    .any(|hitbox| hitbox.bounds.contains(&event.position))
+                                && this
+                                    .world_scene
+                                    .hit_test_screen(local, this.graph.viewport)
+                                    .is_some_and(|hit| hit.auxiliary_pointer_barrier)
+                            {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            }
+                        });
                     });
                     let releasing = graph.clone();
                     window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
@@ -9309,11 +10119,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             MouseButton::Left => {
                                 this.release_control_button(
                                     core::ControlPointerButton::Primary,
+                                    Some(this.local_screen(event.position)),
                                     cx,
                                 );
                             }
                             MouseButton::Middle => {
-                                this.release_control_button(core::ControlPointerButton::Middle, cx);
+                                this.release_control_button(
+                                    core::ControlPointerButton::Middle,
+                                    Some(this.local_screen(event.position)),
+                                    cx,
+                                );
                             }
                             _ => {}
                         });
@@ -9348,13 +10163,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                if this.control_owns_other_button(event.button) {
-                    cx.stop_propagation();
-                    window.prevent_default();
-                    return;
-                }
                 cx.stop_propagation();
                 window.prevent_default();
+                if this.route_world_control_context_menu(event.position, &root_right_theme, cx) {
+                    return;
+                }
                 this.focus(window, cx);
                 let local = this.local_screen(event.position);
                 this.commit_group_editor(cx);
@@ -9399,8 +10212,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     return;
                 }
                 this.anchor_menu = None;
-                this.focus(window, cx);
                 let local = this.local_screen(event.position);
+                if this.block_primary_pointer(local, event.click_count, window, cx) {
+                    return;
+                }
+                this.focus(window, cx);
                 this.commit_group_editor(cx);
                 if event.click_count >= 2 && this.draft.is_none() {
                     if let Some(group_id) = this.group_label_at(local, &root_down_theme) {
@@ -9426,7 +10242,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 }
                 this.catalog_menu = None;
                 if event.modifiers.control {
-                    this.panning = Some(local);
+                    this.panning = Some(PanGesture {
+                        previous: local,
+                        button: MouseButton::Left,
+                    });
                     this.box_selection = None;
                     cx.stop_propagation();
                     window.prevent_default();
@@ -9457,13 +10276,18 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         Some(port == draft.origin)
                     })
                     .unwrap_or(false);
-                this.finish_left_gesture(preserve_click_draft, &root_up_theme, cx);
+                this.finish_left_gesture(preserve_click_draft, &root_up_theme, Some(local), cx);
             }),
         )
         .on_mouse_up_out(
             MouseButton::Left,
-            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                this.finish_left_gesture(false, &root_up_out_theme, cx)
+            cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                this.finish_left_gesture(
+                    false,
+                    &root_up_out_theme,
+                    Some(this.local_screen(event.position)),
+                    cx,
+                )
             }),
         )
         .on_mouse_up(
@@ -9474,8 +10298,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         )
         .on_mouse_up_out(
             MouseButton::Middle,
-            cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                this.release_control_button(core::ControlPointerButton::Middle, cx);
+            cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                this.release_control_button(
+                    core::ControlPointerButton::Middle,
+                    Some(this.local_screen(event.position)),
+                    cx,
+                );
                 this.cancel_middle_gesture();
             }),
         )
@@ -10072,6 +10900,119 @@ fn paint_dashed_route(
 mod tests {
     use super::*;
 
+    fn cursor_test_scene() -> world::WorldScene {
+        let mut scene = world::WorldScene::new();
+        scene.push(world::WorldPrimitive::TextInput(world::TextField::new(
+            "value",
+            core::Rect {
+                origin: core::Point::new(10.0, 20.0),
+                size: core::Size {
+                    width: 80.0,
+                    height: 20.0,
+                },
+            },
+            "hello",
+        )));
+        scene.push_hit_region(world::WorldHitRegion::new(
+            "value",
+            world::HitRole::Control,
+            world::HitShape::Rect(core::Rect {
+                origin: core::Point::new(9.0, 19.0),
+                size: core::Size {
+                    width: 100.0,
+                    height: 22.0,
+                },
+            }),
+        ));
+        scene
+    }
+
+    #[test]
+    fn text_cursor_respects_field_bounds_and_spinner_strip() {
+        let scene = cursor_test_scene().project(core::Viewport::default());
+        let expected = Some(core::Rect {
+            origin: core::Point::new(10.0, 20.0),
+            size: core::Size {
+                width: 80.0,
+                height: 20.0,
+            },
+        });
+        assert_eq!(
+            text_cursor_bounds_at(&scene, core::Point::new(50.0, 30.0)),
+            expected
+        );
+        assert_eq!(
+            text_cursor_bounds_at(&scene, core::Point::new(10.0, 20.0)),
+            expected
+        );
+        assert_eq!(
+            text_cursor_bounds_at(&scene, core::Point::new(9.5, 30.0)),
+            None
+        );
+        assert_eq!(
+            text_cursor_bounds_at(&scene, core::Point::new(100.0, 30.0)),
+            None
+        );
+        let mut missing = scene.clone();
+        missing.primitives.clear();
+        assert_eq!(
+            text_cursor_bounds_at(&missing, core::Point::new(50.0, 30.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn text_cursor_uses_exact_topmost_world_hit() {
+        for role in [world::HitRole::NodeBody, world::HitRole::Control] {
+            let mut scene = cursor_test_scene();
+            scene.push_hit_region(world::WorldHitRegion::new(
+                "above",
+                role,
+                world::HitShape::Circle {
+                    center: core::Point::new(50.0, 30.0),
+                    radius: 8.0,
+                },
+            ));
+            let scene = scene.project(core::Viewport::default());
+            assert_eq!(
+                text_cursor_bounds_at(&scene, core::Point::new(50.0, 30.0)),
+                None
+            );
+            assert_eq!(
+                text_cursor_bounds_at(&scene, core::Point::new(42.0, 22.0)),
+                Some(core::Rect {
+                    origin: core::Point::new(10.0, 20.0),
+                    size: core::Size {
+                        width: 80.0,
+                        height: 20.0
+                    },
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn text_cursor_tracks_projected_pan_and_zoom() {
+        let scene = cursor_test_scene().project(core::Viewport {
+            pan: core::Point::new(100.0, -10.0),
+            zoom: 2.0,
+        });
+        assert_eq!(
+            text_cursor_bounds_at(&scene, core::Point::new(150.0, 40.0)),
+            Some(core::Rect {
+                origin: core::Point::new(120.0, 30.0),
+                size: core::Size {
+                    width: 160.0,
+                    height: 40.0
+                },
+            })
+        );
+        assert_eq!(
+            text_cursor_bounds_at(&scene, core::Point::new(50.0, 30.0)),
+            None
+        );
+    }
+
     #[test]
     fn default_shortcut_catalog_has_unique_sequences_and_typed_metadata() {
         let mut sequences = HashSet::new();
@@ -10080,6 +11021,409 @@ mod tests {
             assert!(!shortcut.command.id().is_empty());
             assert!(!shortcut.command.label().is_empty());
             assert_eq!(shortcut.command.group(), "Node graph");
+        }
+    }
+
+    struct PopupTestHost {
+        editor: gpui::Entity<NodeGraph<Kind, String, String, String>>,
+        width: f32,
+        height: f32,
+    }
+
+    impl Render for PopupTestHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().pl(px(37.)).pt(px(53.)).child(
+                gpui::anchored()
+                    .position_mode(gpui::AnchoredPositionMode::Local)
+                    .position(point(px(17.), px(19.)))
+                    .child(
+                        div()
+                            .w(px(self.width))
+                            .h(px(self.height))
+                            .child(self.editor.clone()),
+                    ),
+            )
+        }
+    }
+
+    #[derive(Clone)]
+    struct PopupTestContent {
+        width: Option<f32>,
+        height: Option<f32>,
+        intrinsic_child_width: Option<f32>,
+        text: String,
+    }
+
+    fn popup_test_graph(
+        cx: &mut Context<NodeGraph<Kind, String, String, String>>,
+        content: Rc<RefCell<PopupTestContent>>,
+        paints: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    ) -> NodeGraph<Kind, String, String, String> {
+        NodeGraph::new(interactive_graph(), cx)
+            .with_world_node_body_renderer(|_| world::WorldScene::default())
+            .with_node_overlay_renderer(
+                move |context: WorldNodeBodyContext<Kind, String, String>,
+                      _: &mut Window,
+                      _: &mut App| {
+                    if context.node.id != "a" {
+                        return Vec::new();
+                    }
+                    let content = content.borrow().clone();
+                    let records = paints.clone();
+                    let panel = div()
+                        .relative()
+                        .when_some(content.width, |el, width| el.w(px(width)))
+                        .when_some(content.height, |el, height| el.h(px(height)))
+                        .child(
+                            div()
+                                .when_some(content.intrinsic_child_width, |el, width| {
+                                    el.w(px(width))
+                                })
+                                .child(content.text),
+                        )
+                        .child(
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| records.borrow_mut().push(bounds),
+                            )
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .size_full(),
+                        );
+                    vec![
+                        NodeOverlay::new(core::Point::default(), panel).with_behavior(
+                            OverlayBehavior {
+                                id: "panel".into(),
+                                estimated_size: core::Size {
+                                    width: 1.,
+                                    height: 1.,
+                                },
+                                flip_horizontal: true,
+                                clamp_to_canvas: true,
+                                dismiss_on_escape: true,
+                                dismiss_on_outside_click: true,
+                                show_backdrop: false,
+                            },
+                        ),
+                    ]
+                },
+            )
+    }
+
+    fn draw_popup_first_frame(
+        cx: &mut gpui::VisualTestContext,
+        host: &gpui::Entity<PopupTestHost>,
+        paints: &Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    ) -> Bounds<Pixels> {
+        paints.borrow_mut().clear();
+        host.update(cx, |host, cx| {
+            host.editor.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        });
+        cx.draw(
+            gpui::Point::default(),
+            gpui::size(
+                gpui::AvailableSpace::Definite(px(800.)),
+                gpui::AvailableSpace::Definite(px(700.)),
+            ),
+            |_, _| host.clone().into_any_element(),
+        );
+        let paints = paints.borrow();
+        assert!(!paints.is_empty(), "first popup paint was observed");
+        for bounds in paints.iter() {
+            assert_eq!(*bounds, paints[0], "no placement settling frame");
+        }
+        paints[0]
+    }
+
+    #[gpui::test]
+    fn popup_first_paint_uses_current_height_and_hitbox_with_ancestor_offset(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| {
+            let mut theme = NodeGraphTheme::default();
+            theme.overlay.panel_border.width = 0.;
+            set_node_graph_theme(app, theme);
+        });
+        let content = Rc::new(RefCell::new(PopupTestContent {
+            width: Some(260.),
+            height: Some(67.),
+            intrinsic_child_width: None,
+            text: String::new(),
+        }));
+        let paints = Rc::new(RefCell::new(Vec::new()));
+        let (host, cx) = cx.add_window_view(|_, cx| PopupTestHost {
+            editor: cx.new(|cx| popup_test_graph(cx, content.clone(), paints.clone())),
+            width: 400.,
+            height: 500.,
+        });
+        let editor = host.read_with(cx, |host, _| host.editor.clone());
+        editor.update(cx, |editor, cx| {
+            editor.set_overlay_pane_anchor(
+                "panel",
+                core::Rect {
+                    origin: core::Point::new(150., 400.),
+                    size: core::Size {
+                        width: 8.,
+                        height: 8.,
+                    },
+                },
+                cx,
+            );
+            editor.set_overlay_placement(
+                "panel",
+                OverlayPlacement {
+                    side: OverlaySide::Right,
+                    align: OverlayAlign::End,
+                    gap: 4.,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        let loading = draw_popup_first_frame(cx, &host, &paints);
+        let canvas = editor.read_with(cx, |editor, _| editor.canvas_bounds.get());
+        assert_eq!(canvas.origin, point(px(54.), px(72.)));
+        assert_eq!(canvas.size, gpui::size(px(400.), px(500.)));
+        assert_eq!(loading.origin, point(px(194.), px(413.)));
+        assert_eq!(loading.size, gpui::size(px(260.), px(67.)));
+        content.borrow_mut().height = Some(255.);
+        let ready = draw_popup_first_frame(cx, &host, &paints);
+        assert_eq!(ready.origin, point(px(194.), px(225.)));
+        assert_eq!(ready.size, gpui::size(px(260.), px(255.)));
+        let hitbox = editor.read_with(cx, |editor, _| {
+            editor.overlay_hitboxes.borrow()["panel"].bounds
+        });
+        assert_eq!(hitbox, ready);
+        content.borrow_mut().height = Some(67.);
+        let compact = draw_popup_first_frame(cx, &host, &paints);
+        assert_eq!(compact, loading);
+        let hitbox = editor.read_with(cx, |editor, _| {
+            editor.overlay_hitboxes.borrow()["panel"].bounds
+        });
+        assert_eq!(hitbox, compact);
+        assert!(!hitbox.contains(&(ready.origin + point(px(10.), px(10.)))));
+        host.update(cx, |host, _| {
+            host.width = 300.;
+            host.height = 300.;
+        });
+        let resized = draw_popup_first_frame(cx, &host, &paints);
+        assert_eq!(resized.origin, point(px(94.), px(305.)));
+        assert_eq!(resized.size, compact.size);
+        let hitbox = editor.read_with(cx, |editor, _| {
+            editor.overlay_hitboxes.borrow()["panel"].bounds
+        });
+        assert_eq!(hitbox, resized);
+    }
+
+    #[gpui::test]
+    fn popup_intrinsic_width_is_measured_before_right_edge_placement(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| {
+            let mut theme = NodeGraphTheme::default();
+            theme.overlay.panel_border.width = 0.;
+            set_node_graph_theme(app, theme);
+        });
+        let content = Rc::new(RefCell::new(PopupTestContent {
+            width: None,
+            height: Some(30.),
+            intrinsic_child_width: Some(180.),
+            text: "Intrinsic popup".into(),
+        }));
+        let paints = Rc::new(RefCell::new(Vec::new()));
+        let (host, cx) = cx.add_window_view(|_, cx| PopupTestHost {
+            editor: cx.new(|cx| popup_test_graph(cx, content.clone(), paints.clone())),
+            width: 400.,
+            height: 500.,
+        });
+        let editor = host.read_with(cx, |host, _| host.editor.clone());
+        editor.update(cx, |editor, cx| {
+            editor.set_overlay_pane_anchor(
+                "panel",
+                core::Rect {
+                    origin: core::Point::new(380., 100.),
+                    size: core::Size {
+                        width: 8.,
+                        height: 8.,
+                    },
+                },
+                cx,
+            );
+            editor.set_overlay_placement(
+                "panel",
+                OverlayPlacement {
+                    gap: 4.,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        let bounds = draw_popup_first_frame(cx, &host, &paints);
+        assert_eq!(bounds.size, gpui::size(px(180.), px(30.)));
+        assert_eq!(bounds.origin, point(px(250.), px(172.)));
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.overlay_hitboxes.borrow()["panel"]
+                .bounds),
+            bounds
+        );
+    }
+
+    #[gpui::test]
+    fn popup_current_hitbox_keeps_auxiliary_buttons_from_underlying_world_barriers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| {
+            let mut theme = NodeGraphTheme::default();
+            theme.overlay.panel_border.width = 0.;
+            set_node_graph_theme(app, theme);
+        });
+        for dismiss_on_outside_click in [true, false] {
+            let height = Rc::new(Cell::new(67.));
+            let paints = Rc::new(RefCell::new(Vec::new()));
+            let buttons = Rc::new(RefCell::new(Vec::new()));
+            let render_height = height.clone();
+            let render_paints = paints.clone();
+            let render_buttons = buttons.clone();
+            let (host, cx) = cx.add_window_view(|_, cx| PopupTestHost {
+                editor: cx.new(|cx| {
+                    NodeGraph::new(interactive_graph(), cx)
+                        .with_world_node_body_renderer(
+                            |context: WorldNodeBodyContext<Kind, String, String>| {
+                                let mut scene = world::WorldScene::default();
+                                if context.node.id == "a" {
+                                    scene.push_hit_region(
+                                        world::WorldHitRegion::new(
+                                            "under-popup",
+                                            world::HitRole::Control,
+                                            world::HitShape::Rect(core::Rect {
+                                                origin: core::Point::default(),
+                                                size: core::Size {
+                                                    width: 800.,
+                                                    height: 700.,
+                                                },
+                                            }),
+                                        )
+                                        .with_auxiliary_pointer_barrier(),
+                                    );
+                                }
+                                scene
+                            },
+                        )
+                        .with_node_overlay_renderer(
+                            move |context: WorldNodeBodyContext<Kind, String, String>,
+                                  _: &mut Window,
+                                  _: &mut App| {
+                                if context.node.id != "a" {
+                                    return Vec::new();
+                                }
+                                let middle = render_buttons.clone();
+                                let right = render_buttons.clone();
+                                let records = render_paints.clone();
+                                vec![
+                                    NodeOverlay::new(
+                                        core::Point::default(),
+                                        div()
+                                            .relative()
+                                            .w(px(260.))
+                                            .h(px(render_height.get()))
+                                            .on_mouse_down(MouseButton::Middle, move |_, _, cx| {
+                                                middle.borrow_mut().push(MouseButton::Middle);
+                                                cx.stop_propagation();
+                                            })
+                                            .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                                                right.borrow_mut().push(MouseButton::Right);
+                                                cx.stop_propagation();
+                                            })
+                                            .child(
+                                                canvas(
+                                                    |_, _, _| (),
+                                                    move |bounds, _, _, _| {
+                                                        records.borrow_mut().push(bounds);
+                                                    },
+                                                )
+                                                .absolute()
+                                                .left_0()
+                                                .top_0()
+                                                .size_full(),
+                                            ),
+                                    )
+                                    .with_behavior(
+                                        OverlayBehavior {
+                                            id: "panel".into(),
+                                            estimated_size: core::Size {
+                                                width: 1.,
+                                                height: 1.,
+                                            },
+                                            flip_horizontal: true,
+                                            clamp_to_canvas: true,
+                                            dismiss_on_escape: true,
+                                            dismiss_on_outside_click,
+                                            show_backdrop: false,
+                                        },
+                                    ),
+                                ]
+                            },
+                        )
+                }),
+                width: 400.,
+                height: 500.,
+            });
+            let editor = host.read_with(cx, |host, _| host.editor.clone());
+            editor.update(cx, |editor, cx| {
+                editor.set_overlay_pane_anchor(
+                    "panel",
+                    core::Rect {
+                        origin: core::Point::new(150., 400.),
+                        size: core::Size {
+                            width: 8.,
+                            height: 8.,
+                        },
+                    },
+                    cx,
+                );
+                editor.set_overlay_placement(
+                    "panel",
+                    OverlayPlacement {
+                        side: OverlaySide::Right,
+                        align: OverlayAlign::End,
+                        gap: 4.,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+            let loading = draw_popup_first_frame(cx, &host, &paints);
+            height.set(255.);
+            let ready = draw_popup_first_frame(cx, &host, &paints);
+            let new_only = ready.origin + point(px(10.), px(10.));
+            assert!(!loading.contains(&new_only));
+            assert!(editor.read_with(cx, |editor, _| {
+                editor
+                    .world_scene
+                    .hit_test_screen(editor.local_screen(new_only), editor.graph.viewport)
+                    .is_some_and(|hit| hit.auxiliary_pointer_barrier)
+            }));
+            cx.simulate_mouse_move(new_only, None, gpui::Modifiers::default());
+            for button in [MouseButton::Middle, MouseButton::Right] {
+                cx.simulate_mouse_down(new_only, button, gpui::Modifiers::default());
+                cx.simulate_mouse_up(new_only, button, gpui::Modifiers::default());
+            }
+            assert_eq!(*buttons.borrow(), [MouseButton::Middle, MouseButton::Right]);
+            assert!(editor.read_with(cx, |editor, _| editor.panning.is_none()));
+            assert!(editor.read_with(cx, |editor, _| editor.anchor_menu.is_none()));
+            height.set(67.);
+            let compact = draw_popup_first_frame(cx, &host, &paints);
+            assert_eq!(compact, loading);
+            cx.simulate_mouse_down(new_only, MouseButton::Middle, gpui::Modifiers::default());
+            cx.simulate_mouse_up(new_only, MouseButton::Middle, gpui::Modifiers::default());
+            assert_eq!(*buttons.borrow(), [MouseButton::Middle, MouseButton::Right]);
+            assert!(editor.read_with(cx, |editor, _| editor.panning.is_none()));
+            assert_eq!(
+                editor.read_with(cx, |editor, _| editor.is_overlay_dismissed("panel")),
+                dismiss_on_outside_click
+            );
         }
     }
 
@@ -10174,6 +11518,1002 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(*keys.borrow(), vec!["t"]);
+    }
+
+    #[gpui::test]
+    fn control_release_uses_mouseup_position_without_a_move(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let window = cx.add_window(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        let editor = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let releases = Rc::new(RefCell::new(Vec::new()));
+        let observed = releases.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if let core::GraphEvent::NodeControlPointerReleased { world_position, .. } =
+                        event
+                    {
+                        observed.borrow_mut().push(*world_position);
+                    }
+                },
+            )
+        });
+        window
+            .update(cx, |editor, _, cx| {
+                editor.graph.viewport.pan = core::Point::new(5.0, 7.0);
+                editor.graph.viewport.zoom = 2.0;
+                editor.begin_world_control_pointer(
+                    "a".into(),
+                    "go".into(),
+                    core::Point::new(10.0, 20.0),
+                    core::ControlPointerButton::Primary,
+                    cx,
+                );
+                assert!(editor.release_control_button(
+                    core::ControlPointerButton::Primary,
+                    Some(core::Point::new(90.0, 110.0)),
+                    cx
+                ));
+                editor.begin_world_control_pointer(
+                    "a".into(),
+                    "go".into(),
+                    core::Point::new(10.0, 20.0),
+                    core::ControlPointerButton::Primary,
+                    cx,
+                );
+                assert!(editor.release_control_button(
+                    core::ControlPointerButton::Primary,
+                    None,
+                    cx
+                ));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            *releases.borrow(),
+            vec![Some(core::Point::new(42.5, 51.5)), None]
+        );
+    }
+
+    #[gpui::test]
+    fn world_control_cancellation_is_distinct_and_once(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _subscription = cx.update(|app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerCancelled {
+                        node_id,
+                        control_id,
+                        button,
+                        reason,
+                    } => {
+                        observed.borrow_mut().push((
+                            node_id.clone(),
+                            control_id.clone(),
+                            *button,
+                            *reason,
+                        ));
+                    }
+                    core::GraphEvent::NodeControlPointerReleased { .. } => {
+                        panic!("cancellation must not release")
+                    }
+                    _ => {}
+                },
+            )
+        });
+        editor.update(cx, |editor, cx| {
+            editor.focus_world_control("a".into(), "old", cx);
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "old".into(),
+                core::Point::default(),
+                core::ControlPointerButton::Primary,
+                cx,
+            );
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "new".into(),
+                core::Point::default(),
+                core::ControlPointerButton::Primary,
+                cx,
+            );
+            editor.blur_world_control(cx);
+            editor.blur_world_control(cx);
+            editor.begin_world_control_pointer(
+                "b".into(),
+                "replace".into(),
+                core::Point::default(),
+                core::ControlPointerButton::Middle,
+                cx,
+            );
+            editor.set_graph(interactive_graph(), cx).unwrap();
+            assert!(!editor.release_control_button(core::ControlPointerButton::Middle, None, cx));
+            editor.focus_world_control("a".into(), "explicit", cx);
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "explicit".into(),
+                core::Point::default(),
+                core::ControlPointerButton::Primary,
+                cx,
+            );
+            editor.cancel_world_control_pointer(core::ControlPointerCancelReason::Explicit, cx);
+            editor.cancel_world_control_pointer(core::ControlPointerCancelReason::Explicit, cx);
+            assert_eq!(
+                editor.last_world_control(),
+                Some((&String::from("a"), "explicit"))
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                (
+                    "a".into(),
+                    "old".into(),
+                    core::ControlPointerButton::Primary,
+                    core::ControlPointerCancelReason::Superseded
+                ),
+                (
+                    "a".into(),
+                    "new".into(),
+                    core::ControlPointerButton::Primary,
+                    core::ControlPointerCancelReason::FocusLost
+                ),
+                (
+                    "b".into(),
+                    "replace".into(),
+                    core::ControlPointerButton::Middle,
+                    core::ControlPointerCancelReason::GraphReplaced
+                ),
+                (
+                    "a".into(),
+                    "explicit".into(),
+                    core::ControlPointerButton::Primary,
+                    core::ControlPointerCancelReason::Explicit
+                ),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn escape_cancels_capture_and_preserves_control_key_routing(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let window = cx.add_window(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        let editor = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _subscription = cx.update(|app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerCancelled {
+                        node_id,
+                        control_id,
+                        button,
+                        reason,
+                    } => {
+                        assert_eq!(node_id, "a");
+                        assert_eq!(control_id, "go");
+                        assert_eq!(*button, core::ControlPointerButton::Primary);
+                        assert_eq!(*reason, core::ControlPointerCancelReason::Explicit);
+                        observed.borrow_mut().push("cancelled");
+                    }
+                    core::GraphEvent::NodeControlKeyDown {
+                        control_id, key, ..
+                    } => {
+                        assert_eq!(control_id, "go");
+                        assert_eq!(key, "escape");
+                        observed.borrow_mut().push("escape");
+                    }
+                    core::GraphEvent::NodeControlPointerReleased { .. } => {
+                        panic!("escape must not release")
+                    }
+                    _ => {}
+                },
+            )
+        });
+        for action in [false, true] {
+            window
+                .update(cx, |editor, window, cx| {
+                    editor.focus_handle().focus(window, cx);
+                    editor.focus_world_control("a".into(), "go", cx);
+                    editor.graph.selected_nodes.insert("a".into());
+                    editor.begin_world_control_pointer(
+                        "a".into(),
+                        "go".into(),
+                        core::Point::default(),
+                        core::ControlPointerButton::Primary,
+                        cx,
+                    );
+                    if action {
+                        editor.perform_editor_action(EditorAction::Cancel, cx);
+                    } else {
+                        editor.handle_key_down(
+                            &KeyDownEvent {
+                                keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                                is_held: false,
+                                prefer_character_input: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    assert!(editor.world_control_pointer.is_none());
+                    assert_eq!(
+                        editor.last_world_control(),
+                        Some((&String::from("a"), "go"))
+                    );
+                    assert!(editor.graph.selected_nodes.contains("a"));
+                    assert!(!editor.release_control_button(
+                        core::ControlPointerButton::Primary,
+                        Some(core::Point::new(2000.0, 0.0)),
+                        cx
+                    ));
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            *events.borrow(),
+            vec!["cancelled", "escape", "cancelled", "escape"]
+        );
+    }
+
+    #[gpui::test]
+    fn public_catalog_opening_releases_a_focused_world_control(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|_| {
+            NodeGraph::new_for_test(interactive_graph()).with_catalog(vec![NodeCatalogItem {
+                id: "constant".into(),
+                label: "Constant".into(),
+                category: "Values".into(),
+                category_color: None,
+                description: String::new(),
+                keywords: Vec::new(),
+                ports: Vec::new(),
+            }])
+        });
+        let blurred = Rc::new(RefCell::new(Vec::new()));
+        let observed = blurred.clone();
+        let _subscription = cx.update(|app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if let core::GraphEvent::NodeControlBlurred { control_id, .. } = event {
+                        observed.borrow_mut().push(control_id.clone());
+                    }
+                },
+            )
+        });
+        editor.update(cx, |editor, cx| {
+            editor.graph.viewport.pan = core::Point::new(5.0, 7.0);
+            editor.graph.viewport.zoom = 2.0;
+            editor.last_pointer_screen = Some(core::Point::new(90.0, 110.0));
+            editor.focus_world_control("a".into(), "go", cx);
+            editor.set_world_text_input(
+                "a".into(),
+                "go",
+                WorldTextInputState::new("draft", 0..5),
+                cx,
+            );
+            editor.begin_world_control_pointer(
+                "a".into(),
+                "go".into(),
+                core::Point::new(10.0, 20.0),
+                core::ControlPointerButton::Primary,
+                cx,
+            );
+            editor.open_node_catalog(cx);
+            assert!(editor.last_world_control().is_none());
+            assert!(editor.world_control_pointer.is_none());
+            assert!(editor.world_text_input().is_none());
+            let menu = editor.catalog_menu.as_ref().expect("node catalog opened");
+            assert_eq!(menu.anchor_world, core::Point::new(42.5, 51.5));
+            assert_eq!(menu.query.text, "");
+            assert_eq!(editor.filtered_catalog_indices(), vec![0]);
+        });
+        cx.run_until_parked();
+        assert_eq!(*blurred.borrow(), vec!["go"]);
+    }
+
+    #[gpui::test]
+    fn inert_rows_blur_without_selection_or_drag_and_keep_children_actionable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        for painted in [false, true] {
+            let enabled = Rc::new(Cell::new(true));
+            let rendered_enabled = enabled.clone();
+            let (editor, cx) = cx.add_window_view(move |_, cx| {
+                NodeGraph::new(interactive_graph(), cx).with_world_node_body_renderer(
+                    move |context: WorldNodeBodyContext<Kind, String, String>| {
+                        let mut scene = world::WorldScene::new();
+                        if context.node.id != "a" {
+                            return scene;
+                        }
+                        let row = core::Rect {
+                            origin: core::Point::new(5.0, 15.0),
+                            size: core::Size {
+                                width: 40.0,
+                                height: 20.0,
+                            },
+                        };
+                        if painted {
+                            scene.push(world::WorldPrimitive::Quad {
+                                bounds: row,
+                                fill: world::WorldColor::rgb(0x111111),
+                                corner_radius: 0.0,
+                            });
+                        }
+                        scene.push_hit_region(world::WorldHitRegion::new(
+                            "row",
+                            world::HitRole::PointerBarrier,
+                            world::HitShape::Rect(row),
+                        ));
+                        if rendered_enabled.get() {
+                            scene.push_hit_region(world::WorldHitRegion::new(
+                                "go",
+                                world::HitRole::Control,
+                                world::HitShape::Rect(core::Rect {
+                                    origin: core::Point::new(30.0, 15.0),
+                                    size: core::Size {
+                                        width: 15.0,
+                                        height: 20.0,
+                                    },
+                                }),
+                            ));
+                        }
+                        scene
+                    },
+                )
+            });
+            cx.run_until_parked();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let observed = events.clone();
+            editor.update(cx, |editor, cx| {
+                editor.focus_world_control("b".into(), "old", cx);
+                editor.set_world_text_input(
+                    "b".into(),
+                    "old",
+                    WorldTextInputState::new("draft", 0..5),
+                    cx,
+                );
+                let entity = cx.entity();
+                cx.subscribe(
+                    &entity,
+                    move |_, _, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                        let name = match event {
+                            core::GraphEvent::NodeControlBlurred { .. } => "blurred",
+                            core::GraphEvent::NodeControlActivated { .. } => "activated",
+                            core::GraphEvent::NodeControlFocused { .. } => "focused",
+                            core::GraphEvent::NodeControlPointerActivated { .. } => "pressed",
+                            core::GraphEvent::SelectionChanged { .. } => "selected",
+                            core::GraphEvent::NodesMoved { .. } => "moved",
+                            _ => return,
+                        };
+                        observed.borrow_mut().push(name);
+                    },
+                )
+                .detach();
+            });
+            cx.run_until_parked();
+            events.borrow_mut().clear();
+            cx.simulate_mouse_down(
+                point(px(15.0), px(25.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                point(px(20.0), px(29.0)),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(
+                point(px(20.0), px(29.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            editor.read_with(cx, |editor, _| {
+                assert!(editor.graph.selected_nodes.is_empty());
+                assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
+                assert!(editor.last_world_control.is_none());
+                assert!(editor.world_text_input.is_none());
+                assert!(
+                    !editor
+                        .world_control_order
+                        .iter()
+                        .any(|(_, control)| control == "row")
+                );
+            });
+            assert_eq!(*events.borrow(), vec!["blurred"]);
+            events.borrow_mut().clear();
+            cx.simulate_mouse_down(
+                point(px(35.0), px(25.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            editor.read_with(cx, |editor, _| {
+                assert_eq!(
+                    editor.last_world_control(),
+                    Some((&String::from("a"), "go"))
+                );
+                assert!(editor.world_control_pointer.is_some());
+            });
+            cx.simulate_mouse_up(
+                point(px(35.0), px(25.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(*events.borrow(), vec!["activated", "pressed"]);
+            enabled.set(false);
+            editor.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            events.borrow_mut().clear();
+            cx.simulate_mouse_down(
+                point(px(35.0), px(25.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                point(px(38.0), px(29.0)),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(
+                point(px(38.0), px(29.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(*events.borrow(), vec!["blurred"]);
+            editor.read_with(cx, |editor, _| {
+                assert!(editor.graph.selected_nodes.is_empty());
+                assert!(editor.last_world_control.is_none());
+                assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn replacing_registry_without_port_changes_retires_retained_body(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let definition = NodeTypeBuilder::<Kind, String, String, String>::new("a", "A")
+            .renderer(
+                |_: NodeBodyContext<Kind, String, String, String>, _: &mut Window, _: &mut App| {
+                    NodeBody::new(
+                        div()
+                            .debug_selector(|| "registry-retained-body".into())
+                            .h(px(40.)),
+                    )
+                    .with_chrome(NodeChrome::BodyOwned)
+                },
+            )
+            .build()
+            .unwrap();
+        let mut registry = NodeTypeRegistry::new(|node: &String, key| format!("{node}:{key}"));
+        registry.register(definition).unwrap();
+        let mut graph = interactive_graph();
+        graph.nodes.remove("b");
+        graph.ports.clear();
+        graph.connections.clear();
+        let (editor, cx) =
+            cx.add_window_view(|_, cx| NodeGraph::new(graph, cx).with_node_type_registry(registry));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("registry-retained-body").is_some());
+        editor.update(cx, |editor, cx| {
+            editor
+                .set_node_type_registry(
+                    Some(NodeTypeRegistry::new(|node: &String, key| {
+                        format!("{node}:{key}")
+                    })),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("registry-retained-body").is_none());
+    }
+
+    #[gpui::test]
+    fn widened_retained_body_uses_effective_width_for_visibility(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let visible = Rc::new(Cell::new(false));
+        let observed = visible.clone();
+        let mut graph = interactive_graph();
+        graph.nodes.remove("b");
+        graph.ports.clear();
+        graph.connections.clear();
+        graph.nodes.get_mut("a").unwrap().position = core::Point::new(0., 40.);
+        graph.nodes.get_mut("a").unwrap().size.width = 100.;
+        let (editor, cx) = cx.add_window_view(|_, cx| {
+            let mut editor = NodeGraph::new(graph, cx).with_node_body_renderer(
+                move |context: NodeBodyContext<Kind, String, String, String>,
+                      _: &mut Window,
+                      _: &mut App| {
+                    observed.set(context.state.visible);
+                    let element = if context.state.visible {
+                        div().w_full().h(px(60.))
+                    } else {
+                        div()
+                    };
+                    NodeBody::new(element)
+                        .with_chrome(NodeChrome::BodyOwned)
+                        .with_ports(PortPresentation::BodyAnchors)
+                },
+            );
+            editor.config.visibility_margin = 0.;
+            editor
+        });
+        cx.run_until_parked();
+        assert!(visible.get());
+        editor.update(cx, |editor, cx| {
+            editor.graph.nodes.get_mut("a").unwrap().position.x = -300.;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!visible.get());
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.resolved_node_size(&"a".into()).unwrap().width, 100.);
+        });
+        editor.update(cx, |editor, cx| {
+            editor.graph.nodes.get_mut("a").unwrap().size.width = 400.;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(visible.get());
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.resolved_node_size(&"a".into()).unwrap().width, 400.);
+            assert_eq!(editor.resolved_node_size(&"a".into()).unwrap().height, 60.);
+        });
+        editor.update(cx, |editor, cx| {
+            let node = editor.graph.nodes.get_mut("a").unwrap();
+            node.position.x = 0.;
+            node.size.width = 100.;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let world_visible = visible.clone();
+        editor.update(cx, |editor, cx| {
+            editor.graph.nodes.get_mut("a").unwrap().position.x = -300.;
+            editor.set_world_node_body_renderer(
+                move |context: WorldNodeBodyContext<Kind, String, String>| {
+                    world_visible.set(context.state.visible);
+                    let mut scene = world::WorldScene::new();
+                    if context.state.visible {
+                        scene.push(world::WorldPrimitive::Quad {
+                            bounds: core::Rect {
+                                origin: context.node.position,
+                                size: context.node.size,
+                            },
+                            fill: world::WorldColor::rgb(0x123456),
+                            corner_radius: 0.,
+                        });
+                    }
+                    scene
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(!visible.get());
+        editor.update(cx, |editor, cx| {
+            editor.graph.nodes.get_mut("a").unwrap().size.width = 400.;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(visible.get());
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.world_scene().primitives.len(), 1);
+            let world::WorldPrimitive::Quad { bounds, .. } = &editor.world_scene().primitives[0]
+            else {
+                panic!("visible world body must paint its quad");
+            };
+            assert_eq!(bounds.size.width, 400.);
+        });
+    }
+
+    #[gpui::test]
+    fn body_owned_chrome_preserves_body_geometry_without_shell_inset(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut theme = NodeGraphTheme::default();
+        theme.node.border.width = 7.;
+        theme.node.border.style = style::LineStyle::Solid;
+        theme.node.header_accent_height = 20.;
+        cx.update(|app| set_node_graph_theme(app, theme));
+        for chrome in [NodeChrome::Theme, NodeChrome::BodyOwned] {
+            let (editor, cx) = cx.add_window_view(|_, cx| {
+                NodeGraph::new(interactive_graph(), cx).with_node_body_renderer(
+                    move |context: NodeBodyContext<Kind, String, String, String>,
+                          _: &mut Window,
+                          _: &mut App| {
+                        NodeBody::new(
+                            div()
+                                .debug_selector(|| "owned-body".into())
+                                .w_full()
+                                .h(px(40. * context.state.zoom)),
+                        )
+                        .with_chrome(chrome)
+                        .with_ports(PortPresentation::BodyAnchors)
+                    },
+                )
+            });
+            editor.update(cx, |editor, cx| {
+                editor.graph.nodes.remove("b");
+                editor.graph.ports.clear();
+                editor.graph.connections.clear();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("owned-body").unwrap();
+            let inset = if chrome == NodeChrome::Theme { 7. } else { 0. };
+            assert_eq!(bounds.origin, point(px(inset), px(inset)));
+            assert_eq!(bounds.size.height, px(40.));
+            editor.read_with(cx, |editor, _| {
+                assert_eq!(editor.resolved_node_size(&"a".into()).unwrap().height, 40.);
+                assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0., 0.));
+            });
+            cx.simulate_mouse_move(point(px(20.), px(20.)), None, gpui::Modifiers::default());
+            cx.simulate_mouse_down(
+                point(px(20.), px(20.)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                point(px(35.), px(32.)),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(
+                point(px(35.), px(32.)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            editor.read_with(cx, |editor, _| {
+                assert!(editor.graph.selected_nodes.contains("a"));
+                assert_eq!(editor.graph.nodes["a"].position, core::Point::new(15., 12.));
+            });
+            if chrome == NodeChrome::BodyOwned {
+                editor.update(cx, |editor, cx| {
+                    editor.graph.nodes.get_mut("a").unwrap().size.width = 80.;
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                assert_eq!(cx.debug_bounds("owned-body").unwrap().size.width, px(80.));
+                editor.read_with(cx, |editor, _| {
+                    assert_eq!(editor.resolved_node_size(&"a".into()).unwrap().width, 80.);
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn platform_cancel_stops_control_primary_pan(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        for world in [false, true] {
+            let (editor, cx) = cx.add_window_view(|_, cx| {
+                let editor =
+                    NodeGraph::<Kind, String, String, String>::new(GraphState::default(), cx);
+                if world {
+                    editor.with_world_node_body_renderer(|_| world::WorldScene::default())
+                } else {
+                    editor
+                }
+            });
+            cx.run_until_parked();
+            let modifiers = gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            };
+            let start = point(px(400.), px(300.));
+            cx.simulate_mouse_move(start, None, modifiers);
+            cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+            cx.simulate_mouse_move(
+                point(px(430.), px(320.)),
+                Some(MouseButton::Left),
+                modifiers,
+            );
+            let moved = editor.read_with(cx, |editor, _| editor.graph.viewport);
+            assert_ne!(moved, Viewport::default());
+            cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+                button: MouseButton::Left,
+                reason: gpui::PointerCancellationReason::CaptureLost,
+            });
+            cx.simulate_mouse_move(point(px(470.), px(350.)), None, gpui::Modifiers::default());
+            editor.read_with(cx, |editor, _| {
+                assert!(editor.panning.is_none());
+                assert_eq!(editor.graph.viewport, moved);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn platform_pointer_cancellation_terminates_capture_without_release(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (editor, cx) = cx.add_window_view(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        cx.run_until_parked();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        editor.update(cx, |_, cx| {
+            let entity = cx.entity();
+            cx.subscribe(
+                &entity,
+                move |_, _, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerCancelled { reason, .. } => {
+                        observed.borrow_mut().push(*reason)
+                    }
+                    core::GraphEvent::NodeControlPointerReleased { .. } => {
+                        panic!("platform cancellation must not release")
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        });
+        for (mouse, button) in [
+            (MouseButton::Left, core::ControlPointerButton::Primary),
+            (MouseButton::Middle, core::ControlPointerButton::Middle),
+        ] {
+            editor.update(cx, |editor, cx| {
+                editor.focus_world_control("a".into(), "gradient", cx);
+                editor.begin_world_control_pointer(
+                    "a".into(),
+                    "gradient".into(),
+                    core::Point::new(0., 0.),
+                    button,
+                    cx,
+                );
+            });
+            cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+                button: MouseButton::Right,
+                reason: gpui::PointerCancellationReason::Cancelled,
+            });
+            editor.read_with(cx, |editor, _| {
+                assert!(editor.world_control_pointer.is_some())
+            });
+            cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+                button: mouse,
+                reason: gpui::PointerCancellationReason::CaptureLost,
+            });
+            editor.read_with(cx, |editor, _| {
+                assert!(editor.world_control_pointer.is_none());
+                assert!(editor.last_world_control.is_some());
+            });
+            cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+                button: mouse,
+                reason: gpui::PointerCancellationReason::CaptureLost,
+            });
+        }
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                core::ControlPointerCancelReason::CaptureLost,
+                core::ControlPointerCancelReason::CaptureLost
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn platform_cancel_rolls_back_primary_geometry_and_preserves_armed_wire(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (editor, cx) = cx.add_window_view(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        cx.run_until_parked();
+        let committed = Rc::new(Cell::new(0));
+        let observed = committed.clone();
+        editor.update(cx, |_, cx| {
+            let entity = cx.entity();
+            cx.subscribe(
+                &entity,
+                move |_, _, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if matches!(
+                        event,
+                        core::GraphEvent::MutationRequested { .. }
+                            | core::GraphEvent::NodesMoved { .. }
+                            | core::GraphEvent::ConnectionRequested { .. }
+                    ) {
+                        observed.set(observed.get() + 1);
+                    }
+                },
+            )
+            .detach();
+        });
+        editor.update(cx, |editor, cx| {
+            editor.begin_node_drag(&"a".into(), core::Point::new(0., 0.), false, false, cx);
+            editor.handle_pointer_move(core::Point::new(80., 90.), &NodeGraphTheme::default(), cx);
+            editor.start_draft(&"out".into(), cx);
+            editor.draft.as_mut().unwrap().pressed = false;
+        });
+        cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+            button: MouseButton::Left,
+            reason: gpui::PointerCancellationReason::Cancelled,
+        });
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0., 0.));
+            assert!(editor.drag.is_none());
+            assert!(editor.draft.is_some());
+        });
+        editor.update(cx, |editor, _| {
+            editor.draft.as_mut().unwrap().pressed = true;
+        });
+        cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+            button: MouseButton::Left,
+            reason: gpui::PointerCancellationReason::Cancelled,
+        });
+        editor.read_with(cx, |editor, _| assert!(editor.draft.is_none()));
+        assert_eq!(committed.get(), 0);
+    }
+
+    #[gpui::test]
+    fn platform_cancel_restores_resize_and_ends_marquee_and_pan(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (editor, cx) = cx.add_window_view(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        cx.run_until_parked();
+        let original = editor.read_with(cx, |editor, _| editor.graph.nodes["a"].size);
+        editor.update(cx, |editor, _| {
+            let mut theme = NodeGraphTheme::default();
+            theme.node.resizable = true;
+            editor.begin_node_resize(&"a".into(), 0., &theme);
+            editor.resize.as_mut().unwrap().moved = true;
+            editor.graph.nodes.get_mut("a").unwrap().size.width += 100.;
+            editor.box_selection = Some(BoxSelection {
+                start: core::Point::new(0., 0.),
+                current: core::Point::new(50., 50.),
+                baseline_nodes: HashSet::new(),
+                baseline_connections: HashSet::new(),
+            });
+            editor.middle_press = Some(MiddlePress {
+                origin: core::Point::new(0., 0.),
+                node: None,
+                moved: true,
+            });
+            editor.panning = Some(PanGesture {
+                previous: core::Point::new(0., 0.),
+                button: MouseButton::Middle,
+            });
+        });
+        cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+            button: MouseButton::Left,
+            reason: gpui::PointerCancellationReason::Cancelled,
+        });
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.graph.nodes["a"].size, original);
+            assert!(editor.resize.is_none());
+            assert!(editor.box_selection.is_none());
+            assert!(
+                editor.panning.is_some(),
+                "a primary cancellation must not end middle ownership"
+            );
+        });
+        cx.simulate_pointer_cancellation(gpui::PointerCancellation {
+            button: MouseButton::Middle,
+            reason: gpui::PointerCancellationReason::CaptureLost,
+        });
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.middle_press.is_none());
+            assert!(editor.panning.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn window_deactivation_cancels_capture_and_world_input(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (editor, cx) = cx.add_window_view(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        cx.run_until_parked();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        editor.update(cx, |_, cx| {
+            let entity = cx.entity();
+            cx.subscribe(
+                &entity,
+                move |_, _, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
+                    core::GraphEvent::NodeControlPointerCancelled {
+                        node_id,
+                        control_id,
+                        reason,
+                        ..
+                    } => {
+                        assert_eq!(node_id, "a");
+                        assert_eq!(control_id, "go");
+                        assert_eq!(*reason, core::ControlPointerCancelReason::WindowDeactivated);
+                        observed.borrow_mut().push("cancelled");
+                    }
+                    core::GraphEvent::NodeControlPointerReleased { .. } => {
+                        panic!("window deactivation must not release a control gesture");
+                    }
+                    core::GraphEvent::NodeControlBlurred { .. } => {
+                        observed.borrow_mut().push("blurred")
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        });
+        for button in [
+            Some(core::ControlPointerButton::Primary),
+            Some(core::ControlPointerButton::Middle),
+            None,
+        ] {
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            editor.update(cx, |editor, cx| {
+                editor.focus_world_control("a".into(), "go", cx);
+                editor.set_world_text_input(
+                    "a".into(),
+                    "go",
+                    WorldTextInputState::new("draft", 0..5),
+                    cx,
+                );
+                if let Some(button) = button {
+                    editor.begin_world_control_pointer(
+                        "a".into(),
+                        "go".into(),
+                        core::Point::new(10.0, 20.0),
+                        button,
+                        cx,
+                    );
+                }
+            });
+            cx.run_until_parked();
+            cx.deactivate_window();
+            editor.read_with(cx, |editor, _| {
+                assert!(editor.world_control_pointer.is_none());
+                assert!(editor.last_world_control.is_none());
+                assert!(editor.world_text_input.is_none());
+            });
+        }
+        assert_eq!(
+            *events.borrow(),
+            vec!["cancelled", "blurred", "cancelled", "blurred", "blurred"]
+        );
+    }
+
+    #[gpui::test]
+    fn key_releases_follow_world_focus_and_exclude_child_editors(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let window = cx.add_window(|_, cx| NodeGraph::new(interactive_graph(), cx));
+        let editor = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let keys = Rc::new(RefCell::new(Vec::new()));
+        let observed = keys.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if let core::GraphEvent::NodeControlKeyUp {
+                        control_id, key, ..
+                    } = event
+                    {
+                        observed
+                            .borrow_mut()
+                            .push((control_id.clone(), key.clone()));
+                    }
+                },
+            )
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                editor.last_world_control = Some(("a".into(), "go".into()));
+                let child = cx.focus_handle();
+                child.focus(window, cx);
+                let event = KeyUpEvent {
+                    keystroke: gpui::Keystroke::parse("space").unwrap(),
+                };
+                editor.handle_key_up(&event, window, cx);
+                editor.focus_handle().focus(window, cx);
+                editor.handle_key_up(&event, window, cx);
+                editor.blur_world_control(cx);
+                editor.handle_key_up(&event, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*keys.borrow(), vec![("go".into(), "space".into())]);
     }
 
     #[test]
@@ -10956,13 +13296,22 @@ mod tests {
         cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
         let events = Rc::new(RefCell::new(Vec::new()));
         let captured = events.clone();
+        let released_positions = Rc::new(RefCell::new(Vec::new()));
+        let observed_positions = released_positions.clone();
+        let expected_release = editor.read_with(cx, |editor, _| {
+            editor
+                .graph
+                .viewport
+                .screen_to_world(editor.local_screen(position))
+        });
         editor.update(cx, |editor, cx| {
             let entity = cx.entity();
             cx.subscribe(
                 &entity,
                 move |_, _, event: &core::GraphEvent<String, String, String, Kind>, _| match event {
-                    core::GraphEvent::NodeControlPointerReleased { .. } => {
-                        captured.borrow_mut().push("released")
+                    core::GraphEvent::NodeControlPointerReleased { world_position, .. } => {
+                        captured.borrow_mut().push("released");
+                        observed_positions.borrow_mut().push(*world_position);
                     }
                     core::GraphEvent::NodeControlPointerDragged { .. } => {
                         captured.borrow_mut().push("drag")
@@ -10976,6 +13325,7 @@ mod tests {
                 "field".into(),
                 core::Point::new(f32::from(position.x), f32::from(position.y)),
                 core::ControlPointerButton::Primary,
+                cx,
             );
             cx.notify();
         });
@@ -10991,6 +13341,688 @@ mod tests {
             gpui::Modifiers::default(),
         );
         assert_eq!(*events.borrow(), vec!["drag", "released"]);
+        assert_eq!(*released_positions.borrow(), vec![Some(expected_release)]);
+    }
+
+    #[gpui::test]
+    fn explicit_overlay_stack_order_crosses_node_paint_order(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let capture = clicks.clone();
+        let (editor, cx) = cx.add_window_view(|_, cx| {
+            NodeGraph::new(interactive_graph(), cx)
+                .with_world_node_body_renderer(|_| world::WorldScene::default())
+                .with_node_overlay_renderer(
+                    move |context: WorldNodeBodyContext<Kind, String, String>,
+                          _: &mut Window,
+                          _: &mut App| {
+                        let id = context.node.id.clone();
+                        let target = id.clone();
+                        let events = capture.clone();
+                        let selector = format!("stack-{id}");
+                        vec![
+                            NodeOverlay::new(
+                                core::Point::new(200. - context.node.position.x, 100.),
+                                div()
+                                    .id(id.clone())
+                                    .debug_selector(move || selector.clone())
+                                    .w(px(80.))
+                                    .h(px(30.))
+                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                        events.borrow_mut().push(target.clone());
+                                        cx.stop_propagation();
+                                    }),
+                            )
+                            .adaptive(
+                                id,
+                                core::Size {
+                                    width: 80.,
+                                    height: 30.,
+                                },
+                            ),
+                        ]
+                    },
+                )
+        });
+        editor.update(cx, |editor, cx| {
+            editor.set_overlay_stack_order("a", 2, cx);
+            editor.set_overlay_stack_order("b", 1, cx);
+        });
+        cx.run_until_parked();
+        let point = cx.debug_bounds("stack-a").expect("overlay a").center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(*clicks.borrow(), vec!["a"]);
+        assert!(editor.read_with(cx, |editor, _| editor.is_overlay_dismissed("b")));
+        editor.update(cx, |editor, cx| {
+            editor.reopen_overlay("b", cx);
+            editor.set_overlay_stack_order("b", 3, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(*clicks.borrow(), vec!["a", "b"]);
+        assert!(editor.read_with(cx, |editor, _| editor.is_overlay_dismissed("a")));
+    }
+
+    #[gpui::test]
+    fn outside_dismissal_is_per_panel_but_consumed_controls_preserve_all(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        editor.update(cx, |editor, cx| {
+            let rect = |x| core::Rect {
+                origin: core::Point::new(x, 0.),
+                size: core::Size {
+                    width: 100.,
+                    height: 100.,
+                },
+            };
+            editor
+                .active_outside_overlays
+                .extend(["a".into(), "b".into()]);
+            editor
+                .overlay_dismiss_triggers
+                .insert("b".into(), "hidden-clock".into());
+            editor.world_scene.push_hit_region(
+                world::WorldHitRegion::new(
+                    "hidden-clock",
+                    world::HitRole::Control,
+                    world::HitShape::Rect(rect(0.)),
+                )
+                .preserving_overlays(),
+            );
+            editor.world_scene.push_hit_region(
+                world::WorldHitRegion::new(
+                    "closed-clock",
+                    world::HitRole::Control,
+                    world::HitShape::Rect(rect(400.)),
+                )
+                .preserving_overlays(),
+            );
+            editor.dismiss_overlays_at_target(core::Point::new(450., 20.), None, cx);
+            assert_eq!(editor.active_outside_overlays.len(), 2);
+            editor.dismiss_overlays_at_target(core::Point::new(20., 20.), Some("a"), cx);
+            assert!(editor.active_outside_overlays.contains("a"));
+            assert!(!editor.active_outside_overlays.contains("b"));
+            editor.active_outside_overlays.insert("b".into());
+            editor.dismiss_overlays_at_target(core::Point::new(600., 200.), None, cx);
+            assert!(editor.active_outside_overlays.is_empty());
+        });
+    }
+
+    fn context_test_graph(
+        cx: &mut Context<NodeGraph<Kind, String, String, String>>,
+        regions: Rc<RefCell<Vec<world::WorldHitRegion>>>,
+        painted: bool,
+    ) -> NodeGraph<Kind, String, String, String> {
+        NodeGraph::new(interactive_graph(), cx).with_world_node_body_renderer(
+            move |context: WorldNodeBodyContext<Kind, String, String>| {
+                let mut scene = world::WorldScene::new();
+                if painted {
+                    scene.push(world::WorldPrimitive::Quad {
+                        bounds: core::Rect {
+                            origin: context.node.position,
+                            size: context.node.size,
+                        },
+                        fill: world::WorldColor::rgb(0x222222),
+                        corner_radius: 0.,
+                    });
+                }
+                if context.node.id == "a" {
+                    scene.hit_regions = regions.borrow().clone();
+                }
+                scene
+            },
+        )
+    }
+
+    fn context_region() -> world::WorldHitRegion {
+        world::WorldHitRegion::new(
+            "gradient",
+            world::HitRole::Control,
+            world::HitShape::Rect(core::Rect {
+                origin: core::Point::new(10., 10.),
+                size: core::Size {
+                    width: 30.,
+                    height: 30.,
+                },
+            }),
+        )
+        .with_context_menu()
+    }
+
+    #[gpui::test]
+    fn world_context_shapes_keep_one_control_and_preserve_primary_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        for painted in [false, true] {
+            for zoom in [0.5, 2.] {
+                let region = context_region().with_context_menu_hit_shapes(vec![
+                    world::HitShape::Circle {
+                        center: core::Point::new(18., 18.),
+                        radius: 3.,
+                    },
+                    world::HitShape::Circle {
+                        center: core::Point::new(32., 32.),
+                        radius: 3.,
+                    },
+                ]);
+                let regions = Rc::new(RefCell::new(vec![region]));
+                let (host, cx) = cx.add_window_view(|_, cx| PopupTestHost {
+                    editor: cx.new(|cx| context_test_graph(cx, regions.clone(), painted)),
+                    width: 400.,
+                    height: 500.,
+                });
+                let editor = host.read_with(cx, |host, _| host.editor.clone());
+                editor.update(cx, |editor, cx| {
+                    editor.graph.viewport = core::Viewport {
+                        pan: core::Point::new(10., 20.),
+                        zoom,
+                    };
+                    cx.notify();
+                });
+                let contexts = Rc::new(RefCell::new(Vec::new()));
+                let observed = contexts.clone();
+                let primary = Rc::new(Cell::new(0));
+                let activated = primary.clone();
+                let _subscription = cx.update(|_, app| {
+                    app.subscribe(
+                        &editor,
+                        move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                            match event {
+                                core::GraphEvent::NodeControlContextMenuRequested {
+                                    control_id,
+                                    world_position,
+                                    ..
+                                } => {
+                                    assert_eq!(control_id, "gradient");
+                                    observed.borrow_mut().push(*world_position);
+                                }
+                                core::GraphEvent::NodeControlPointerActivated {
+                                    control_id,
+                                    ..
+                                } if control_id == "gradient" => {
+                                    activated.set(activated.get() + 1);
+                                }
+                                _ => {}
+                            }
+                        },
+                    )
+                });
+                cx.run_until_parked();
+                editor.read_with(cx, |editor, _| {
+                    assert_eq!(editor.canvas_bounds.get().origin, point(px(54.), px(72.)));
+                    assert_eq!(
+                        editor
+                            .world_scene
+                            .hit_regions
+                            .iter()
+                            .filter(|hit| hit.id == "gradient")
+                            .count(),
+                        1
+                    );
+                });
+                for world in [core::Point::new(18., 18.), core::Point::new(32., 32.)] {
+                    let at =
+                        editor.read_with(cx, |editor, _| editor.canvas_to_client(world).unwrap());
+                    let at = point(px(at.x), px(at.y));
+                    cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+                    cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+                }
+                assert_eq!(
+                    *contexts.borrow(),
+                    [core::Point::new(18., 18.), core::Point::new(32., 32.)]
+                );
+                assert_eq!(primary.get(), 0);
+                let blank = editor.read_with(cx, |editor, _| {
+                    editor.canvas_to_client(core::Point::new(26., 16.)).unwrap()
+                });
+                let blank = point(px(blank.x), px(blank.y));
+                cx.simulate_mouse_down(blank, MouseButton::Right, gpui::Modifiers::default());
+                cx.simulate_mouse_up(blank, MouseButton::Right, gpui::Modifiers::default());
+                assert_eq!(contexts.borrow().len(), 2);
+                assert!(
+                    cx.update(|window, app| editor.read(app).focus_handle().is_focused(window))
+                );
+                cx.simulate_mouse_down(blank, MouseButton::Left, gpui::Modifiers::default());
+                cx.simulate_mouse_up(blank, MouseButton::Left, gpui::Modifiers::default());
+                assert_eq!(primary.get(), 1);
+                regions.borrow_mut()[0] =
+                    context_region().with_context_menu_hit_shapes(Vec::<world::HitShape>::new());
+                editor.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+                let at = editor.read_with(cx, |editor, _| {
+                    editor.canvas_to_client(core::Point::new(18., 18.)).unwrap()
+                });
+                let at = point(px(at.x), px(at.y));
+                cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+                cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+                assert_eq!(contexts.borrow().len(), 2);
+                regions.borrow_mut()[0] = world::WorldHitRegion::new(
+                    "gradient",
+                    world::HitRole::Control,
+                    world::HitShape::Rect(core::Rect {
+                        origin: core::Point::new(40., 15.),
+                        size: core::Size {
+                            width: 20.,
+                            height: 20.,
+                        },
+                    }),
+                )
+                .with_context_menu_hit_shapes(vec![world::HitShape::Circle {
+                    center: core::Point::new(50., 25.),
+                    radius: 6.,
+                }]);
+                editor.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+                let at = editor.read_with(cx, |editor, _| {
+                    editor.canvas_to_client(core::Point::new(50., 25.)).unwrap()
+                });
+                let at = point(px(at.x), px(at.y));
+                cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+                cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+                assert_eq!(contexts.borrow().len(), 2);
+                assert!(editor.read_with(cx, |editor, _| editor.anchor_menu_is_open()));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn world_context_request_is_advisory_and_once_in_both_routes(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        for painted in [false, true] {
+            let regions = Rc::new(RefCell::new(vec![context_region()]));
+            let (host, cx) = cx.add_window_view(|_, cx| PopupTestHost {
+                editor: cx.new(|cx| context_test_graph(cx, regions.clone(), painted)),
+                width: 400.,
+                height: 500.,
+            });
+            let editor = host.read_with(cx, |host, _| host.editor.clone());
+            editor.update(cx, |editor, cx| {
+                editor.graph.viewport = core::Viewport {
+                    pan: core::Point::new(10., 20.),
+                    zoom: 2.,
+                };
+                editor.focus_world_control("a".into(), "previous", cx);
+                editor.set_world_text_input(
+                    "a".into(),
+                    "previous",
+                    WorldTextInputState::new("kept", 2..2),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            let requests = Rc::new(RefCell::new(Vec::new()));
+            let observed = requests.clone();
+            let activations = Rc::new(Cell::new(0));
+            let unexpected = activations.clone();
+            let _subscription = cx.update(|_, app| {
+                app.subscribe(
+                    &editor,
+                    move |_, event: &core::GraphEvent<String, String, String, Kind>, _| match event
+                    {
+                        core::GraphEvent::NodeControlContextMenuRequested {
+                            node_id,
+                            control_id,
+                            world_position,
+                        } => observed.borrow_mut().push((
+                            node_id.clone(),
+                            control_id.clone(),
+                            *world_position,
+                        )),
+                        core::GraphEvent::NodeControlFocused { .. }
+                        | core::GraphEvent::NodeControlBlurred { .. }
+                        | core::GraphEvent::NodeControlActivated { .. }
+                        | core::GraphEvent::NodeControlPointerActivated { .. }
+                        | core::GraphEvent::NodeControlPointerDragged { .. }
+                        | core::GraphEvent::NodeControlPointerReleased { .. }
+                        | core::GraphEvent::MutationRequested { .. } => {
+                            unexpected.set(unexpected.get() + 1)
+                        }
+                        _ => {}
+                    },
+                )
+            });
+            let at = point(px(104.), px(132.));
+            cx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+            cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+            cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+            assert_eq!(
+                *requests.borrow(),
+                [("a".into(), "gradient".into(), core::Point::new(20., 20.))]
+            );
+            assert_eq!(activations.get(), 0);
+            editor.read_with(cx, |editor, _| {
+                assert_eq!(editor.canvas_bounds.get().origin, point(px(54.), px(72.)));
+                assert_eq!(
+                    editor.last_world_control(),
+                    Some((&"a".to_string(), "previous"))
+                );
+                assert_eq!(editor.world_text_input().unwrap().2.text, "kept");
+                assert!(editor.world_control_pointer.is_none());
+                assert!(editor.anchor_menu.is_none());
+                assert_eq!(editor.graph.nodes["a"].position, core::Point::default());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn world_context_request_keeps_socket_priority_and_plain_fallback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        for enabled in [false, true] {
+            let mut region = context_region();
+            region.context_menu = enabled;
+            region.shape = world::HitShape::Rect(core::Rect {
+                origin: core::Point::new(40., 15.),
+                size: core::Size {
+                    width: 20.,
+                    height: 20.,
+                },
+            });
+            let regions = Rc::new(RefCell::new(vec![region]));
+            let (editor, cx) =
+                cx.add_window_view(|_, cx| context_test_graph(cx, regions.clone(), true));
+            let requests = Rc::new(Cell::new(0));
+            let observed = requests.clone();
+            let _subscription = cx.update(|_, app| {
+                app.subscribe(
+                    &editor,
+                    move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                        if matches!(
+                            event,
+                            core::GraphEvent::NodeControlContextMenuRequested { .. }
+                        ) {
+                            observed.set(observed.get() + 1);
+                        }
+                    },
+                )
+            });
+            cx.run_until_parked();
+            let at = point(px(50.), px(25.));
+            cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+            cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+            assert_eq!(requests.get(), 0);
+            assert!(editor.read_with(cx, |editor, _| editor.anchor_menu_is_open()));
+            cx.simulate_mouse_down(
+                point(px(20.), px(20.)),
+                MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(
+                point(px(20.), px(20.)),
+                MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(requests.get(), 0);
+            assert!(!editor.read_with(cx, |editor, _| editor.anchor_menu_is_open()));
+            if !enabled {
+                *regions.borrow_mut() = vec![world::WorldHitRegion::new(
+                    "default",
+                    world::HitRole::Control,
+                    context_region().shape,
+                )];
+                editor.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+                cx.simulate_mouse_down(
+                    point(px(20.), px(20.)),
+                    MouseButton::Right,
+                    gpui::Modifiers::default(),
+                );
+                cx.simulate_mouse_up(
+                    point(px(20.), px(20.)),
+                    MouseButton::Right,
+                    gpui::Modifiers::default(),
+                );
+                assert_eq!(requests.get(), 0);
+                editor.read_with(cx, |editor, _| {
+                    assert!(editor.last_world_control.is_none());
+                    assert!(editor.world_control_pointer.is_none());
+                    assert!(editor.anchor_menu.is_none());
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn world_context_request_respects_topmost_barrier_and_node_ownership(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let regions = Rc::new(RefCell::new(vec![context_region()]));
+        let (editor, cx) =
+            cx.add_window_view(|_, cx| context_test_graph(cx, regions.clone(), true));
+        let requests = Rc::new(Cell::new(0));
+        let observed = requests.clone();
+        let _subscription = cx.update(|_, app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if matches!(
+                        event,
+                        core::GraphEvent::NodeControlContextMenuRequested { .. }
+                    ) {
+                        observed.set(observed.get() + 1);
+                    }
+                },
+            )
+        });
+        cx.run_until_parked();
+        let at = point(px(20.), px(20.));
+        let mut blocker = context_region();
+        blocker.id = "topmost".into();
+        blocker.context_menu = false;
+        regions.borrow_mut().push(blocker);
+        editor.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+        assert_eq!(requests.get(), 0);
+        *regions.borrow_mut() = vec![context_region().with_auxiliary_pointer_barrier()];
+        editor.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+        assert_eq!(requests.get(), 0);
+        assert!(!editor.read_with(cx, |editor, _| editor.anchor_menu_is_open()));
+        let mut wide = context_region();
+        wide.shape = world::HitShape::Rect(core::Rect {
+            origin: core::Point::new(10., 10.),
+            size: core::Size {
+                width: 130.,
+                height: 30.,
+            },
+        });
+        *regions.borrow_mut() = vec![wide];
+        editor.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(
+            point(px(120.), px(20.)),
+            MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(px(120.), px(20.)),
+            MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(requests.get(), 0);
+        cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+        assert_eq!(requests.get(), 1);
+        editor.update(cx, |editor, cx| {
+            let mut snapshot = editor.graph.snapshot();
+            snapshot.nodes.remove("a");
+            snapshot.ports.remove("out");
+            snapshot.connections.remove("wire");
+            editor.reconcile(snapshot, cx).unwrap();
+        });
+        cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+        assert_eq!(requests.get(), 1);
+    }
+
+    #[gpui::test]
+    fn world_context_request_does_not_steal_primary_or_middle_capture(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        for button in [MouseButton::Left, MouseButton::Middle] {
+            let regions = Rc::new(RefCell::new(vec![
+                context_region().with_middle_pointer(true),
+            ]));
+            let (editor, cx) =
+                cx.add_window_view(|_, cx| context_test_graph(cx, regions.clone(), true));
+            let requests = Rc::new(Cell::new(0));
+            let releases = Rc::new(Cell::new(0));
+            let observed = requests.clone();
+            let ended = releases.clone();
+            let _subscription = cx.update(|_, app| {
+                app.subscribe(
+                    &editor,
+                    move |_, event: &core::GraphEvent<String, String, String, Kind>, _| match event
+                    {
+                        core::GraphEvent::NodeControlContextMenuRequested { .. } => {
+                            observed.set(observed.get() + 1)
+                        }
+                        core::GraphEvent::NodeControlPointerReleased { .. } => {
+                            ended.set(ended.get() + 1)
+                        }
+                        _ => {}
+                    },
+                )
+            });
+            cx.run_until_parked();
+            let at = point(px(20.), px(20.));
+            cx.simulate_mouse_down(at, button, gpui::Modifiers::default());
+            assert!(editor.read_with(cx, |editor, _| editor.world_control_pointer.is_some()));
+            cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+            cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+            assert_eq!(requests.get(), 0);
+            assert_eq!(releases.get(), 0);
+            assert!(editor.read_with(cx, |editor, _| editor.world_control_pointer.is_some()));
+            cx.simulate_mouse_up(at, button, gpui::Modifiers::default());
+            assert_eq!(releases.get(), 1);
+            assert!(editor.read_with(cx, |editor, _| editor.world_control_pointer.is_none()));
+        }
+    }
+
+    #[gpui::test]
+    fn world_context_request_stays_below_measured_adaptive_overlays(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        {
+            let content = Rc::new(RefCell::new(PopupTestContent {
+                width: Some(260.),
+                height: Some(67.),
+                intrinsic_child_width: None,
+                text: "Context overlay".into(),
+            }));
+            let paints = Rc::new(RefCell::new(Vec::new()));
+            let (host, cx) = cx.add_window_view(|_, cx| PopupTestHost {
+                editor: cx.new(|cx| {
+                    let mut graph = popup_test_graph(cx, content.clone(), paints.clone())
+                        .with_world_node_body_renderer(
+                            |context: WorldNodeBodyContext<Kind, String, String>| {
+                                let mut scene = world::WorldScene::new();
+                                if context.node.id == "a" {
+                                    let mut region = context_region();
+                                    region.shape = world::HitShape::Rect(core::Rect {
+                                        origin: core::Point::default(),
+                                        size: core::Size {
+                                            width: 500.,
+                                            height: 500.,
+                                        },
+                                    });
+                                    scene.push_hit_region(region);
+                                }
+                                scene
+                            },
+                        );
+                    graph.graph.nodes.get_mut("a").unwrap().size = core::Size {
+                        width: 500.,
+                        height: 500.,
+                    };
+                    graph
+                }),
+                width: 400.,
+                height: 500.,
+            });
+            let editor = host.read_with(cx, |host, _| host.editor.clone());
+            let requests = Rc::new(Cell::new(0));
+            let observed = requests.clone();
+            let _subscription = cx.update(|_, app| {
+                app.subscribe(
+                    &editor,
+                    move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                        if matches!(
+                            event,
+                            core::GraphEvent::NodeControlContextMenuRequested { .. }
+                        ) {
+                            observed.set(observed.get() + 1);
+                        }
+                    },
+                )
+            });
+            editor.update(cx, |editor, cx| {
+                editor.set_overlay_pane_anchor(
+                    "panel",
+                    core::Rect {
+                        origin: core::Point::new(150., 400.),
+                        size: core::Size {
+                            width: 8.,
+                            height: 8.,
+                        },
+                    },
+                    cx,
+                );
+                editor.set_overlay_placement(
+                    "panel",
+                    OverlayPlacement {
+                        side: OverlaySide::Right,
+                        align: OverlayAlign::End,
+                        gap: 4.,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+            let compact = draw_popup_first_frame(cx, &host, &paints);
+            content.borrow_mut().height = Some(255.);
+            let expanded = draw_popup_first_frame(cx, &host, &paints);
+            let newly_covered = expanded.origin + point(px(10.), px(10.));
+            assert!(!compact.contains(&newly_covered));
+            assert!(expanded.contains(&newly_covered));
+            cx.simulate_mouse_move(newly_covered, None, gpui::Modifiers::default());
+            cx.simulate_mouse_down(
+                newly_covered,
+                MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(
+                newly_covered,
+                MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(requests.get(), 0);
+            content.borrow_mut().height = Some(67.);
+            assert_eq!(draw_popup_first_frame(cx, &host, &paints), compact);
+            cx.simulate_mouse_move(newly_covered, None, gpui::Modifiers::default());
+            cx.simulate_mouse_down(
+                newly_covered,
+                MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(
+                newly_covered,
+                MouseButton::Right,
+                gpui::Modifiers::default(),
+            );
+            assert_eq!(requests.get(), 1);
+            assert!(editor.read_with(cx, |editor, _| editor.is_overlay_dismissed("panel")));
+        }
     }
 
     #[gpui::test]
@@ -11041,7 +14073,15 @@ mod tests {
                 .insert("number".into(), "a".into());
             let start = core::Point::new(30.0, 30.0);
             assert!(!editor.begin_middle_control(start, 1, cx));
-            editor.world_scene.hit_regions[0].middle_pointer = true;
+            editor.world_scene.hit_regions[0].middle_pointer = world::MiddlePointerBehavior::Block;
+            let focused = editor.last_world_control.clone();
+            assert!(editor.begin_middle_control(start, 1, cx));
+            assert_eq!(editor.last_world_control, focused);
+            assert!(editor.world_control_pointer.is_none());
+            editor.finish_middle_gesture(start, cx);
+            assert!(events.borrow().is_empty());
+            editor.world_scene.hit_regions[0].middle_pointer =
+                world::MiddlePointerBehavior::Capture;
             assert!(editor.begin_middle_control(start, 1, cx));
             assert!(editor.control_owns_other_button(MouseButton::Left));
             editor.begin_world_control_pointer(
@@ -11049,8 +14089,9 @@ mod tests {
                 "other".into(),
                 start,
                 core::ControlPointerButton::Primary,
+                cx,
             );
-            assert!(!editor.release_control_button(core::ControlPointerButton::Primary, cx));
+            assert!(!editor.release_control_button(core::ControlPointerButton::Primary, None, cx));
             editor.handle_pointer_move(
                 core::Point::new(300.0, 400.0),
                 &NodeGraphTheme::default(),
@@ -11114,6 +14155,7 @@ mod tests {
                 "field".into(),
                 core::Point::new(30.0, 40.0),
                 core::ControlPointerButton::Primary,
+                cx,
             );
             editor.handle_pointer_move(
                 core::Point::new(50.0, 30.0),
@@ -11125,7 +14167,7 @@ mod tests {
                 &NodeGraphTheme::default(),
                 cx,
             );
-            editor.finish_left_gesture(false, &NodeGraphTheme::default(), cx);
+            editor.finish_left_gesture(false, &NodeGraphTheme::default(), None, cx);
             editor.handle_pointer_move(
                 core::Point::new(80.0, 100.0),
                 &NodeGraphTheme::default(),
@@ -11182,6 +14224,25 @@ mod tests {
                 assert_eq!(editor.world_text_input().unwrap().2.text, "abab");
                 assert!(!editor.edit_world_text_key("enter", None, false, false, cx));
                 assert!(!editor.edit_world_text_key("escape", None, false, false, cx));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn removing_an_edited_node_releases_its_world_input(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let editor = cx.new(|cx| NodeGraph::new(interactive_graph(), cx));
+            editor.update(cx, |editor, cx| {
+                editor.focus_world_control("a".to_owned(), "name", cx);
+                editor.set_world_text_input(
+                    "a".to_owned(),
+                    "name",
+                    WorldTextInputState::at_end("draft"),
+                    cx,
+                );
+                editor.reconcile(GraphSnapshot::default(), cx).unwrap();
+                assert!(!editor.world_text_input_is_active());
+                assert!(editor.last_world_control().is_none());
             });
         });
     }
@@ -11329,9 +14390,12 @@ mod tests {
         let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
         editor.update(cx, |editor, cx| {
             editor.start_draft(&"out".into(), cx);
-            editor.panning = Some(core::Point::new(10.0, 10.0));
+            editor.panning = Some(PanGesture {
+                previous: core::Point::new(10.0, 10.0),
+                button: MouseButton::Middle,
+            });
             let theme = Arc::clone(cx.node_graph_theme());
-            editor.finish_left_gesture(false, &theme, cx);
+            editor.finish_left_gesture(false, &theme, None, cx);
             assert!(editor.panning.is_none());
             assert_eq!(
                 editor.draft.as_ref().map(|draft| draft.origin.as_str()),
@@ -11441,27 +14505,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancelling_a_drag_restores_nodes_and_ports() {
-        let mut editor = NodeGraph::new_for_test(interactive_graph());
-        let starts = vec![("a".to_string(), editor.graph.nodes["a"].position)];
-        editor
-            .graph
-            .move_nodes(&[("a".into(), core::Point::new(40.0, 20.0))])
-            .unwrap();
-        editor.drag = Some(NodeDrag {
-            primary: String::from("a"),
-            offsets: Vec::new(),
-            starts,
-            moved: true,
-            alter_groups: false,
+    #[gpui::test]
+    fn cancelling_a_drag_restores_nodes_and_ports(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|_| NodeGraph::new_for_test(interactive_graph()));
+        editor.update(cx, |editor, cx| {
+            let starts = vec![("a".to_string(), editor.graph.nodes["a"].position)];
+            editor
+                .graph
+                .move_nodes(&[("a".into(), core::Point::new(40.0, 20.0))])
+                .unwrap();
+            editor.drag = Some(NodeDrag {
+                primary: String::from("a"),
+                offsets: Vec::new(),
+                starts,
+                moved: true,
+                alter_groups: false,
+            });
+            editor.cancel_gestures(core::ControlPointerCancelReason::Explicit, cx);
+            assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
+            assert_eq!(
+                editor.graph.ports["out"].position,
+                core::Point::new(50.0, 25.0)
+            );
         });
-        editor.cancel_gestures();
-        assert_eq!(editor.graph.nodes["a"].position, core::Point::new(0.0, 0.0));
-        assert_eq!(
-            editor.graph.ports["out"].position,
-            core::Point::new(50.0, 25.0)
-        );
     }
 
     #[test]
