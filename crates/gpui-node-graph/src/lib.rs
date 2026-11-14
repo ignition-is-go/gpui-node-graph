@@ -5555,6 +5555,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx: &mut Context<Self>,
     ) {
         let was_panning = self.panning.take().is_some();
+        // A dragged card renders translucent and a resize handle highlighted
+        // until the gesture ends, so ending one changes what is drawn.
+        if self.drag.is_some() || self.resize.is_some() {
+            cx.notify();
+        }
         if let Some(resize) = self.resize.take().filter(|resize| resize.moved)
             && let Some(size) = self.graph.nodes.get(&resize.id).map(|node| node.size)
         {
