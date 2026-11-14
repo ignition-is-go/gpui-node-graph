@@ -4,7 +4,8 @@
 use std::time::{Duration, Instant};
 
 use gpui::{Modifiers, VisualTestContext, point, px};
-use gpui_node_graph::{NodeGraph, NodeGraphTheme, core::*};
+use gpui::{ParentElement, Styled, div};
+use gpui_node_graph::{NodeBody, NodeBodyContext, NodeGraph, NodeGraphTheme, core::*, graph_px};
 
 #[derive(Clone, Debug, PartialEq)]
 struct Kind;
@@ -102,13 +103,49 @@ fn report(label: &str, mut samples: Vec<Duration>) {
     );
 }
 
-fn measure(cx: &mut gpui::TestAppContext, zoom: f32, pitch: (f32, f32)) {
+/// Whether cards use the default body or a consumer-authored one (header,
+/// field row and body section), which takes the measured, unlayered path.
+#[derive(Clone, Copy)]
+enum Body {
+    Default,
+    Custom,
+}
+
+impl Body {
+    fn suffix(self) -> &'static str {
+        match self {
+            Body::Default => "",
+            Body::Custom => " custom body",
+        }
+    }
+}
+
+fn measure(cx: &mut gpui::TestAppContext, zoom: f32, pitch: (f32, f32), body: Body) {
     cx.update(|cx| {
         gpui_node_graph::init(cx);
         gpui_node_graph::set_node_graph_theme(cx, NodeGraphTheme::dark());
     });
     let graph = large_graph(zoom, pitch);
-    let (editor, cx) = cx.add_window_view(move |_, cx| NodeGraph::new(graph, cx));
+    let (editor, cx) = cx.add_window_view(move |_, cx| {
+        let editor = NodeGraph::new(graph, cx);
+        match body {
+            Body::Default => editor,
+            Body::Custom => editor.with_node_body_renderer(
+                |context: NodeBodyContext<Kind, String, String, String>,
+                 _: &mut gpui::Window,
+                 _: &mut gpui::App| {
+                    NodeBody::new(
+                        div()
+                            .h(graph_px(100.0))
+                            .child(context.field("Gain", div().child("0.50")))
+                            .child(context.body_section(
+                                div().child(context.field("Mode", div().child("Linear"))),
+                            )),
+                    )
+                },
+            ),
+        }
+    });
     cx.run_until_parked();
     for _ in 0..5 {
         draw(cx);
@@ -120,7 +157,7 @@ fn measure(cx: &mut gpui::TestAppContext, zoom: f32, pitch: (f32, f32)) {
             draw(cx)
         })
         .collect();
-    report(&format!("zoom {zoom}: full redraw"), idle);
+    report(&format!("zoom {zoom}{}: full redraw", body.suffix()), idle);
 
     let hover = (0..60)
         .map(|frame| {
@@ -129,23 +166,32 @@ fn measure(cx: &mut gpui::TestAppContext, zoom: f32, pitch: (f32, f32)) {
             draw(cx)
         })
         .collect();
-    report(&format!("zoom {zoom}: hover move + redraw"), hover);
+    report(
+        &format!("zoom {zoom}{}: hover move + redraw", body.suffix()),
+        hover,
+    );
 }
 
 #[gpui::test]
 #[ignore = "benchmark"]
 fn frame_cost_all_500_nodes_visible(cx: &mut gpui::TestAppContext) {
-    measure(cx, 0.2, SPARSE_PITCH);
+    measure(cx, 0.2, SPARSE_PITCH, Body::Default);
 }
 
 #[gpui::test]
 #[ignore = "benchmark"]
 fn frame_cost_500_nodes_mostly_offscreen(cx: &mut gpui::TestAppContext) {
-    measure(cx, 1.0, SPARSE_PITCH);
+    measure(cx, 1.0, SPARSE_PITCH, Body::Default);
 }
 
 #[gpui::test]
 #[ignore = "benchmark"]
 fn frame_cost_500_overlapping_nodes_visible(cx: &mut gpui::TestAppContext) {
-    measure(cx, 0.3, OVERLAPPING_PITCH);
+    measure(cx, 0.3, OVERLAPPING_PITCH, Body::Default);
+}
+
+#[gpui::test]
+#[ignore = "benchmark"]
+fn frame_cost_500_custom_body_nodes_visible(cx: &mut gpui::TestAppContext) {
+    measure(cx, 0.3, SPARSE_PITCH, Body::Custom);
 }

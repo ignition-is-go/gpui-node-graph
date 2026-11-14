@@ -704,6 +704,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
     }
 
     /// Build the reference-style label/control row from `NodeStyle::field_*`.
+    ///
+    /// The label is upper-cased and sized as in leptos-node-graph 0.2.2, except
+    /// for its `letter-spacing: 0.04em`: GPUI 1.16 has no letter-spacing style
+    /// or text-run field, so the label's glyph advances stay at the font's own
+    /// and a label measures slightly narrower than the reference's.
     pub fn field(&self, label: impl Into<SharedString>, control: impl IntoElement) -> AnyElement {
         let label_color = self.theme.node.field_label_color;
         div()
@@ -714,7 +719,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
                 div()
                     .min_w(graph_px(self.theme.node.field_label_min_width))
                     .text_size(graph_px(self.theme.node.field_label_font_size))
-                    .line_height(graph_px(self.theme.node.field_label_font_size * 1.2))
+                    .line_height(graph_px(normal_line_height(
+                        self.theme.node.field_label_font_size,
+                    )))
                     .text_color(rgb(label_color.rgb).opacity(label_color.alpha))
                     .child(SharedString::from(label.into().to_uppercase())),
             )
@@ -1857,6 +1864,26 @@ pub const GRAPH_REM: f32 = 16.0;
 /// [`NodeBodyRenderer`] element it paints `value * zoom` screen pixels and
 /// lays out the same, so a body authored in it scales with the viewport.
 /// Outside a node body it is `value` pixels at the window's rem size of 16.
+/// A border or outline width of a CSS pixel or more, floored to whole device
+/// pixels as Chromium does at layout, before the zoom transform applies: a
+/// 1.5px outline paints 1 device pixel at DPR 1, 3 at DPR 2 and 2 at DPR 1.5.
+/// (Chromium's emulated device scale factor floors to CSS pixels instead, 2
+/// device pixels at DPR 2, which no display produces.) Returns CSS pixels.
+fn whole_device_pixels(width: f32, dpr: f32) -> f32 {
+    if width >= 1.0 {
+        (width * dpr).floor() / dpr
+    } else {
+        width
+    }
+}
+
+/// CSS `line-height: normal` for a font size, in whole CSS pixels. Chromium
+/// rounds the line box in CSS pixels before the device scale applies, so a 12px
+/// header is 14px tall at every DPR; GPUI would snap 14.4px to 14.5px at DPR 2.
+fn normal_line_height(font_size: f32) -> f32 {
+    (font_size * 1.2).round()
+}
+
 pub fn graph_px(value: f32) -> gpui::Rems {
     gpui::rems(value / GRAPH_REM)
 }
@@ -3783,7 +3810,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .and_then(|item| item.category_color)
             .map_or(0.0, |_| theme.node.header_accent_height);
         let header_height = accent_height
-            + theme.node.header_font_size * 1.2
+            + normal_line_height(theme.node.header_font_size)
             + theme.node.header_padding_y * 2.0
             + visible_border_width(theme.node.header_border_bottom);
         let width = if self.auto_width_nodes.contains(&node.id) {
@@ -8057,7 +8084,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     // uppercase` with a normal (1.2) line height, which the
                     // default port layout assumes.
                     .font_weight(FontWeight::SEMIBOLD)
-                    .line_height(px(viewport.scale_length(theme.node.header_font_size * 1.2)))
+                    .line_height(px(
+                        viewport.scale_length(normal_line_height(theme.node.header_font_size))
+                    ))
                     .child(node.title.to_uppercase());
                 if header.width > 0.0 && header.style != style::LineStyle::None {
                     default_header = default_header
@@ -8273,6 +8302,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 && selected_outline.width > 0.0
                 && selected_outline.style == style::LineStyle::Solid)
                 .then_some((selected_outline.width, selected_outline.color));
+            let dpr = window.scale_factor();
             let rings: Vec<Ring> = ring_shadows
                 .into_iter()
                 .rev()
@@ -8280,12 +8310,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .map(|shadow| (shadow.spread, shadow.color))
                 .chain(outline_ring)
                 .map(|(width, color)| {
-                    // Chromium floors border and outline widths of a CSS pixel or
-                    // more to whole CSS pixels before the canvas transform and the
-                    // device scale apply: a 1.5px outline paints 1px at DPR 1,
-                    // 2 device pixels at DPR 2 and 2px under scale(2).
-                    let width =
-                        viewport.scale_length(if width >= 1.0 { width.floor() } else { width });
+                    let width = viewport.scale_length(whole_device_pixels(width, dpr));
                     Ring {
                         width: px(width),
                         color: rgb(color.rgb).opacity(color.alpha),
@@ -10614,6 +10639,15 @@ mod tests {
     }
 
     #[test]
+    fn ring_widths_floor_to_whole_device_pixels() {
+        assert_eq!(whole_device_pixels(1.5, 1.0), 1.0);
+        assert_eq!(whole_device_pixels(1.5, 2.0), 1.5);
+        assert_eq!(whole_device_pixels(1.5, 1.5), 2.0 / 1.5);
+        assert_eq!(whole_device_pixels(0.5, 2.0), 0.5);
+        assert_eq!(whole_device_pixels(2.0, 1.5), 2.0);
+    }
+
+    #[test]
     fn coincident_rings_composite_into_one_band_per_width() {
         let red = gpui::Rgba {
             r: 1.0,
@@ -12738,7 +12772,7 @@ mod tests {
         assert_eq!(editor.dangling_connections[0].missing_port, "out");
         assert_eq!(
             editor.dangling_connections[0].source_position,
-            core::Point::new(35.0, 44.4)
+            core::Point::new(35.0, 44.0)
         );
         editor.graph.ports.insert(
             "out".into(),
@@ -12849,10 +12883,10 @@ mod tests {
             editor.resolved_node_size(&"a".into()),
             Some(core::Size {
                 width: 50.0,
-                height: 61.4,
+                height: 61.0,
             })
         );
-        assert_eq!(editor.render_bounds().unwrap().size.height, 61.4);
+        assert_eq!(editor.render_bounds().unwrap().size.height, 61.0);
     }
 
     #[test]
@@ -12863,13 +12897,13 @@ mod tests {
         editor.refresh_default_render_geometry(&default_theme);
         assert_eq!(
             editor.resolved_port_position(&String::from("out")),
-            Some(core::Point::new(35.0, 44.4))
+            Some(core::Point::new(35.0, 44.0))
         );
         assert_eq!(
             editor.resolved_node_size(&String::from("a")),
             Some(core::Size {
                 width: 50.0,
-                height: 61.4,
+                height: 61.0,
             })
         );
 
@@ -12880,13 +12914,13 @@ mod tests {
         editor.refresh_default_render_geometry(&theme);
         assert_eq!(
             editor.resolved_port_position(&String::from("out")),
-            Some(core::Point::new(44.0, 53.4))
+            Some(core::Point::new(44.0, 53.0))
         );
         assert_eq!(
             editor.resolved_node_size(&String::from("a")),
             Some(core::Size {
                 width: 50.0,
-                height: 79.4,
+                height: 79.0,
             })
         );
 
@@ -12896,12 +12930,12 @@ mod tests {
             editor.resolved_node_size(&String::from("a")),
             Some(core::Size {
                 width: 160.0,
-                height: 79.4,
+                height: 79.0,
             })
         );
         assert_eq!(
             editor.resolved_port_position(&String::from("out")),
-            Some(core::Point::new(154.0, 53.4))
+            Some(core::Point::new(154.0, 53.0))
         );
     }
 

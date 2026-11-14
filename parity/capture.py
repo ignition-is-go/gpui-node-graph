@@ -26,7 +26,11 @@ output socket: the reference's elementsFromPoint there must name the expected
 top element, and the socket must be drawn, or hidden, as in the reference (see
 SOCKET_BOX). Exits non-zero when, in a geometry-matched state, a card exceeds
 CARD_LIMIT or a ring band exceeds RING_LIMIT, or an overlap socket disagrees. PARITY_GALLERY_DIST
-points it at another gallery build, such as a mutated one.
+points it at another gallery build, such as a mutated one. `--real-dpr` runs
+Chromium with `--force-device-scale-factor` and no emulated viewport, so
+gpui_web takes its primary devicePixelContentBoxSize path (still headless);
+without it the emulated-DPR page deletes that property to exercise the
+contentRect fallback. Outputs are written as parity/out/<theme>-real-dpr<n>-*.
 """
 
 import argparse
@@ -49,6 +53,10 @@ W, H = 960, 400
 # Device pixels per CSS pixel for both pages (`--dpr`). Geometry stays in CSS
 # pixels; screenshots and every image box are in device pixels.
 DPR = 1
+# `--real-dpr`: the browser itself runs at DPR (`--force-device-scale-factor`)
+# with no emulated viewport, so GPUI sizes its surface from the real
+# devicePixelContentBoxSize instead of the contentRect fallback.
+REAL_DPR = False
 
 # Port id by label, node ids in render order and connection ids, per fixture in
 # parity/fixture.rs (labels are unique within one). `overlap` is two cards
@@ -110,7 +118,8 @@ CARD_LIMIT = 6.0
 # Matching states measure at most 2.36 (corner and port-dot antialiasing).
 # Builds with the ring shifted 1px measured 12.2 (default) and 21.7 (scene),
 # with the 1.5px outline left unfloored 10.4 and 41.2, and a dragged card
-# left translucent after release 6.62.
+# left translucent after release 6.62. At DPR 2 a card 0.5px taller than the
+# reference (a header line height of 14.4px snapped to 14.5) measured 16.6.
 RING_INSET, RING_OUTSET = 2, 3
 RING_LIMIT = 4.0
 # Geometry is not expected to match here, so its cards are reported only.
@@ -123,6 +132,10 @@ CARD_UNGATED = {"zoomed", "body-zoom2", "body-zoom05"}
 # each card's top edge out of the ring band. The other three edges still gate
 # the grabbed card's dimming, which lowers the ring's red by about 8%.
 TOOLBAR_STATES = {"overlap-multidrag"}
+# Chromium's emulated device scale factor floors a 1.5px outline to whole CSS
+# pixels (2 device pixels at DPR 2); a real one floors to device pixels (3). GPUI
+# follows the real display, so at an emulated DPR other than 1 the ring band is
+# reported but not gated: `--real-dpr` is the DPR > 1 ring gate.
 
 
 def header(g, node):
@@ -323,8 +336,11 @@ def gpui_geometry(page):
 
 
 def capture(browser, url, steps, geometry, gpui, name, fixture):
-    page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=DPR)
-    if gpui:
+    if REAL_DPR:
+        page = browser.new_page(no_viewport=True)
+    else:
+        page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=DPR)
+    if gpui and not REAL_DPR:
         # Headless Chromium's emulated device scale factor leaves
         # devicePixelContentBoxSize in CSS pixels, so GPUI would size its
         # surface to the CSS box and draw the scene DPR times too large. Without
@@ -332,6 +348,9 @@ def capture(browser, url, steps, geometry, gpui, name, fixture):
         # real HiDPI display reports.
         page.add_init_script("delete ResizeObserverEntry.prototype.devicePixelContentBoxSize")
     page.goto(url)
+    if REAL_DPR:
+        size = page.evaluate("() => [innerWidth, innerHeight, devicePixelRatio]")
+        assert size == [W, H, DPR], f"real-dpr page is {size}, expected {[W, H, DPR]}"
     if gpui:
         page.wait_for_selector("canvas")
         page.wait_for_function("() => typeof globalThis.__nodeGraphParts === 'function'")
@@ -462,11 +481,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--theme", default="scene", choices=["scene", "default"])
     parser.add_argument("--dpr", type=float, default=1)
+    parser.add_argument("--real-dpr", action="store_true",
+                        help="force the browser's device scale factor instead of emulating it")
     parser.add_argument("states", nargs="*")
     args = parser.parse_args()
-    global DPR
+    global DPR, REAL_DPR
     DPR = args.dpr
-    stem = args.theme if DPR == 1 else f"{args.theme}-dpr{args.dpr:g}"
+    REAL_DPR = args.real_dpr
+    stem = args.theme if DPR == 1 and not REAL_DPR else (
+        f"{args.theme}-{'real-' if REAL_DPR else ''}dpr{args.dpr:g}")
     OUT.mkdir(exist_ok=True)
     ref_port = serve(HERE / "reference" / "dist")
     gpui_port = serve(Path(os.environ.get("PARITY_GALLERY_DIST") or HERE / "gallery" / "dist"))
@@ -477,7 +500,9 @@ def main():
         browser = p.chromium.launch(
             executable_path=os.environ.get("PARITY_CHROMIUM") or (shells[-1] if shells else None),
             args=["--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-                  "--enable-unsafe-webgpu", "--enable-features=Vulkan"],
+                  "--enable-unsafe-webgpu", "--enable-features=Vulkan",
+                  *([f"--force-device-scale-factor={DPR:g}", f"--window-size={W},{H}"]
+                    if REAL_DPR else [])],
         )
         idles = {}
         for name, (fixture, steps, top) in STATES.items():
@@ -516,7 +541,7 @@ def main():
                          *wire_offsets(ref_geo, gpui_geo), worst_card, worst_ring, ink,
                          mean, bad))
         browser.close()
-    print(f"theme {args.theme} dpr {DPR:g}")
+    print(f"theme {args.theme} dpr {DPR:g}{' real' if REAL_DPR else ''}")
     print(f"{'state':20} {'socket max px':>18} {'card max px':>18} {'body max px':>18} {'wire end px':>14}"
           f" {'wire path px':>14} {'card |d|':>13} {'ring |d|':>13} {'dot ink r/g':>13} {'mean|d|':>8} {'px>32':>7}")
     failed = []
@@ -528,12 +553,14 @@ def main():
         gated = name not in CARD_UNGATED
         if gated and card > CARD_LIMIT:
             failed.append(f"{name} card {card_at} {card:.2f} > {CARD_LIMIT}")
-        if gated and ring > RING_LIMIT:
+        ring_gated = gated and (REAL_DPR or DPR == 1)
+        if ring_gated and ring > RING_LIMIT:
             failed.append(f"{name} ring {ring_at} {ring:.2f} > {RING_LIMIT}")
         if STATES[name][2] and min(ink_ref, ink_gpui) < INK_RATIO * max(ink_ref, ink_gpui):
             failed.append(f"{name} socket {HIT_PORT} ink {ink_ref} vs {ink_gpui}")
         mark = "" if gated else "~"
-        print(f"{name:20} {cells} {card:7.2f}{mark:1} {card_at:>5} {ring:7.2f}{mark:1} {ring_at:>5}"
+        ring_mark = "" if ring_gated else "~"
+        print(f"{name:20} {cells} {card:7.2f}{mark:1} {card_at:>5} {ring:7.2f}{ring_mark:1} {ring_at:>5}"
               f" {ink_ref:5d}/{ink_gpui:<5d} {mean:8.2f} {bad:7.2%}")
     for name, top, kinds in hits:
         print(f"reference elementsFromPoint at {HIT_PORT} in {name}: {' > '.join(kinds)}")
