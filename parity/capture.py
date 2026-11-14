@@ -19,7 +19,8 @@ The reference build sets RUSTFLAGS so it does not inherit the repo's wasm
 thread flags. Nothing opens on a display. Writes parity/out/<theme>-<state>.png
 (reference | gpui | diff x4) and prints, per state, the largest socket-centre
 and node-card offsets, the wire endpoint and path offsets, and the pixel
-difference.
+difference, plus the worst node card's mean |d|. Exits non-zero when a card
+in a geometry-matched state exceeds CARD_LIMIT.
 """
 
 import argparse
@@ -51,6 +52,13 @@ PORTS = {
 NODES = ["src", "calc", "sink"]
 CONNECTIONS = ["c1", "c2"]
 SAMPLES = 64
+CARD_MARGIN = 6
+# Largest mean |d| a node card may show before its state counts as styled
+# differently: matching states measure at most 4.74 (text antialiasing), a
+# dragged card with a filled shadow under it 9.41.
+CARD_LIMIT = 6.0
+# Geometry is not expected to match here, so its cards are reported only.
+CARD_UNGATED = {"zoomed"}
 
 
 def header(g, node):
@@ -206,6 +214,21 @@ def pixel_diff(ref, gpui):
     return mean, bad, diff
 
 
+def card_diffs(ref_img, gpui_img, geometry):
+    """Mean |difference| per node card, over the reference card rect grown by
+    CARD_MARGIN so the selection ring and glow count. A fill or ring that one
+    side has and the other lacks moves this; text antialiasing barely does."""
+    out = {}
+    for node, (x, y, w, h) in geometry["nodes"].items():
+        box = (max(0, int(x - CARD_MARGIN)), max(0, int(y - CARD_MARGIN)),
+               min(W, int(x + w + CARD_MARGIN + 1)), min(H, int(y + h + CARD_MARGIN + 1)))
+        diff = ImageChops.difference(ref_img.crop(box), gpui_img.crop(box))
+        hist = diff.histogram()
+        area = (box[2] - box[0]) * (box[3] - box[1]) * 3
+        out[node] = sum(i * hist[c * 256 + i] for c in range(3) for i in range(256)) / area
+    return out
+
+
 def max_offset(ref, gpui, key, width):
     worst, where = 0.0, "-"
     for ident, a in ref[key].items():
@@ -288,16 +311,25 @@ def main():
             sheet.save(OUT / f"{args.theme}-{name}.png")
             (OUT / f"{args.theme}-{name}.json").write_text(
                 json.dumps({"reference": ref_geo, "gpui": gpui_geo}, indent=1))
+            cards = card_diffs(ref_img, gpui_img, ref_geo)
+            worst_card = max(cards.items(), key=lambda kv: kv[1])
             rows.append((name, max_offset(ref_geo, gpui_geo, "ports", 2),
                          max_offset(ref_geo, gpui_geo, "nodes", 4),
-                         *wire_offsets(ref_geo, gpui_geo), mean, bad))
+                         *wire_offsets(ref_geo, gpui_geo), worst_card, mean, bad))
         browser.close()
     print(f"theme {args.theme}")
     print(f"{'state':12} {'socket max px':>18} {'card max px':>18} {'wire end px':>14}"
-          f" {'wire path px':>14} {'mean|d|':>8} {'px>32':>7}")
-    for name, *offsets, mean, bad in rows:
+          f" {'wire path px':>14} {'card |d|':>13} {'mean|d|':>8} {'px>32':>7}")
+    failed = []
+    for name, *offsets, (card_at, card), mean, bad in rows:
         cells = " ".join(f"{v:9.2f} {at:>{8 if i < 2 else 4}}" for i, (v, at) in enumerate(offsets))
-        print(f"{name:12} {cells} {mean:8.2f} {bad:7.2%}")
+        gated = name not in CARD_UNGATED
+        if gated and card > CARD_LIMIT:
+            failed.append(f"{name} {card_at} {card:.2f}")
+        mark = "" if gated else "~"
+        print(f"{name:12} {cells} {card:7.2f}{mark:1} {card_at:>5} {mean:8.2f} {bad:7.2%}")
+    if failed:
+        raise SystemExit(f"card styling differs (limit {CARD_LIMIT}): " + ", ".join(failed))
 
 
 if __name__ == "__main__":

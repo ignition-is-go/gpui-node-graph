@@ -7539,37 +7539,67 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let automatic_width = self.auto_width_nodes.contains(&id);
             let styled_automatic_width = theme.node.width;
             let node_cursor = resolved_node_cursor(&theme.node, dragging, self.resize.is_some());
-            let mut node_shadows = if selected {
-                &theme.node.shadow_selected
+            let scale_factor = window.scale_factor();
+            let card_opacity = if dragging {
+                theme.node.opacity_dragging
             } else {
-                &theme.node.shadow
-            }
-            .iter()
-            .map(|shadow| {
-                BoxShadow::new(
-                    px(viewport.scale_length(shadow.offset_x)),
-                    px(viewport.scale_length(shadow.offset_y)),
-                    rgb(shadow.color.rgb).opacity(shadow.color.alpha).into(),
-                )
-                .blur_radius(px(viewport.scale_length(shadow.blur * 0.5)))
-                .spread_radius(px(viewport.scale_length(shadow.spread)))
-            })
-            .collect::<Vec<_>>();
-            // GPUI has no outline primitive. A zero-offset, zero-blur outer shadow is
-            // the non-layout-shifting equivalent for the solid Leptos selection outline.
-            if selected
-                && selected_outline.width > 0.0
-                && selected_outline.style == style::LineStyle::Solid
-            {
-                node_shadows.push(
+                1.0
+            };
+            // GPUI fills a shadow's whole rect, and CSS clips a box-shadow to outside
+            // the border box. Under a translucent (dragged) card the difference shows,
+            // so centred zero-blur shadows and the solid selection outline paint as
+            // rings around the card instead; only blurred shadows stay shadows.
+            let (ring_shadows, node_shadows): (Vec<&style::Shadow>, Vec<&style::Shadow>) =
+                if selected {
+                    &theme.node.shadow_selected
+                } else {
+                    &theme.node.shadow
+                }
+                .iter()
+                .partition(|shadow| {
+                    shadow.blur == 0.0 && shadow.offset_x == 0.0 && shadow.offset_y == 0.0
+                });
+            let node_shadows = node_shadows
+                .into_iter()
+                .map(|shadow| {
                     BoxShadow::new(
-                        px(0.0),
-                        px(0.0),
-                        rgb(selected_outline.color.rgb)
-                            .opacity(selected_outline.color.alpha)
-                            .into(),
+                        px(viewport.scale_length(shadow.offset_x)),
+                        px(viewport.scale_length(shadow.offset_y)),
+                        rgb(shadow.color.rgb).opacity(shadow.color.alpha).into(),
                     )
-                    .spread_radius(px(viewport.scale_length(selected_outline.width))),
+                    .blur_radius(px(viewport.scale_length(shadow.blur * 0.5)))
+                    .spread_radius(px(viewport.scale_length(shadow.spread)))
+                })
+                .collect::<Vec<_>>();
+            let outline_ring = (selected
+                && selected_outline.width > 0.0
+                && selected_outline.style == style::LineStyle::Solid)
+                .then_some((selected_outline.width, selected_outline.color));
+            for (spread, color) in ring_shadows
+                .into_iter()
+                .filter(|shadow| shadow.spread > 0.0)
+                .map(|shadow| (shadow.spread, shadow.color))
+                .chain(outline_ring)
+            {
+                // Chromium floors border and outline widths of a device pixel or
+                // more to whole device pixels; a 1.5px outline paints as 1px.
+                let spread = viewport.scale_length(spread);
+                let spread = if spread * scale_factor >= 1.0 {
+                    (spread * scale_factor).floor() / scale_factor
+                } else {
+                    spread
+                };
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left(px(position.x - spread))
+                        .top(px(position.y - spread))
+                        .w(px(viewport.scale_length(model_size.width) + spread * 2.0))
+                        .h(px(viewport.scale_length(model_size.height) + spread * 2.0))
+                        .rounded(px(viewport.scale_length(node_radius) + spread))
+                        .border(px(spread))
+                        .border_color(rgb(color.rgb).opacity(color.alpha))
+                        .opacity(card_opacity),
                 );
             }
             let card_id = id.clone();
@@ -7593,11 +7623,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .rounded(px(viewport.scale_length(node_radius)))
                     .shadow(node_shadows)
                     .overflow_hidden()
-                    .opacity(if dragging {
-                        theme.node.opacity_dragging
-                    } else {
-                        1.0
-                    })
+                    .opacity(card_opacity)
                     .when(matches!(node_cursor, style::Cursor::Default), |element| {
                         element.cursor_default()
                     })
