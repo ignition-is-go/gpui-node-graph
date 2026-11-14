@@ -4033,7 +4033,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         if delta_y.abs() <= f32::EPSILON {
             return;
         }
-        let factor = if delta_y < 0.0 {
+        // GPUI reports a wheel turned away from the user as positive `y` (the
+        // web adapter negates DOM `deltaY`); like the reference, that zooms in.
+        let factor = if delta_y > 0.0 {
             self.config.zoom_step.exp()
         } else {
             (-self.config.zoom_step).exp()
@@ -7346,7 +7348,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .px(px(viewport.scale_length(theme.node.padding_x)))
                     .py(px(viewport.scale_length(theme.node.header_padding_y)))
                     .bg(rgb(background.rgb).opacity(background.alpha))
-                    .child(node.title.clone());
+                    // The reference header is `font-weight: 600; text-transform:
+                    // uppercase` with a normal (1.2) line height, which the
+                    // default port layout assumes.
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .line_height(px(viewport.scale_length(theme.node.header_font_size * 1.2)))
+                    .child(node.title.to_uppercase());
                 if header.width > 0.0 && header.style != style::LineStyle::None {
                     default_header = default_header
                         .border_b(px(viewport.scale_length(header.width)))
@@ -10423,6 +10430,26 @@ mod tests {
         ] {
             assert!(parts.contains(id), "{id} missing from {parts:?}");
         }
+    }
+
+    #[gpui::test]
+    fn wheel_away_from_the_user_zooms_in_like_the_reference(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (editor, cx) =
+            cx.add_window_view(move |_, _| NodeGraph::new_for_test(interactive_graph()));
+        cx.run_until_parked();
+        let wheel = |y: f32| gpui::ScrollWheelEvent {
+            position: point(px(300.0), px(200.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(y))),
+            ..Default::default()
+        };
+        cx.simulate_event(wheel(100.0));
+        let zoomed_in = editor.read_with(cx, |editor, _| editor.graph.viewport.zoom);
+        assert!(zoomed_in > 1.0, "wheel up zooms in, got {zoomed_in}");
+        cx.simulate_event(wheel(-100.0));
+        cx.simulate_event(wheel(-100.0));
+        let zoomed_out = editor.read_with(cx, |editor, _| editor.graph.viewport.zoom);
+        assert!(zoomed_out < 1.0, "wheel down zooms out, got {zoomed_out}");
     }
 
     #[gpui::test]
