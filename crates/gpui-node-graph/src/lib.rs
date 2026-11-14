@@ -19,9 +19,11 @@ use std::{
 
 pub use node_graph_core as core;
 pub mod layout;
+mod part_tag;
 pub mod style;
 pub mod world;
 pub use node_graph_core::*;
+pub use part_tag::{PartTagger, set_part_tagger};
 pub use style::NodeGraphTheme;
 
 struct GlobalNodeGraphTheme(Arc<NodeGraphTheme>);
@@ -694,6 +696,7 @@ pub struct NodeBodyContext<T: PortType, N: core::NodeId, P: core::PortId, C: cor
     graph: WeakEntity<NodeGraph<T, N, P, C>>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     viewport: Viewport,
+    part_tagger: Option<part_tag::PartTagger>,
 }
 
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
@@ -780,6 +783,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
         let viewport = self.viewport;
         let node_id = self.node.id.clone();
         let node_position = self.node.position;
+        let interactive = part_tag::tag(self.part_tagger, interactive, || {
+            part_tag::part_id("port", &id)
+        });
         MeasuredElement::new(interactive, move |bounds, cx| {
             let canvas = canvas_bounds.get();
             let center = core::Point::new(
@@ -2011,19 +2017,36 @@ impl<N, C> BoxSelection<N, C> {
 /// Shared native/WebAssembly retained-mode GPUI node editor. Domain state stays
 /// framework-free in `node_graph_core`.
 struct RouteCache<C: Eq + std::hash::Hash> {
-    fingerprint: String,
-    routes: HashMap<C, Vec<core::Point>>,
+    fingerprint: Option<u64>,
+    routes: Rc<HashMap<C, Vec<core::Point>>>,
     generation: u64,
 }
 
 impl<C: Eq + std::hash::Hash> Default for RouteCache<C> {
     fn default() -> Self {
         Self {
-            fingerprint: String::new(),
-            routes: HashMap::new(),
+            fingerprint: None,
+            routes: Rc::default(),
             generation: 0,
         }
     }
+}
+
+/// Hash of one map entry, summed so the total ignores `HashMap` iteration order.
+fn entry_hash(write: impl FnOnce(&mut std::collections::hash_map::DefaultHasher)) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    write(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_point(point: core::Point, hasher: &mut impl Hasher) {
+    point.x.to_bits().hash(hasher);
+    point.y.to_bits().hash(hasher);
+}
+
+fn hash_size(size: core::Size, hasher: &mut impl Hasher) {
+    size.width.to_bits().hash(hasher);
+    size.height.to_bits().hash(hasher);
 }
 
 /// Platform text state for the currently focused world-space text control.
@@ -2938,6 +2961,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             !self.connection_is_detached(&connection.id)
                 && (connection.source == *id || connection.target == *id)
         });
+        Some(self.port_visual_state_with(id, connected))
+    }
+
+    /// Ports with at least one attached, non-detached connection. Built once per
+    /// frame so per-port state is not a scan of every connection.
+    fn connected_ports(&self) -> HashSet<P> {
+        self.graph
+            .connections
+            .values()
+            .filter(|connection| !self.connection_is_detached(&connection.id))
+            .flat_map(|connection| [connection.source.clone(), connection.target.clone()])
+            .collect()
+    }
+
+    fn port_visual_state_with(&self, id: &P, connected: bool) -> WorldPortVisualState {
         let source = self.draft.as_ref().is_some_and(|draft| draft.origin == *id);
         let snap = self
             .draft
@@ -2948,13 +2986,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .draft
             .as_ref()
             .is_some_and(|draft| self.normalized_connection(&draft.origin, id).is_some());
-        Some(WorldPortVisualState {
+        WorldPortVisualState {
             connected,
             source,
             snap,
             compatible,
             incompatible: self.draft.is_some() && !(source || snap || compatible),
-        })
+        }
     }
 
     pub fn hovered_port(&self) -> Option<&P> {
@@ -3114,6 +3152,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     fn automatic_default_layout(
         &self,
         node: &core::Node<N>,
+        mut ports: Vec<&Port<N, P, T>>,
         theme: &NodeGraphTheme,
     ) -> Option<(layout::DefaultNodeLayout, Vec<P>)> {
         let registered = self
@@ -3129,12 +3168,6 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         {
             return None;
         }
-        let mut ports: Vec<_> = self
-            .graph
-            .ports
-            .values()
-            .filter(|port| port.node == node.id)
-            .collect();
         ports.sort_by_cached_key(|port| format!("{:?}", port.id));
         let ids = ports.iter().map(|port| port.id.clone()).collect();
         let directions: Vec<_> = ports.iter().map(|port| port.direction).collect();
@@ -3161,12 +3194,17 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn refresh_default_render_geometry(&mut self, theme: &NodeGraphTheme) {
+        let mut ports_by_node: HashMap<&N, Vec<&Port<N, P, T>>> = HashMap::new();
+        for port in self.graph.ports.values() {
+            ports_by_node.entry(&port.node).or_default().push(port);
+        }
         let layouts: Vec<_> = self
             .graph
             .nodes
             .values()
             .filter_map(|node| {
-                let (layout, ports) = self.automatic_default_layout(node, theme)?;
+                let ports = ports_by_node.remove(&node.id).unwrap_or_default();
+                let (layout, ports) = self.automatic_default_layout(node, ports, theme)?;
                 let size = core::Size {
                     width: if self.auto_width_nodes.contains(&node.id) {
                         layout.size.width
@@ -4546,6 +4584,31 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
+    /// An offscreen node builds no elements, world primitives or port labels.
+    /// A retained body is still laid out once so its measured size is known.
+    fn node_is_culled(&self, node: &Node<N>) -> bool {
+        let size = self.resolved_node_size(&node.id).unwrap_or(node.size);
+        let measured = Node {
+            size,
+            ..node.clone()
+        };
+        if self.node_is_visible(&measured) {
+            return false;
+        }
+        let needs_measurement = !self.render_geometry.node_sizes.contains_key(&node.id)
+            && (self.node_body_renderer.is_some()
+                || self.world_node_body_renderer.is_some()
+                || self
+                    .node_type_registry
+                    .as_ref()
+                    .and_then(|registry| registry.get(&node.node_type))
+                    .is_some_and(|definition| {
+                        definition.world_renderer.is_some()
+                            || definition.retained_renderer.is_some()
+                    }));
+        !needs_measurement
+    }
+
     fn node_is_visible(&self, node: &Node<N>) -> bool {
         let canvas = self.canvas_bounds.get();
         let width = f32::from(canvas.size.width);
@@ -4623,18 +4686,62 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         }
     }
 
-    fn connection_routes(&self) -> HashMap<C, Vec<core::Point>> {
-        let fingerprint = format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
-            self.config.routing,
-            self.config.route_lane_spacing,
-            self.graph.nodes,
-            self.graph.ports,
-            self.graph.connections,
-            self.render_geometry.port_offsets,
-        );
+    /// Everything a route depends on, hashed without formatting the graph.
+    fn route_fingerprint(&self) -> u64 {
+        let mut total = entry_hash(|hasher| {
+            format!("{:?}", self.config.routing).hash(hasher);
+            self.config.route_lane_spacing.to_bits().hash(hasher);
+            (
+                self.graph.nodes.len(),
+                self.graph.ports.len(),
+                self.graph.connections.len(),
+            )
+                .hash(hasher);
+        });
+        for node in self.graph.nodes.values() {
+            total = total.wrapping_add(entry_hash(|hasher| {
+                node.id.hash(hasher);
+                hash_point(node.position, hasher);
+                hash_size(node.size, hasher);
+            }));
+        }
+        for port in self.graph.ports.values() {
+            total = total.wrapping_add(entry_hash(|hasher| {
+                port.id.hash(hasher);
+                port.node.hash(hasher);
+                port.direction.hash(hasher);
+                hash_point(port.position, hasher);
+            }));
+        }
+        for connection in self.graph.connections.values() {
+            total = total.wrapping_add(entry_hash(|hasher| {
+                connection.id.hash(hasher);
+                connection.source.hash(hasher);
+                connection.target.hash(hasher);
+            }));
+        }
+        for (port, (node, offset)) in &self.render_geometry.port_offsets {
+            total = total.wrapping_add(entry_hash(|hasher| {
+                1u8.hash(hasher);
+                port.hash(hasher);
+                node.hash(hasher);
+                hash_point(*offset, hasher);
+            }));
+        }
+        for (node, size) in &self.render_geometry.node_sizes {
+            total = total.wrapping_add(entry_hash(|hasher| {
+                2u8.hash(hasher);
+                node.hash(hasher);
+                hash_size(*size, hasher);
+            }));
+        }
+        total
+    }
+
+    fn connection_routes(&self) -> Rc<HashMap<C, Vec<core::Point>>> {
+        let fingerprint = Some(self.route_fingerprint());
         if self.route_cache.borrow().fingerprint == fingerprint {
-            return self.route_cache.borrow().routes.clone();
+            return Rc::clone(&self.route_cache.borrow().routes);
         }
 
         let mut connections: Vec<_> = self.graph.connections.values().collect();
@@ -4678,10 +4785,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 });
             }
             let routed = core::subway::compute_subway_routes(&obstacles, &batch, &options);
-            let routes: HashMap<C, Vec<core::Point>> = ids.into_iter().zip(routed).collect();
+            let routes: Rc<HashMap<C, Vec<core::Point>>> =
+                Rc::new(ids.into_iter().zip(routed).collect());
             let mut cache = self.route_cache.borrow_mut();
             cache.fingerprint = fingerprint;
-            cache.routes = routes.clone();
+            cache.routes = Rc::clone(&routes);
             cache.generation = cache.generation.saturating_add(1);
             return routes;
         }
@@ -4713,9 +4821,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             routes.insert(connection.id.clone(), route);
         }
 
+        let routes = Rc::new(routes);
         let mut cache = self.route_cache.borrow_mut();
         cache.fingerprint = fingerprint;
-        cache.routes = routes.clone();
+        cache.routes = Rc::clone(&routes);
         cache.generation = cache.generation.saturating_add(1);
         routes
     }
@@ -6275,6 +6384,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let focus_handle = self.focus_handle().clone();
         // Read exactly once for this root render, then share the same immutable aggregate.
         let theme = Arc::clone(cx.node_graph_theme());
+        let tagger = part_tag::part_tagger(cx);
         self.refresh_default_render_geometry(&theme);
         let viewport = self.graph.viewport.sanitized();
 
@@ -6442,6 +6552,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         .iter()
                         .map(|point| viewport.world_to_screen(*point))
                         .collect::<Vec<_>>();
+                    if !route_intersects(&projected, bounds.size, selected_wire_width) {
+                        continue;
+                    }
                     let color = if *dangling {
                         dangling_color
                     } else if *selected {
@@ -6953,7 +7066,30 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let mut frame_world_scene = world::WorldScene::new();
         let mut frame_world_control_owners = HashMap::new();
         let mut frame_world_control_order = Vec::new();
-        let mut nodes: Vec<_> = self.graph.nodes.values().cloned().collect();
+        let connected_ports = self.connected_ports();
+        let mut culled_nodes = HashSet::new();
+        let mut nodes: Vec<_> = self
+            .graph
+            .nodes
+            .values()
+            .filter(|node| {
+                let cull = self.node_is_culled(node);
+                if cull {
+                    culled_nodes.insert(node.id.clone());
+                }
+                !cull
+            })
+            .cloned()
+            .collect();
+        let mut ports_by_node: HashMap<N, Vec<Port<N, P, T>>> = HashMap::new();
+        for port in self.graph.ports.values() {
+            if !culled_nodes.contains(&port.node) {
+                ports_by_node
+                    .entry(port.node.clone())
+                    .or_default()
+                    .push(port.clone());
+            }
+        }
         nodes.sort_by_cached_key(|node| {
             (
                 node_paint_rank(&self.background_node_types, &node.node_type),
@@ -6984,13 +7120,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let has_custom_body = has_registered_body
                 || self.node_body_renderer.is_some()
                 || self.world_node_body_renderer.is_some();
-            let mut ports: Vec<_> = self
-                .graph
-                .ports
-                .values()
-                .filter(|port| port.node == id)
-                .cloned()
-                .collect();
+            let mut ports = ports_by_node.remove(&id).unwrap_or_default();
             if let Some(order) = self.defined_port_order.get(&id) {
                 ports.sort_by_cached_key(|port| {
                     (
@@ -7007,9 +7137,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let port_states: Arc<HashMap<P, WorldPortVisualState>> = Arc::new(
                 ports
                     .iter()
-                    .filter_map(|port| {
-                        self.port_visual_state(&port.id)
-                            .map(|state| (port.id.clone(), state))
+                    .map(|port| {
+                        (
+                            port.id.clone(),
+                            self.port_visual_state_with(
+                                &port.id,
+                                connected_ports.contains(&port.id),
+                            ),
+                        )
                     })
                     .collect(),
             );
@@ -7155,6 +7290,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         theme: theme.clone(),
                         graph: cx.weak_entity(),
                         canvas_bounds: self.canvas_bounds.clone(),
+                        part_tagger: tagger,
                         viewport,
                     },
                     window,
@@ -7197,6 +7333,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         theme: theme.clone(),
                         graph: cx.weak_entity(),
                         canvas_bounds: self.canvas_bounds.clone(),
+                        part_tagger: tagger,
                         viewport,
                     },
                     window,
@@ -7218,7 +7355,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             element.border_dashed()
                         });
                 }
-                NodeBody::new(default_header.children(port_slot_elements))
+                NodeBody::new(part_tag::tag(
+                    tagger,
+                    default_header.children(port_slot_elements),
+                    || part_tag::part_id("node-header", &id),
+                ))
             };
             if let Some(renderer) = self.node_overlay_renderer.as_mut() {
                 body.overlays.extend(renderer.render_node_overlays(
@@ -7424,7 +7565,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .spread_radius(px(viewport.scale_length(selected_outline.width))),
                 );
             }
-            root = root.child(
+            let card_id = id.clone();
+            root = root.child(part_tag::tag(
+                tagger,
                 div()
                     .absolute()
                     .left(px(position.x))
@@ -7599,7 +7742,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             }
                         })
                     }),
-            );
+                || part_tag::part_id("node", &card_id),
+            ));
             if theme.node.resizable {
                 let resize_theme = Arc::clone(&theme);
                 root = root.child(
@@ -7676,7 +7820,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
 
         let mut default_port_scene = world::WorldScene::new();
         for port in self.graph.ports.values() {
-            if body_anchored_nodes.contains(&port.node) {
+            if body_anchored_nodes.contains(&port.node) || culled_nodes.contains(&port.node) {
                 continue;
             }
             let id = port.id.clone();
@@ -7684,10 +7828,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .resolved_port_position(&port.id)
                 .unwrap_or(port.position);
             let position = viewport.world_to_screen(world_position);
-            let connected = self.graph.connections.values().any(|connection| {
-                !self.connection_is_detached(&connection.id)
-                    && (connection.source == port.id || connection.target == port.id)
-            });
+            let connected = connected_ports.contains(&port.id);
             let is_source = self
                 .draft
                 .as_ref()
@@ -7869,7 +8010,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 })
                 .child(port.label.clone());
             let dot_up_theme = Arc::clone(&theme);
-            root = root.child(label_element).child(
+            let dot_part = tagger.map(|_| part_tag::part_id("port", &id));
+            root = root.child(label_element).child(part_tag::tag(
+                tagger,
                 div()
                     .absolute()
                     .left(px(position.x - dot_radius))
@@ -7925,7 +8068,43 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                             this.finish_left_gesture(true, &dot_up_theme, cx);
                         }),
                     ),
-            );
+                || dot_part.unwrap_or_default(),
+            ));
+        }
+
+        if tagger.is_some() {
+            let pane = self.canvas_bounds.get().size;
+            for connection in self.graph.connections.values() {
+                let Some(route) = routes.get(&connection.id) else {
+                    continue;
+                };
+                let projected: Vec<_> = route
+                    .iter()
+                    .map(|point| viewport.world_to_screen(*point))
+                    .collect();
+                let measured = pane.width > px(0.0) && pane.height > px(0.0);
+                if projected.is_empty() || (measured && !route_intersects(&projected, pane, 0.0)) {
+                    continue;
+                }
+                let (min, max) =
+                    projected
+                        .iter()
+                        .fold((projected[0], projected[0]), |(min, max), point| {
+                            (
+                                core::Point::new(min.x.min(point.x), min.y.min(point.y)),
+                                core::Point::new(max.x.max(point.x), max.y.max(point.y)),
+                            )
+                        });
+                let probe = div()
+                    .absolute()
+                    .left(px(min.x))
+                    .top(px(min.y))
+                    .w(px((max.x - min.x).max(1.0)))
+                    .h(px((max.y - min.y).max(1.0)));
+                root = root.child(part_tag::tag(tagger, probe, || {
+                    part_tag::part_id("wire", &connection.id)
+                }));
+            }
         }
 
         if !default_port_scene.primitives.is_empty() {
@@ -9591,6 +9770,22 @@ fn resolve_overlay_position(
     position
 }
 
+/// Whether a polyline's bounding box, grown by `margin`, overlaps the pane.
+fn route_intersects(points: &[core::Point], pane: gpui::Size<Pixels>, margin: f32) -> bool {
+    let (mut min, mut max) = (
+        core::Point::new(f32::INFINITY, f32::INFINITY),
+        core::Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
+    );
+    for point in points {
+        min = core::Point::new(min.x.min(point.x), min.y.min(point.y));
+        max = core::Point::new(max.x.max(point.x), max.y.max(point.y));
+    }
+    max.x >= -margin
+        && max.y >= -margin
+        && min.x <= f32::from(pane.width) + margin
+        && min.y <= f32::from(pane.height) + margin
+}
+
 fn paint_route(
     window: &mut Window,
     bounds: Bounds<Pixels>,
@@ -10189,6 +10384,78 @@ mod tests {
             },
         );
         graph
+    }
+
+    thread_local! {
+        static TAGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn record_part(element: AnyElement, id: SharedString) -> AnyElement {
+        TAGGED.with(|tagged| tagged.borrow_mut().push(id.to_string()));
+        element
+    }
+
+    fn tagged_parts() -> HashSet<String> {
+        TAGGED.with(|tagged| tagged.borrow_mut().drain(..).collect())
+    }
+
+    #[gpui::test]
+    fn an_installed_part_tagger_sees_cards_headers_ports_and_wires(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (_editor, cx) =
+            cx.add_window_view(move |_, _| NodeGraph::new_for_test(interactive_graph()));
+        cx.run_until_parked();
+        assert!(tagged_parts().is_empty(), "no tagger, no ids");
+
+        cx.update(|window, app| {
+            set_part_tagger(app, record_part);
+            window.refresh();
+        });
+        cx.run_until_parked();
+        let parts = tagged_parts();
+        for id in [
+            "node-graph.node:a",
+            "node-graph.node:b",
+            "node-graph.node-header:a",
+            "node-graph.port:out",
+            "node-graph.port:in",
+            "node-graph.wire:wire",
+        ] {
+            assert!(parts.contains(id), "{id} missing from {parts:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn offscreen_nodes_build_no_chrome_but_keep_their_wires(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            set_node_graph_theme(app, NodeGraphTheme::default());
+            set_part_tagger(app, record_part);
+        });
+        let mut graph = interactive_graph();
+        graph.nodes.get_mut("b").unwrap().position = core::Point::new(100_000.0, 0.0);
+        graph.ports.get_mut("in").unwrap().position = core::Point::new(100_000.0, 25.0);
+        let (editor, cx) = cx.add_window_view(move |_, _| NodeGraph::new_for_test(graph));
+        cx.run_until_parked();
+        tagged_parts();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let parts = tagged_parts();
+        assert!(parts.contains("node-graph.node:a"));
+        assert!(
+            parts.contains("node-graph.wire:wire"),
+            "wire enters the pane"
+        );
+        assert!(
+            !parts.contains("node-graph.node:b"),
+            "offscreen card culled"
+        );
+        assert!(
+            !parts.contains("node-graph.port:in"),
+            "offscreen port culled"
+        );
+        editor.update(cx, |editor, _| {
+            assert!(editor.resolved_port_position(&"in".into()).is_some());
+        });
     }
 
     #[test]
@@ -11478,7 +11745,7 @@ mod tests {
         assert_eq!(editor.dangling_connections[0].missing_port, "out");
         assert_eq!(
             editor.dangling_connections[0].source_position,
-            core::Point::new(36.0, 43.4)
+            core::Point::new(35.0, 44.4)
         );
         editor.graph.ports.insert(
             "out".into(),
@@ -11589,10 +11856,10 @@ mod tests {
             editor.resolved_node_size(&"a".into()),
             Some(core::Size {
                 width: 50.0,
-                height: 59.4,
+                height: 61.4,
             })
         );
-        assert_eq!(editor.render_bounds().unwrap().size.height, 59.4);
+        assert_eq!(editor.render_bounds().unwrap().size.height, 61.4);
     }
 
     #[test]
@@ -11603,30 +11870,30 @@ mod tests {
         editor.refresh_default_render_geometry(&default_theme);
         assert_eq!(
             editor.resolved_port_position(&String::from("out")),
-            Some(core::Point::new(36.0, 43.4))
+            Some(core::Point::new(35.0, 44.4))
         );
         assert_eq!(
             editor.resolved_node_size(&String::from("a")),
             Some(core::Size {
                 width: 50.0,
-                height: 59.4,
+                height: 61.4,
             })
         );
 
         let mut theme = NodeGraphTheme::default();
-        theme.anchor.dot_inset = 5.0;
+        theme.anchor.row_padding_x = 1.0;
         theme.anchor.row_height = 30.0;
         theme.node.ports_padding_y = 10.0;
         editor.refresh_default_render_geometry(&theme);
         assert_eq!(
             editor.resolved_port_position(&String::from("out")),
-            Some(core::Point::new(45.0, 52.4))
+            Some(core::Point::new(44.0, 53.4))
         );
         assert_eq!(
             editor.resolved_node_size(&String::from("a")),
             Some(core::Size {
                 width: 50.0,
-                height: 77.4,
+                height: 79.4,
             })
         );
 
@@ -11636,12 +11903,12 @@ mod tests {
             editor.resolved_node_size(&String::from("a")),
             Some(core::Size {
                 width: 160.0,
-                height: 77.4,
+                height: 79.4,
             })
         );
         assert_eq!(
             editor.resolved_port_position(&String::from("out")),
-            Some(core::Point::new(155.0, 52.4))
+            Some(core::Point::new(154.0, 53.4))
         );
     }
 
