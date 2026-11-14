@@ -2213,6 +2213,9 @@ struct PortChrome<P> {
 /// least from that coverage: a stroke on whole device pixels stays crisp, one
 /// that straddles them spreads at partial alpha, which keeps the ring's ink.
 /// `left` and `width` are the dot box's unsnapped screen left edge and width.
+/// This models one edge on the device pixel grid, which holds at whole device
+/// scales; at a fractional scale the ring is stroked as a circle instead
+/// ([`paint_socket_ring`]).
 fn whole_pixel_ring(
     border: Pixels,
     stroke: gpui::Hsla,
@@ -2258,6 +2261,37 @@ fn whole_pixel_ring(
         px(band / scale_factor),
         stroke.opacity((device / band).min(1.0)),
     )
+}
+
+/// A hollow socket as 0.2.2 draws it: a circle of radius 9.5 in a 24-unit box,
+/// stroked `border` wide, antialiased where it falls between device pixels.
+fn paint_socket_ring(dot: Bounds<Pixels>, border: Pixels, stroke: gpui::Hsla, window: &mut Window) {
+    let radius = dot.size.width.min(dot.size.height) * (9.5 / 24.0);
+    if radius <= Pixels::ZERO || border <= Pixels::ZERO {
+        return;
+    }
+    let center = dot.center();
+    let mut path = PathBuilder::stroke(border);
+    path.move_to(point(center.x + radius, center.y));
+    let radii = point(radius, radius);
+    path.arc_to(
+        radii,
+        px(0.0),
+        false,
+        true,
+        point(center.x - radius, center.y),
+    );
+    path.arc_to(
+        radii,
+        px(0.0),
+        false,
+        true,
+        point(center.x + radius, center.y),
+    );
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, stroke);
+    }
 }
 
 struct DotPaint {
@@ -2380,13 +2414,17 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                     let radius = dot.size.width.min(dot.size.height) * 0.5;
                     let hidden_by: &[Bounds<Pixels>] =
                         if port.dragging { &placed.above } else { &[] };
-                    let (border, stroke) = if paint.fill.is_transparent() {
+                    let scale = window.scale_factor();
+                    let stroked_ring = paint.fill.is_transparent() && scale.fract() != 0.0;
+                    let (border, stroke) = if stroked_ring {
+                        (Pixels::ZERO, gpui::transparent_black())
+                    } else if paint.fill.is_transparent() {
                         whole_pixel_ring(
                             paint.border,
                             paint.stroke,
                             bounds.origin.x + port.dot.origin.x,
                             port.dot.size.width,
-                            window.scale_factor(),
+                            scale,
                         )
                     } else {
                         (paint.border, paint.stroke)
@@ -2394,14 +2432,18 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                     for visible in visible_pieces(*dot, hidden_by) {
                         window.with_content_mask(Some(ContentMask { bounds: visible }), |window| {
                             window.paint_drop_shadows(*dot, radius.into(), &paint.glow);
-                            window.paint_quad(quad(
-                                *dot,
-                                radius,
-                                paint.fill,
-                                border,
-                                stroke,
-                                BorderStyle::Solid,
-                            ));
+                            if stroked_ring {
+                                paint_socket_ring(*dot, paint.border, paint.stroke, window);
+                            } else {
+                                window.paint_quad(quad(
+                                    *dot,
+                                    radius,
+                                    paint.fill,
+                                    border,
+                                    stroke,
+                                    BorderStyle::Solid,
+                                ));
+                            }
                         });
                     }
                 }
