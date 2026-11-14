@@ -2000,18 +2000,132 @@ impl IntoElement for MeasuredElement {
     }
 }
 
-/// Paints its child as one scene layer, so every primitive inside shares a
-/// single draw order. GPUI otherwise searches its bounds tree once per quad and
-/// glyph to order it; for a card that is dozens of searches instead of one.
-/// Within a layer GPUI draws shadows, then quads, then paths, then glyphs, so
-/// only content whose primitives already stack in that order may use it.
-struct LayerElement {
-    child: Option<AnyElement>,
-    /// How far the child paints outside its bounds (shadows, rings).
-    outset: Pixels,
+/// A ring from a node card's edge out to `width`: a centred zero-blur
+/// box-shadow or a solid outline.
+#[derive(Clone, Copy)]
+struct Ring {
+    width: Pixels,
+    color: gpui::Rgba,
 }
 
-impl Element for LayerElement {
+/// Splits rings listed bottom first into disjoint `(inner, outer, colour)`
+/// bands, each the source-over composite of every ring covering it.
+fn ring_bands(rings: &[Ring]) -> Vec<(Pixels, Pixels, gpui::Rgba)> {
+    let mut edges: Vec<Pixels> = rings.iter().map(|ring| ring.width).collect();
+    edges.sort_by(|a, b| f32::from(*a).total_cmp(&f32::from(*b)));
+    edges.dedup();
+    let mut inner = px(0.0);
+    edges
+        .into_iter()
+        .map(|outer| {
+            let mut color = gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            };
+            for top in rings.iter().filter(|ring| ring.width >= outer) {
+                let top = top.color;
+                let a = top.a + color.a * (1.0 - top.a);
+                let mix = |t: f32, b: f32| {
+                    if a == 0.0 {
+                        0.0
+                    } else {
+                        (t * top.a + b * color.a * (1.0 - top.a)) / a
+                    }
+                };
+                color = gpui::Rgba {
+                    r: mix(top.r, color.r),
+                    g: mix(top.g, color.g),
+                    b: mix(top.b, color.b),
+                    a,
+                };
+            }
+            let band = (inner, outer, color);
+            inner = outer;
+            band
+        })
+        .collect()
+}
+
+/// What CSS paints outside a node card's border box: box-shadows clipped to
+/// outside it and the selection outline, all inside the card's opacity group.
+struct CardChrome {
+    /// Bottom first: box-shadows in reverse list order, then the outline.
+    rings: Vec<Ring>,
+    glow: Vec<BoxShadow>,
+    radius: Pixels,
+    opacity: f32,
+}
+
+impl CardChrome {
+    /// How far past the card edge anything here paints.
+    fn reach(&self) -> Pixels {
+        self.glow
+            .iter()
+            .map(|shadow| {
+                shadow.offset.x.abs().max(shadow.offset.y.abs())
+                    + shadow.blur_radius * 2.0
+                    + shadow.spread_radius
+            })
+            .chain(self.rings.iter().map(|ring| ring.width))
+            .fold(px(0.0), Pixels::max)
+    }
+
+    fn paint_glow(&self, card: Bounds<Pixels>, window: &mut Window) {
+        let glow: Vec<_> = self
+            .glow
+            .iter()
+            .cloned()
+            .map(|mut shadow| {
+                shadow.color = shadow.color.opacity(self.opacity);
+                shadow
+            })
+            .collect();
+        window.paint_drop_shadows(card, self.radius.into(), &glow);
+    }
+
+    /// Rings paint over the card: GPUI clips its content to the card's
+    /// rectangle, not its rounded corners, and the rings cover what leaks.
+    /// Opaque, each ring is its own antialiased shape, as in CSS. GPUI has no
+    /// group opacity, so a translucent card's rings are first composited into
+    /// disjoint bands; otherwise coincident rings would stack the opacity.
+    fn paint_rings(&self, card: Bounds<Pixels>, window: &mut Window) {
+        let bands = if self.opacity >= 1.0 {
+            self.rings
+                .iter()
+                .map(|ring| (px(0.0), ring.width, ring.color))
+                .collect()
+        } else {
+            ring_bands(&self.rings)
+        };
+        for (inner, outer, mut color) in bands {
+            color.a *= self.opacity;
+            window.paint_quad(quad(
+                card.dilate(outer),
+                self.radius + outer,
+                gpui::transparent_black(),
+                outer - inner,
+                color,
+                BorderStyle::Solid,
+            ));
+        }
+    }
+}
+
+/// A node card with its outside chrome. A default-chrome card also paints as
+/// one scene layer, so every primitive inside shares a single draw order. GPUI
+/// otherwise searches its bounds tree once per quad and glyph to order it; for
+/// a card that is dozens of searches instead of one. Within a layer GPUI draws
+/// shadows, then quads, then paths, then glyphs, so only content whose
+/// primitives already stack in that order may share one.
+struct CardElement {
+    child: Option<AnyElement>,
+    chrome: CardChrome,
+    layer: bool,
+}
+
+impl Element for CardElement {
     type RequestLayoutState = AnyElement;
     type PrepaintState = ();
 
@@ -2030,7 +2144,7 @@ impl Element for LayerElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut child = self.child.take().expect("layer element laid out once");
+        let mut child = self.child.take().expect("card element laid out once");
         let layout_id = child.request_layout(window, cx);
         (layout_id, child)
     }
@@ -2057,11 +2171,20 @@ impl Element for LayerElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.paint_layer(bounds.dilate(self.outset), |window| child.paint(window, cx));
+        let mut draw = |window: &mut Window| {
+            self.chrome.paint_glow(bounds, window);
+            child.paint(window, cx);
+            self.chrome.paint_rings(bounds, window);
+        };
+        if self.layer {
+            window.paint_layer(bounds.dilate(self.chrome.reach()), draw);
+        } else {
+            draw(window);
+        }
     }
 }
 
-impl IntoElement for LayerElement {
+impl IntoElement for CardElement {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -7619,11 +7742,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             } else {
                 1.0
             };
-            // GPUI fills a shadow's whole rect, and CSS clips a box-shadow to outside
-            // the border box. Under a translucent (dragged) card the difference shows,
-            // so centred zero-blur shadows and the solid selection outline paint as
-            // rings around the card instead; only blurred shadows stay shadows.
-            let (ring_shadows, node_shadows): (Vec<&style::Shadow>, Vec<&style::Shadow>) =
+            // CSS stacks the outline over the box-shadows, the first shadow on top,
+            // clips them all to outside the border box, and applies the dragged
+            // card's opacity to the group. Centred zero-blur shadows and a solid
+            // outline are rings from the card edge; composite them per band here
+            // so the group opacity applies once.
+            let (ring_shadows, glow_shadows): (Vec<&style::Shadow>, Vec<&style::Shadow>) =
                 if selected {
                     &theme.node.shadow_selected
                 } else {
@@ -7633,49 +7757,48 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .partition(|shadow| {
                     shadow.blur == 0.0 && shadow.offset_x == 0.0 && shadow.offset_y == 0.0
                 });
-            let node_shadows = node_shadows
-                .into_iter()
-                .map(|shadow| {
-                    BoxShadow::new(
-                        px(viewport.scale_length(shadow.offset_x)),
-                        px(viewport.scale_length(shadow.offset_y)),
-                        rgb(shadow.color.rgb).opacity(shadow.color.alpha).into(),
-                    )
-                    .blur_radius(px(viewport.scale_length(shadow.blur * 0.5)))
-                    .spread_radius(px(viewport.scale_length(shadow.spread)))
-                })
-                .collect::<Vec<_>>();
             let outline_ring = (selected
                 && selected_outline.width > 0.0
                 && selected_outline.style == style::LineStyle::Solid)
                 .then_some((selected_outline.width, selected_outline.color));
-            for (spread, color) in ring_shadows
+            let rings: Vec<Ring> = ring_shadows
                 .into_iter()
+                .rev()
                 .filter(|shadow| shadow.spread > 0.0)
                 .map(|shadow| (shadow.spread, shadow.color))
                 .chain(outline_ring)
-            {
-                // Chromium floors border and outline widths of a device pixel or
-                // more to whole device pixels; a 1.5px outline paints as 1px.
-                let spread = viewport.scale_length(spread);
-                let spread = if spread * scale_factor >= 1.0 {
-                    (spread * scale_factor).floor() / scale_factor
-                } else {
-                    spread
-                };
-                root = root.child(
-                    div()
-                        .absolute()
-                        .left(px(position.x - spread))
-                        .top(px(position.y - spread))
-                        .w(px(viewport.scale_length(model_size.width) + spread * 2.0))
-                        .h(px(viewport.scale_length(model_size.height) + spread * 2.0))
-                        .rounded(px(viewport.scale_length(node_radius) + spread))
-                        .border(px(spread))
-                        .border_color(rgb(color.rgb).opacity(color.alpha))
-                        .opacity(card_opacity),
-                );
-            }
+                .map(|(width, color)| {
+                    // Chromium floors border and outline widths of a device pixel or
+                    // more to whole device pixels; a 1.5px outline paints as 1px.
+                    let width = viewport.scale_length(width);
+                    let width = if width * scale_factor >= 1.0 {
+                        (width * scale_factor).floor() / scale_factor
+                    } else {
+                        width
+                    };
+                    Ring {
+                        width: px(width),
+                        color: rgb(color.rgb).opacity(color.alpha),
+                    }
+                })
+                .collect();
+            let chrome = CardChrome {
+                rings,
+                glow: glow_shadows
+                    .into_iter()
+                    .map(|shadow| {
+                        BoxShadow::new(
+                            px(viewport.scale_length(shadow.offset_x)),
+                            px(viewport.scale_length(shadow.offset_y)),
+                            rgb(shadow.color.rgb).opacity(shadow.color.alpha).into(),
+                        )
+                        .blur_radius(px(viewport.scale_length(shadow.blur * 0.5)))
+                        .spread_radius(px(viewport.scale_length(shadow.spread)))
+                    })
+                    .collect(),
+                radius: px(viewport.scale_length(node_radius)),
+                opacity: card_opacity,
+            };
             let card_id = id.clone();
             let card = part_tag::tag(
                 tagger,
@@ -7695,7 +7818,6 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     })
                     .h(px(viewport.scale_length(model_size.height)))
                     .rounded(px(viewport.scale_length(node_radius)))
-                    .shadow(node_shadows)
                     .overflow_hidden()
                     .opacity(card_opacity)
                     .when(matches!(node_cursor, style::Cursor::Default), |element| {
@@ -7853,25 +7975,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             );
             // Default chrome stacks as GPUI orders a layer (card shadow, quads,
             // then glyphs); a custom body may not, so it keeps per-primitive order.
-            root = root.child(if has_custom_body {
-                card
-            } else {
-                let outset = theme
-                    .node
-                    .shadow
-                    .iter()
-                    .chain(&theme.node.shadow_selected)
-                    .map(|shadow| {
-                        shadow.offset_x.abs().max(shadow.offset_y.abs())
-                            + shadow.blur
-                            + shadow.spread.max(0.0)
-                    })
-                    .fold(theme.node.outline_selected.width, f32::max);
-                LayerElement {
-                    child: Some(card),
-                    outset: px(viewport.scale_length(outset)),
-                }
-                .into_any_element()
+            root = root.child(CardElement {
+                child: Some(card),
+                chrome,
+                layer: !has_custom_body,
             });
             if theme.node.resizable {
                 let resize_theme = Arc::clone(&theme);
@@ -10017,6 +10124,40 @@ fn paint_dashed_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coincident_rings_composite_into_one_band_per_width() {
+        let red = gpui::Rgba {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let faint = gpui::Rgba { a: 0.5, ..red };
+        let bands = ring_bands(&[
+            Ring {
+                width: px(2.0),
+                color: faint,
+            },
+            Ring {
+                width: px(1.0),
+                color: red,
+            },
+            Ring {
+                width: px(1.0),
+                color: red,
+            },
+        ]);
+        assert_eq!(bands.len(), 2);
+        assert_eq!(
+            (bands[0].0, bands[0].1, bands[0].2.a),
+            (px(0.0), px(1.0), 1.0)
+        );
+        assert_eq!(
+            (bands[1].0, bands[1].1, bands[1].2.a),
+            (px(1.0), px(2.0), 0.5)
+        );
+    }
 
     #[test]
     fn default_shortcut_catalog_has_unique_sequences_and_typed_metadata() {

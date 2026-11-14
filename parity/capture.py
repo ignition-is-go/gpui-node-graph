@@ -19,8 +19,10 @@ The reference build sets RUSTFLAGS so it does not inherit the repo's wasm
 thread flags. Nothing opens on a display. Writes parity/out/<theme>-<state>.png
 (reference | gpui | diff x4) and prints, per state, the largest socket-centre
 and node-card offsets, the wire endpoint and path offsets, and the pixel
-difference, plus the worst node card's mean |d|. Exits non-zero when a card
-in a geometry-matched state exceeds CARD_LIMIT.
+difference, plus the worst node card's mean |d| and the worst selection-ring
+band's mean |d|. Exits non-zero when, in a geometry-matched state, a card
+exceeds CARD_LIMIT or a ring band exceeds RING_LIMIT. PARITY_GALLERY_DIST
+points it at another gallery build, such as a mutated one.
 """
 
 import argparse
@@ -33,7 +35,7 @@ import socketserver
 import threading
 from pathlib import Path
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw, ImageStat
 from playwright.sync_api import sync_playwright
 
 HERE = Path(__file__).resolve().parent
@@ -57,6 +59,15 @@ CARD_MARGIN = 6
 # differently: matching states measure at most 4.74 (text antialiasing), a
 # dragged card with a filled shadow under it 9.41.
 CARD_LIMIT = 6.0
+# The selection ring band, card edge -RING_INSET .. +RING_OUTSET px, where a
+# 1px ring and its antialiasing land. The whole-card mean dilutes a 1px ring
+# shift or a half-pixel width error below CARD_LIMIT; this band does not.
+# Matching states measure at most 2.36 (corner and port-dot antialiasing).
+# Builds with the ring shifted 1px measured 12.2 (default) and 21.7 (scene),
+# with the 1.5px outline left unfloored 10.4 and 41.2, and a dragged card
+# left translucent after release 6.62.
+RING_INSET, RING_OUTSET = 2, 3
+RING_LIMIT = 4.0
 # Geometry is not expected to match here, so its cards are reported only.
 CARD_UNGATED = {"zoomed"}
 
@@ -229,6 +240,21 @@ def card_diffs(ref_img, gpui_img, geometry):
     return out
 
 
+def ring_diffs(ref_img, gpui_img, geometry):
+    """Mean |difference| per node over the selection ring band only."""
+    out = {}
+    for node, (x, y, w, h) in geometry["nodes"].items():
+        mask = Image.new("L", (W, H), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rectangle((round(x) - RING_OUTSET, round(y) - RING_OUTSET,
+                        round(x + w) + RING_OUTSET - 1, round(y + h) + RING_OUTSET - 1), fill=255)
+        draw.rectangle((round(x) + RING_INSET, round(y) + RING_INSET,
+                        round(x + w) - RING_INSET - 1, round(y + h) - RING_INSET - 1), fill=0)
+        diff = ImageChops.difference(ref_img, gpui_img)
+        out[node] = sum(ImageStat.Stat(diff, mask).mean) / 3
+    return out
+
+
 def max_offset(ref, gpui, key, width):
     worst, where = 0.0, "-"
     for ident, a in ref[key].items():
@@ -286,7 +312,7 @@ def main():
     args = parser.parse_args()
     OUT.mkdir(exist_ok=True)
     ref_port = serve(HERE / "reference" / "dist")
-    gpui_port = serve(HERE / "gallery" / "dist")
+    gpui_port = serve(Path(os.environ.get("PARITY_GALLERY_DIST") or HERE / "gallery" / "dist"))
     query = f"?theme={args.theme}"
     rows = []
     with sync_playwright() as p:
@@ -313,23 +339,26 @@ def main():
                 json.dumps({"reference": ref_geo, "gpui": gpui_geo}, indent=1))
             cards = card_diffs(ref_img, gpui_img, ref_geo)
             worst_card = max(cards.items(), key=lambda kv: kv[1])
+            worst_ring = max(ring_diffs(ref_img, gpui_img, ref_geo).items(), key=lambda kv: kv[1])
             rows.append((name, max_offset(ref_geo, gpui_geo, "ports", 2),
                          max_offset(ref_geo, gpui_geo, "nodes", 4),
-                         *wire_offsets(ref_geo, gpui_geo), worst_card, mean, bad))
+                         *wire_offsets(ref_geo, gpui_geo), worst_card, worst_ring, mean, bad))
         browser.close()
     print(f"theme {args.theme}")
     print(f"{'state':12} {'socket max px':>18} {'card max px':>18} {'wire end px':>14}"
-          f" {'wire path px':>14} {'card |d|':>13} {'mean|d|':>8} {'px>32':>7}")
+          f" {'wire path px':>14} {'card |d|':>13} {'ring |d|':>13} {'mean|d|':>8} {'px>32':>7}")
     failed = []
-    for name, *offsets, (card_at, card), mean, bad in rows:
+    for name, *offsets, (card_at, card), (ring_at, ring), mean, bad in rows:
         cells = " ".join(f"{v:9.2f} {at:>{8 if i < 2 else 4}}" for i, (v, at) in enumerate(offsets))
         gated = name not in CARD_UNGATED
         if gated and card > CARD_LIMIT:
-            failed.append(f"{name} {card_at} {card:.2f}")
+            failed.append(f"{name} card {card_at} {card:.2f} > {CARD_LIMIT}")
+        if gated and ring > RING_LIMIT:
+            failed.append(f"{name} ring {ring_at} {ring:.2f} > {RING_LIMIT}")
         mark = "" if gated else "~"
-        print(f"{name:12} {cells} {card:7.2f}{mark:1} {card_at:>5} {mean:8.2f} {bad:7.2%}")
+        print(f"{name:12} {cells} {card:7.2f}{mark:1} {card_at:>5} {ring:7.2f}{mark:1} {ring_at:>5} {mean:8.2f} {bad:7.2%}")
     if failed:
-        raise SystemExit(f"card styling differs (limit {CARD_LIMIT}): " + ", ".join(failed))
+        raise SystemExit("card styling differs: " + ", ".join(failed))
 
 
 if __name__ == "__main__":
