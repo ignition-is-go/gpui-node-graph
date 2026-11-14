@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use gpui::{Modifiers, VisualTestContext, point, px};
+use gpui::{Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, VisualTestContext, point, px};
 use gpui::{ParentElement, Styled, div};
 use gpui_node_graph::{NodeBody, NodeBodyContext, NodeGraph, NodeGraphTheme, core::*, graph_px};
 
@@ -17,6 +17,9 @@ impl PortType for Kind {
 
 const COLUMNS: usize = 25;
 const ROWS: usize = 20;
+/// The interaction benchmarks use a 20x10 grid: about the size of a busy
+/// hand-built graph, all of it on screen.
+const INTERACTION_GRID: (usize, usize) = (20, 10);
 const PORTS_PER_SIDE: usize = 2;
 
 /// Cards are 160x100. The default pitch leaves gaps; the overlapping pitch
@@ -26,12 +29,20 @@ const SPARSE_PITCH: (f32, f32) = (220.0, 140.0);
 const OVERLAPPING_PITCH: (f32, f32) = (110.0, 70.0);
 
 fn large_graph(zoom: f32, pitch: (f32, f32)) -> GraphState<String, String, String, Kind> {
+    grid_graph(zoom, pitch, (COLUMNS, ROWS))
+}
+
+fn grid_graph(
+    zoom: f32,
+    pitch: (f32, f32),
+    (columns, rows): (usize, usize),
+) -> GraphState<String, String, String, Kind> {
     let mut graph = GraphState::default();
-    for index in 0..COLUMNS * ROWS {
+    for index in 0..columns * rows {
         let id = format!("n{index}");
         let position = Point::new(
-            (index % COLUMNS) as f32 * pitch.0,
-            (index / COLUMNS) as f32 * pitch.1,
+            (index % columns) as f32 * pitch.0,
+            (index / columns) as f32 * pitch.1,
         );
         graph.nodes.insert(
             id.clone(),
@@ -62,7 +73,7 @@ fn large_graph(zoom: f32, pitch: (f32, f32)) -> GraphState<String, String, Strin
                 );
             }
         }
-        if index % COLUMNS != 0 {
+        if index % columns != 0 {
             let source = format!("n{}:out0", index - 1);
             let connection = format!("c{index}");
             graph.connections.insert(
@@ -120,32 +131,40 @@ impl Body {
     }
 }
 
+type Editor = NodeGraph<Kind, String, String, String>;
+
+fn editor(
+    graph: GraphState<String, String, String, Kind>,
+    body: Body,
+    cx: &mut gpui::Context<Editor>,
+) -> Editor {
+    let editor = NodeGraph::new(graph, cx);
+    match body {
+        Body::Default => editor,
+        Body::Custom => editor.with_node_body_renderer(
+            |context: NodeBodyContext<Kind, String, String, String>,
+             _: &mut gpui::Window,
+             _: &mut gpui::App| {
+                NodeBody::new(
+                    div()
+                        .h(graph_px(100.0))
+                        .child(context.field("Gain", div().child("0.50")))
+                        .child(context.body_section(
+                            div().child(context.field("Mode", div().child("Linear"))),
+                        )),
+                )
+            },
+        ),
+    }
+}
+
 fn measure(cx: &mut gpui::TestAppContext, zoom: f32, pitch: (f32, f32), body: Body) {
     cx.update(|cx| {
         gpui_node_graph::init(cx);
         gpui_node_graph::set_node_graph_theme(cx, NodeGraphTheme::dark());
     });
     let graph = large_graph(zoom, pitch);
-    let (editor, cx) = cx.add_window_view(move |_, cx| {
-        let editor = NodeGraph::new(graph, cx);
-        match body {
-            Body::Default => editor,
-            Body::Custom => editor.with_node_body_renderer(
-                |context: NodeBodyContext<Kind, String, String, String>,
-                 _: &mut gpui::Window,
-                 _: &mut gpui::App| {
-                    NodeBody::new(
-                        div()
-                            .h(graph_px(100.0))
-                            .child(context.field("Gain", div().child("0.50")))
-                            .child(context.body_section(
-                                div().child(context.field("Mode", div().child("Linear"))),
-                            )),
-                    )
-                },
-            ),
-        }
-    });
+    let (editor, cx) = cx.add_window_view(move |_, cx| editor(graph, body, cx));
     cx.run_until_parked();
     for _ in 0..5 {
         draw(cx);
@@ -194,4 +213,82 @@ fn frame_cost_500_overlapping_nodes_visible(cx: &mut gpui::TestAppContext) {
 #[ignore = "benchmark"]
 fn frame_cost_500_custom_body_nodes_visible(cx: &mut gpui::TestAppContext) {
     measure(cx, 0.3, SPARSE_PITCH, Body::Custom);
+}
+
+/// Pan (middle drag over blank canvas), wheel zoom and a card drag, each one
+/// input event plus a full frame, on 200 visible cards with wires.
+fn measure_interactions(cx: &mut gpui::TestAppContext, body: Body) {
+    cx.update(|cx| {
+        gpui_node_graph::init(cx);
+        gpui_node_graph::set_node_graph_theme(cx, NodeGraphTheme::dark());
+    });
+    let zoom = 0.4;
+    let graph = grid_graph(zoom, SPARSE_PITCH, INTERACTION_GRID);
+    let (_, cx) = cx.add_window_view(move |_, cx| editor(graph, body, cx));
+    cx.run_until_parked();
+    for _ in 0..5 {
+        draw(cx);
+    }
+    let none = Modifiers::default();
+    let suffix = body.suffix();
+
+    let header = point(px(80.0 * zoom), px(12.0 * zoom));
+    cx.simulate_mouse_down(header, MouseButton::Left, none);
+    let drag = (0..120)
+        .map(|frame| {
+            let step = (frame % 40) as f32;
+            cx.simulate_mouse_move(
+                header + point(px(step * 4.0), px(step * 2.0)),
+                MouseButton::Left,
+                none,
+            );
+            draw(cx)
+        })
+        .collect();
+    cx.simulate_mouse_up(header, MouseButton::Left, none);
+    report(&format!("200 nodes{suffix}: card drag + redraw"), drag);
+
+    let blank = point(px(190.0 * zoom), px(120.0 * zoom));
+    cx.simulate_mouse_down(blank, MouseButton::Middle, none);
+    let pan = (0..120)
+        .map(|frame| {
+            let step = (frame % 40) as f32 - 20.0;
+            cx.simulate_mouse_move(
+                blank + point(px(step * 3.0), px(step * 2.0)),
+                MouseButton::Middle,
+                none,
+            );
+            draw(cx)
+        })
+        .collect();
+    cx.simulate_mouse_up(blank, MouseButton::Middle, none);
+    report(&format!("200 nodes{suffix}: pan + redraw"), pan);
+
+    let zoom_frames = (0..120)
+        .map(|frame| {
+            let direction = if (frame / 10) % 2 == 0 { 40.0 } else { -40.0 };
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(400.0), px(300.0)),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(direction))),
+                ..Default::default()
+            });
+            draw(cx)
+        })
+        .collect();
+    report(
+        &format!("200 nodes{suffix}: wheel zoom + redraw"),
+        zoom_frames,
+    );
+}
+
+#[gpui::test]
+#[ignore = "benchmark"]
+fn frame_cost_200_nodes_pan_zoom_drag(cx: &mut gpui::TestAppContext) {
+    measure_interactions(cx, Body::Default);
+}
+
+#[gpui::test]
+#[ignore = "benchmark"]
+fn frame_cost_200_custom_body_nodes_pan_zoom_drag(cx: &mut gpui::TestAppContext) {
+    measure_interactions(cx, Body::Custom);
 }
