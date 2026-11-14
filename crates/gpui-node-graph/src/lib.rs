@@ -2155,6 +2155,15 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                     if !engage && !menu {
                         continue;
                     }
+                    let local = down_graph
+                        .read_with(cx, |this, _| {
+                            let at = this.local_screen(event.position);
+                            this.port_covered_at(id, at)
+                        })
+                        .unwrap_or(false);
+                    if local {
+                        continue;
+                    }
                     cx.stop_propagation();
                     window.prevent_default();
                     let _ = down_graph.update(cx, |this, cx| {
@@ -2177,6 +2186,14 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                     if !(dot.is_hovered(window) || (draft_active && row.is_hovered(window))) {
                         continue;
                     }
+                    let covered = graph
+                        .read_with(cx, |this, _| {
+                            this.port_covered_at(id, this.local_screen(event.position))
+                        })
+                        .unwrap_or(false);
+                    if covered {
+                        continue;
+                    }
                     cx.stop_propagation();
                     let _ = graph.update(cx, |this, cx| {
                         if this.draft.as_ref().is_some_and(|draft| &draft.origin != id) {
@@ -2193,6 +2210,92 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
     )
     .absolute()
     .size_full()
+}
+
+/// Card rectangles bucketed by world-space cell, each tagged with its stacking
+/// index, so asking what lies above a port tests the few cards near it instead
+/// of every card.
+type CellBuild = std::hash::BuildHasherDefault<CellHasher>;
+
+#[derive(Default)]
+struct CardGrid {
+    cells: HashMap<(i32, i32), Vec<(usize, core::Rect)>, CellBuild>,
+    /// Set once two cards share a cell and overlap; until then nothing is covered.
+    overlapping: bool,
+}
+
+/// Whether two rectangles share any point, edges included, as `Rect::contains`
+/// counts them.
+fn touches(a: &core::Rect, b: &core::Rect) -> bool {
+    a.origin.x <= b.origin.x + b.size.width
+        && b.origin.x <= a.origin.x + a.size.width
+        && a.origin.y <= b.origin.y + b.size.height
+        && b.origin.y <= a.origin.y + a.size.height
+}
+
+/// Multiplicative hash for the small integer cell keys; SipHash dominated
+/// the per-frame cost of this grid.
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl std::hash::Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.write_u64(value as u32 as u64);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl CardGrid {
+    const CELL: f32 = 128.0;
+
+    fn cell(value: f32) -> i32 {
+        (value / Self::CELL).floor() as i32
+    }
+
+    /// Cards must be inserted bottom first.
+    fn insert(&mut self, z: usize, card: core::Rect) {
+        let (x0, x1) = (
+            Self::cell(card.origin.x),
+            Self::cell(card.origin.x + card.size.width),
+        );
+        let (y0, y1) = (
+            Self::cell(card.origin.y),
+            Self::cell(card.origin.y + card.size.height),
+        );
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                let cell = self.cells.entry((x, y)).or_default();
+                self.overlapping |= cell.iter().any(|(_, other)| touches(other, &card));
+                cell.push((z, card));
+            }
+        }
+    }
+
+    /// Whether a card stacked above `z` holds `point`.
+    fn covers(&self, z: usize, point: core::Point) -> bool {
+        self.overlapping
+            && self
+                .cells
+                .get(&(Self::cell(point.x), Self::cell(point.y)))
+                .is_some_and(|cards| {
+                    cards
+                        .iter()
+                        .any(|(above, card)| *above > z && card.contains(point))
+                })
+    }
 }
 
 /// A ring from a node card's edge out to `width`: a centred zero-blur
@@ -2792,7 +2895,23 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .iter()
             .any(|connection| connection.source == *port_id || connection.target == *port_id);
         if live.is_empty() && !has_broken {
-            return Vec::new();
+            return ["Disconnect all", "Remove broken connections"]
+                .into_iter()
+                .zip([
+                    AnchorMenuAction::RemoveConnections,
+                    AnchorMenuAction::RemoveBrokenConnections,
+                ])
+                .map(|(label, action)| {
+                    (
+                        AnchorMenuItem {
+                            label: label.into(),
+                            action,
+                            enabled: false,
+                        },
+                        None,
+                    )
+                })
+                .collect();
         }
         let mut items = vec![(
             AnchorMenuItem {
@@ -4464,9 +4583,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn node_at_screen(&self, screen: core::Point) -> Option<N> {
         let world = self.graph.viewport.screen_to_world(screen);
-        let mut nodes: Vec<_> = self.graph.nodes.values().collect();
-        nodes.sort_by_cached_key(|node| format!("{:?}", node.id));
-        nodes.into_iter().rev().find_map(|node| {
+        self.stack_order().into_iter().rev().find_map(|node| {
             core::Rect {
                 origin: node.position,
                 size: self.resolved_node_size(&node.id).unwrap_or(node.size),
@@ -4608,23 +4725,94 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         cx.notify();
     }
 
+    /// Every node, bottom card first: background types under the rest, then by
+    /// id. Card paint order and every pointer pick derive from this one order.
+    fn stack_order(&self) -> Vec<&Node<N>> {
+        let mut nodes: Vec<_> = self.graph.nodes.values().collect();
+        nodes.sort_by_cached_key(|node| {
+            (
+                node_paint_rank(&self.background_node_types, &node.node_type),
+                format!("{:?}", node.id),
+            )
+        });
+        nodes
+    }
+
+    /// True when a card stacked above `port`'s card holds the screen point, so
+    /// the port is hidden there as a Leptos socket inside its card would be.
+    fn port_covered_at(&self, port: &P, screen: core::Point) -> bool {
+        let Some(owner) = self.graph.ports.get(port).map(|port| &port.node) else {
+            return false;
+        };
+        let world = self.graph.viewport.screen_to_world(screen);
+        self.stack_order()
+            .into_iter()
+            .rev()
+            .take_while(|node| &node.id != owner)
+            .any(|node| {
+                core::Rect {
+                    origin: node.position,
+                    size: self.resolved_node_size(&node.id).unwrap_or(node.size),
+                }
+                .contains(world)
+            })
+    }
+
+    /// The port under `screen` within `radius`: nearest wins; a tie goes to the
+    /// port stacked last (upper card, then greatest id), never to map order.
     fn port_at_screen(&self, screen: core::Point, radius: f32) -> Option<P> {
-        self.graph
+        let mut near: Vec<_> = self
+            .graph
             .ports
             .keys()
             .filter_map(|id| {
                 let position = self.resolved_port_position(id)?;
                 let screen_position = self.graph.viewport.world_to_screen(position);
                 let distance = screen_position.distance(screen);
-                (distance <= radius).then(|| (id.clone(), distance))
+                (distance <= radius).then_some((id, distance))
             })
-            .min_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(id, _)| id)
+            .collect();
+        if near.is_empty() {
+            return None;
+        }
+        let z: HashMap<&N, usize> = self
+            .stack_order()
+            .into_iter()
+            .enumerate()
+            .map(|(z, node)| (&node.id, z))
+            .collect();
+        let z_of = |id: &P| self.graph.ports.get(id).and_then(|port| z.get(&port.node));
+        let top = self
+            .node_at_screen(screen)
+            .and_then(|node| z.get(&node).copied());
+        near.retain(|(id, _)| top.is_none_or(|top| z_of(id).is_none_or(|z| *z >= top)));
+        near.into_iter()
+            .min_by(|(left, ld), (right, rd)| {
+                ld.total_cmp(rd)
+                    .then_with(|| z_of(right).cmp(&z_of(left)))
+                    .then_with(|| format!("{right:?}").cmp(&format!("{left:?}")))
+            })
+            .map(|(id, _)| id.clone())
     }
 
     fn nearest_compatible_port(&self, origin: &P, cursor: core::Point) -> Option<P> {
+        let z: HashMap<&N, usize> = self
+            .stack_order()
+            .into_iter()
+            .enumerate()
+            .map(|(z, node)| (&node.id, z))
+            .collect();
         let mut ports: Vec<_> = self.graph.ports.keys().collect();
-        ports.sort_by_cached_key(|id| format!("{id:?}"));
+        ports.sort_by_cached_key(|id| {
+            (
+                self.graph
+                    .ports
+                    .get(*id)
+                    .and_then(|port| z.get(&port.node))
+                    .copied(),
+                format!("{id:?}"),
+            )
+        });
         let mut nearest: Option<(P, f32)> = None;
         for id in ports {
             if id == origin || self.normalized_connection(origin, id).is_none() {
@@ -4636,7 +4824,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 .world_to_screen(self.resolved_port_position(id)?);
             let distance = screen.distance(cursor);
             if distance <= self.config.snap_distance
-                && nearest.as_ref().is_none_or(|(_, best)| distance < *best)
+                && nearest.as_ref().is_none_or(|(_, best)| distance <= *best)
             {
                 nearest = Some((id.clone(), distance));
             }
@@ -7490,6 +7678,22 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 format!("{:?}", node.id),
             )
         });
+        let node_z: HashMap<N, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(z, node)| (node.id.clone(), z))
+            .collect();
+        let mut port_order: Vec<(usize, P)> = Vec::new();
+        let mut card_grid = CardGrid::default();
+        for (z, node) in nodes.iter().enumerate() {
+            card_grid.insert(
+                z,
+                core::Rect {
+                    origin: node.position,
+                    size: self.resolved_node_size(&node.id).unwrap_or(node.size),
+                },
+            );
+        }
         for mut node in nodes {
             let background_node = self.background_node_types.contains(&node.node_type);
             if !background_node && let Some(connection_layer) = wire_layer.take() {
@@ -7528,6 +7732,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             } else {
                 ports.sort_by_cached_key(|port| format!("{:?}", port.id));
             }
+            let z = node_z[&id];
+            port_order.extend(ports.iter().map(|port| (z, port.id.clone())));
             let port_states: Arc<HashMap<P, WorldPortVisualState>> = Arc::new(
                 ports
                     .iter()
@@ -8252,7 +8458,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let mut default_port_scene = world::WorldScene::new();
         let mut port_chrome = Vec::new();
         let mut port_probes = Vec::new();
-        for port in self.graph.ports.values() {
+        for (z, port_id) in &port_order {
+            let Some(port) = self.graph.ports.get(port_id) else {
+                continue;
+            };
             if body_anchored_nodes.contains(&port.node) || culled_nodes.contains(&port.node) {
                 continue;
             }
@@ -8260,6 +8469,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let world_position = self
                 .resolved_port_position(&port.id)
                 .unwrap_or(port.position);
+            if card_grid.covers(*z, world_position) {
+                continue;
+            }
             let position = viewport.world_to_screen(world_position);
             let connected = connected_ports.contains(&port.id);
             let is_source = self
@@ -10897,6 +11109,93 @@ mod tests {
                 "right-clicking a connected port's {via} opens its menu"
             );
         }
+    }
+
+    #[gpui::test]
+    fn a_socket_under_an_upper_card_takes_no_press(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let mut graph = interactive_graph();
+        graph.connections.clear();
+        graph.nodes.get_mut("b").unwrap().position = core::Point::new(30.0, 0.0);
+        graph.ports.get_mut("in").unwrap().position = core::Point::new(30.0, 25.0);
+        let (editor, cx) = cx.add_window_view(move |_, _| NodeGraph::new_for_test(graph));
+        cx.run_until_parked();
+        let none = gpui::Modifiers::default();
+
+        let covered = port_screen(&editor, cx, "out");
+        cx.simulate_mouse_down(covered, MouseButton::Left, none);
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.draft.is_none(),
+                "a socket covered by an upper card must not start a connection"
+            );
+            assert!(
+                editor.graph.selected_nodes.contains("b"),
+                "the press lands on the upper card"
+            );
+        });
+        cx.simulate_mouse_up(covered, MouseButton::Left, none);
+
+        let upper = port_screen(&editor, cx, "in");
+        cx.simulate_mouse_down(upper, MouseButton::Left, none);
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(
+                editor.draft.as_ref().map(|draft| draft.origin.as_str()),
+                Some("in"),
+                "the upper card's own socket still engages"
+            );
+        });
+    }
+
+    fn overlapping_ports_graph() -> GraphState<String, String, String, Kind> {
+        let mut graph = interactive_graph();
+        graph.connections.clear();
+        for id in ["p1", "p2", "p3"] {
+            graph.ports.insert(
+                id.into(),
+                Port {
+                    id: id.into(),
+                    node: "a".into(),
+                    label: id.into(),
+                    direction: PortDirection::Output,
+                    kind: Kind,
+                    position: core::Point::new(20.0, 40.0),
+                },
+            );
+        }
+        graph
+    }
+
+    #[test]
+    fn overlapping_ports_resolve_to_the_same_winner_every_time() {
+        for _ in 0..48 {
+            let editor = NodeGraph::new_for_test(overlapping_ports_graph());
+            assert_eq!(
+                editor.port_at_screen(core::Point::new(20.0, 40.0), 6.0),
+                Some("p3".to_string()),
+                "the last port in stacking order wins a tie"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn right_clicking_an_unconnected_port_opens_a_menu_of_disabled_items(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let mut graph = interactive_graph();
+        graph.connections.clear();
+        let (editor, cx) = cx.add_window_view(move |_, _| NodeGraph::new_for_test(graph));
+        cx.run_until_parked();
+        let items = editor.read_with(cx, |editor, _| editor.anchor_menu_items(&"out".into()));
+        assert!(!items.is_empty(), "0.2.2 offers its items even when idle");
+        assert!(items.iter().all(|item| !item.enabled));
+        let at = port_screen(&editor, cx, "out");
+        cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::default());
+        assert!(editor.read_with(cx, |editor, _| editor.anchor_menu_is_open()));
     }
 
     #[gpui::test]
