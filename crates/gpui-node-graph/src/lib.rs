@@ -715,16 +715,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
             .flex()
             .items_center()
             .gap(graph_px(self.theme.node.field_gap))
-            .child(
-                div()
-                    .min_w(graph_px(self.theme.node.field_label_min_width))
-                    .text_size(graph_px(self.theme.node.field_label_font_size))
-                    .line_height(graph_px(normal_line_height(
-                        self.theme.node.field_label_font_size,
-                    )))
-                    .text_color(rgb(label_color.rgb).opacity(label_color.alpha))
-                    .child(SharedString::from(label.into().to_uppercase())),
-            )
+            .child(FieldLabel {
+                text: label.into().to_uppercase().into(),
+                style: gpui::TextStyleRefinement {
+                    font_size: Some(graph_px(self.theme.node.field_label_font_size).into()),
+                    line_height: Some(
+                        graph_px(normal_line_height(self.theme.node.field_label_font_size)).into(),
+                    ),
+                    color: Some(rgb(label_color.rgb).opacity(label_color.alpha).into()),
+                    ..Default::default()
+                },
+                min_width: graph_px(self.theme.node.field_label_min_width),
+                lines: Rc::default(),
+                line_height: Pixels::ZERO,
+                text_align: TextAlign::Left,
+            })
             .child(control)
             .into_any_element()
     }
@@ -1964,6 +1969,138 @@ impl Element for NodeScaleElement {
 }
 
 impl IntoElement for NodeScaleElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// A field row's label as one measured leaf: what a `min_w` div around a text
+/// child lays out and paints, without the div's layout node and style pass.
+/// The text style is resolved when layout is requested, inside the card's
+/// rem scope, as a text element resolves its own.
+struct FieldLabel {
+    text: SharedString,
+    style: gpui::TextStyleRefinement,
+    min_width: gpui::Rems,
+    lines: Rc<RefCell<Vec<gpui::WrappedLine>>>,
+    line_height: Pixels,
+    text_align: TextAlign,
+}
+
+impl Element for FieldLabel {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let text_style =
+            window.with_text_style(Some(self.style.clone()), |window| window.text_style());
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let line_height = window.pixel_snap(
+            text_style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size()),
+        );
+        self.line_height = line_height;
+        self.text_align = text_style.text_align;
+        let mut style = gpui::Style::default();
+        style.min_size.width = self.min_width.into();
+        let text = self.text.clone();
+        let runs = [text_style.to_run(text.len())];
+        let lines = Rc::clone(&self.lines);
+        let layout_id =
+            window.request_measured_layout(style, move |known, available, window, _| {
+                let wrap_width = (text_style.white_space == gpui::WhiteSpace::Normal)
+                    .then(|| {
+                        known.width.or(match available.width {
+                            gpui::AvailableSpace::Definite(width) => Some(width),
+                            _ => None,
+                        })
+                    })
+                    .flatten();
+                let shaped = window
+                    .text_system()
+                    .shape_text(
+                        text.clone(),
+                        font_size,
+                        &runs,
+                        wrap_width,
+                        text_style.line_clamp,
+                    )
+                    .map(|lines| lines.into_iter().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let mut size = gpui::Size::<Pixels>::default();
+                for line in &shaped {
+                    let line_size = line.size(line_height);
+                    size.height += line_size.height;
+                    size.width = size.width.max(line_size.width).ceil();
+                }
+                *lines.borrow_mut() = shaped;
+                size
+            });
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let mut origin = bounds.origin;
+        for line in self.lines.borrow().iter() {
+            let _ = line.paint_background(
+                origin,
+                self.line_height,
+                self.text_align,
+                Some(bounds),
+                window,
+                cx,
+            );
+            let _ = line.paint(
+                origin,
+                self.line_height,
+                self.text_align,
+                Some(bounds),
+                window,
+                cx,
+            );
+            origin.y += line.size(self.line_height).height;
+        }
+    }
+}
+
+impl IntoElement for FieldLabel {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
