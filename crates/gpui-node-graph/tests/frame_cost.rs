@@ -93,12 +93,20 @@ fn grid_graph(
     graph
 }
 
-fn draw(cx: &mut VisualTestContext) -> Duration {
-    let start = Instant::now();
+fn draw(cx: &mut VisualTestContext) {
     cx.update(|window, cx| {
         let arena = window.draw(cx);
         arena.clear(cx)
     });
+}
+
+/// Time one input (or notify) and the frame it causes. A test-support app
+/// draws every dirty window when it flushes effects, so the frame is drawn
+/// inside `input`; drawing again afterwards would time a second frame with
+/// every cache warm instead of the real one.
+fn timed_frame(cx: &mut VisualTestContext, input: impl FnOnce(&mut VisualTestContext)) -> Duration {
+    let start = Instant::now();
+    input(cx);
     start.elapsed()
 }
 
@@ -171,18 +179,16 @@ fn measure(cx: &mut gpui::TestAppContext, zoom: f32, pitch: (f32, f32), body: Bo
     }
 
     let idle = (0..60)
-        .map(|_| {
-            editor.update(cx, |_, cx| cx.notify());
-            draw(cx)
-        })
+        .map(|_| timed_frame(cx, |cx| editor.update(cx, |_, cx| cx.notify())))
         .collect();
     report(&format!("zoom {zoom}{}: full redraw", body.suffix()), idle);
 
     let hover = (0..60)
         .map(|frame| {
             let x = 20.0 + (frame % 30) as f32 * 9.0;
-            cx.simulate_mouse_move(point(px(x), px(15.0)), None, Modifiers::default());
-            draw(cx)
+            timed_frame(cx, |cx| {
+                cx.simulate_mouse_move(point(px(x), px(15.0)), None, Modifiers::default())
+            })
         })
         .collect();
     report(
@@ -237,12 +243,13 @@ fn measure_interactions(cx: &mut gpui::TestAppContext, body: Body) {
     let drag = (0..120)
         .map(|frame| {
             let step = (frame % 40) as f32;
-            cx.simulate_mouse_move(
-                header + point(px(step * 4.0), px(step * 2.0)),
-                MouseButton::Left,
-                none,
-            );
-            draw(cx)
+            timed_frame(cx, |cx| {
+                cx.simulate_mouse_move(
+                    header + point(px(step * 4.0), px(step * 2.0)),
+                    MouseButton::Left,
+                    none,
+                )
+            })
         })
         .collect();
     cx.simulate_mouse_up(header, MouseButton::Left, none);
@@ -253,12 +260,13 @@ fn measure_interactions(cx: &mut gpui::TestAppContext, body: Body) {
     let pan = (0..120)
         .map(|frame| {
             let step = (frame % 40) as f32 - 20.0;
-            cx.simulate_mouse_move(
-                blank + point(px(step * 3.0), px(step * 2.0)),
-                MouseButton::Middle,
-                none,
-            );
-            draw(cx)
+            timed_frame(cx, |cx| {
+                cx.simulate_mouse_move(
+                    blank + point(px(step * 3.0), px(step * 2.0)),
+                    MouseButton::Middle,
+                    none,
+                )
+            })
         })
         .collect();
     cx.simulate_mouse_up(blank, MouseButton::Middle, none);
@@ -267,12 +275,13 @@ fn measure_interactions(cx: &mut gpui::TestAppContext, body: Body) {
     let zoom_frames = (0..120)
         .map(|frame| {
             let direction = if (frame / 10) % 2 == 0 { 40.0 } else { -40.0 };
-            cx.simulate_event(ScrollWheelEvent {
-                position: point(px(400.0), px(300.0)),
-                delta: ScrollDelta::Pixels(point(px(0.0), px(direction))),
-                ..Default::default()
-            });
-            draw(cx)
+            timed_frame(cx, |cx| {
+                cx.simulate_event(ScrollWheelEvent {
+                    position: point(px(400.0), px(300.0)),
+                    delta: ScrollDelta::Pixels(point(px(0.0), px(direction))),
+                    ..Default::default()
+                })
+            })
         })
         .collect();
     report(
