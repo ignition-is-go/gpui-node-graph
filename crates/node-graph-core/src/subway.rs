@@ -2137,4 +2137,114 @@ mod tests {
         assert!(stats.budget_fallbacks > 0);
         assert_eq!(stats.routed + stats.fallbacks(), connections.len());
     }
+
+    /// The parity fixture's routes (`parity/fixture.rs`, idle, both themes) as
+    /// leptos-node-graph 0.2.2's `compute_subway_routes_with_stats` returns
+    /// them, run natively on the same rects and anchors in Leptos's rect order
+    /// (calc, sink, src).
+    #[test]
+    fn parity_fixture_routes_match_leptos_node_graph_0_2_2() {
+        let rect = |x, y, w, h| Rect {
+            origin: p(x, y),
+            size: crate::Size {
+                width: w,
+                height: h,
+            },
+        };
+        let wire = |start: Point, end: Point, start_obstacle, end_obstacle| SubwayConnection {
+            start,
+            end,
+            start_obstacle,
+            end_obstacle,
+        };
+        let cases = [
+            (
+                "scene",
+                [
+                    rect(330.0, 70.0, 256.0, 88.0),
+                    rect(640.0, 40.0, 256.0, 46.0),
+                    rect(40.0, 40.0, 256.0, 68.0),
+                ],
+                [
+                    wire(p(286.0, 76.0), p(340.0, 106.0), Some(2), Some(0)),
+                    wire(p(576.0, 146.0), p(650.0, 74.0), Some(0), Some(1)),
+                ],
+                [
+                    vec![
+                        p(286.0, 76.0),
+                        p(312.0, 76.0),
+                        p(312.0, 106.0),
+                        p(340.0, 106.0),
+                    ],
+                    vec![
+                        p(576.0, 146.0),
+                        p(602.0, 146.0),
+                        p(602.0, 74.0),
+                        p(650.0, 74.0),
+                    ],
+                ],
+            ),
+            (
+                "default",
+                [
+                    rect(330.0, 70.0, 160.0, 87.0),
+                    rect(640.0, 40.0, 160.0, 61.0),
+                    rect(40.0, 40.0, 160.0, 87.0),
+                ],
+                [
+                    wire(p(185.0, 86.0), p(345.0, 116.0), Some(2), Some(0)),
+                    wire(p(475.0, 116.0), p(655.0, 84.0), Some(0), Some(1)),
+                ],
+                [
+                    vec![
+                        p(185.0, 86.0),
+                        p(216.0, 86.0),
+                        p(216.0, 116.0),
+                        p(345.0, 116.0),
+                    ],
+                    vec![
+                        p(475.0, 116.0),
+                        p(506.0, 116.0),
+                        p(506.0, 84.0),
+                        p(655.0, 84.0),
+                    ],
+                ],
+            ),
+            // The reference harness once registered every port under its last
+            // node; 0.2.2 then wrapped c2 out of calc's left side. Same router,
+            // same inputs, same detour.
+            (
+                "every port owned by sink",
+                [
+                    rect(330.0, 70.0, 256.0, 88.0),
+                    rect(640.0, 40.0, 256.0, 46.0),
+                    rect(40.0, 40.0, 256.0, 68.0),
+                ],
+                [
+                    wire(p(286.0, 76.0), p(340.0, 106.0), Some(1), Some(1)),
+                    wire(p(576.0, 146.0), p(650.0, 74.0), Some(1), Some(1)),
+                ],
+                [
+                    vec![
+                        p(286.0, 76.0),
+                        p(308.5, 76.0),
+                        p(308.5, 106.0),
+                        p(340.0, 106.0),
+                    ],
+                    vec![
+                        p(576.0, 146.0),
+                        p(551.5, 146.0),
+                        p(551.5, 174.0),
+                        p(608.0, 174.0),
+                        p(608.0, 74.0),
+                        p(650.0, 74.0),
+                    ],
+                ],
+            ),
+        ];
+        for (name, rects, connections, expected) in cases {
+            let routes = compute_subway_routes(&rects, &connections, &SubwayOptions::default());
+            assert_eq!(routes, expected, "{name}");
+        }
+    }
 }
