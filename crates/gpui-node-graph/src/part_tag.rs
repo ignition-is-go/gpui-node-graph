@@ -15,6 +15,7 @@
 //! | `node-graph.node-header:<node>` | the default chrome's header row |
 //! | `node-graph.port:<port>` | a port socket, sized to the theme's dot |
 //! | `node-graph.wire:<connection>` | the bounding box of a wire's route |
+//! | `node-graph.wire-point:<connection>.<n>` | the route's `n`th vertex, as a zero-size box |
 //!
 //! Offscreen nodes are culled, so their parts are absent from a frame.
 

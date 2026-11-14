@@ -8111,6 +8111,13 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 root = root.child(part_tag::tag(tagger, probe, || {
                     part_tag::part_id("wire", &connection.id)
                 }));
+                for (index, point) in projected.iter().enumerate() {
+                    let vertex = div().absolute().left(px(point.x)).top(px(point.y));
+                    root = root.child(part_tag::tag(tagger, vertex, || {
+                        let wire = part_tag::part_id("wire-point", &connection.id);
+                        format!("{wire}.{index}").into()
+                    }));
+                }
             }
         }
 
@@ -10427,6 +10434,8 @@ mod tests {
             "node-graph.port:out",
             "node-graph.port:in",
             "node-graph.wire:wire",
+            "node-graph.wire-point:wire.0",
+            "node-graph.wire-point:wire.1",
         ] {
             assert!(parts.contains(id), "{id} missing from {parts:?}");
         }

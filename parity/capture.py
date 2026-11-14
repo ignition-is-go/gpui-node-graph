@@ -6,6 +6,11 @@
 the GPUI gallery, replay the same input on both in headless Chromium, and
 report geometry and pixel differences per interaction state.
 
+Wires are compared as screen-space polylines: the reference's routed SVG path
+(corner control points are the vertices) against GPUI's tagged route vertices,
+by their endpoints and by the largest distance between points sampled at equal
+arc-length steps along each.
+
     (cd parity/gallery && trunk build)
     (cd parity/reference && RUSTFLAGS=--cfg=parity_reference trunk build)
     uv run parity/capture.py [--theme scene|default] [state ...]
@@ -13,7 +18,8 @@ report geometry and pixel differences per interaction state.
 The reference build sets RUSTFLAGS so it does not inherit the repo's wasm
 thread flags. Nothing opens on a display. Writes parity/out/<theme>-<state>.png
 (reference | gpui | diff x4) and prints, per state, the largest socket-centre
-and node-card offsets between the two renderings and the pixel difference.
+and node-card offsets, the wire endpoint and path offsets, and the pixel
+difference.
 """
 
 import argparse
@@ -43,6 +49,8 @@ PORTS = {
     "In": "sink:in",
 }
 NODES = ["src", "calc", "sink"]
+CONNECTIONS = ["c1", "c2"]
+SAMPLES = 64
 
 
 def header(g, node):
@@ -111,7 +119,7 @@ def replay(page, steps, geometry):
         page.wait_for_timeout(150)
 
 
-REFERENCE_GEOMETRY = """() => {
+REFERENCE_GEOMETRY = r"""() => {
   const center = (r) => [r.x + r.width / 2, r.y + r.height / 2];
   const nodes = {}, ports = {}, headers = {};
   const ids = %s;
@@ -127,13 +135,32 @@ REFERENCE_GEOMETRY = """() => {
     const d = row.querySelector('[data-anchor-dot]');
     if (port && d) ports[port] = center(d.getBoundingClientRect());
   });
-  return {nodes, ports, headers};
-}""" % (json.dumps(NODES), json.dumps(PORTS))
+  // A routed wire is `M` then `L` runs joined by `Q` corners whose control
+  // point is the polyline vertex; keep M, each control point, and the end.
+  // `<For>` renders connections in id order; a dangling one has no attribute.
+  const wires = {};
+  const conns = %s;
+  document.querySelectorAll('path[data-connection]').forEach((path, i) => {
+    const m = path.getScreenCTM();
+    const nums = (path.getAttribute('d').match(/[MLQ][^MLQ]*/g) || []).map((seg) =>
+      [seg[0], seg.slice(1).trim().split(/[\s,]+/).map(Number)]);
+    const pts = [];
+    nums.forEach(([cmd, n], j) => {
+      if (cmd === 'M' || cmd === 'Q') pts.push([n[0], n[1]]);
+      if (j === nums.length - 1) pts.push(n.slice(-2));
+    });
+    wires[conns[i]] = pts.map(([x, y]) => {
+      const p = new DOMPoint(x, y).matrixTransform(m);
+      return [p.x, p.y];
+    });
+  });
+  return {nodes, ports, headers, wires};
+}""" % (json.dumps(NODES), json.dumps(PORTS), json.dumps(CONNECTIONS))
 
 
 def gpui_geometry(page):
     parts = json.loads(page.evaluate("() => globalThis.__nodeGraphParts()"))
-    nodes, ports, headers = {}, {}, {}
+    nodes, ports, headers, points = {}, {}, {}, {}
     for key, (x, y, w, h) in parts.items():
         kind, _, ident = key.removeprefix("node-graph.").partition(":")
         if kind == "node":
@@ -142,7 +169,11 @@ def gpui_geometry(page):
             headers[ident] = [x, y, w, h]
         elif kind == "port":
             ports[ident] = [x + w / 2, y + h / 2]
-    return {"nodes": nodes, "ports": ports, "headers": headers}
+        elif kind == "wire-point":
+            wire, _, index = ident.rpartition(".")
+            points.setdefault(wire, {})[int(index)] = [x, y]
+    wires = {wire: [p for _, p in sorted(vs.items())] for wire, vs in points.items()}
+    return {"nodes": nodes, "ports": ports, "headers": headers, "wires": wires}
 
 
 def capture(browser, url, steps, geometry, gpui, name):
@@ -187,6 +218,44 @@ def max_offset(ref, gpui, key, width):
     return worst, where
 
 
+def resample(points, n=SAMPLES):
+    """`n` points at equal arc-length steps along a polyline."""
+    lengths = [((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5 for a, b in zip(points, points[1:])]
+    total = sum(lengths)
+    if total == 0:
+        return [points[0]] * n
+    out, seg, walked = [], 0, 0.0
+    for k in range(n):
+        target = total * k / (n - 1)
+        while seg < len(lengths) - 1 and walked + lengths[seg] < target:
+            walked += lengths[seg]
+            seg += 1
+        t = 0 if lengths[seg] == 0 else min(1.0, (target - walked) / lengths[seg])
+        a, b = points[seg], points[seg + 1]
+        out.append([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t])
+    return out
+
+
+def wire_offsets(ref, gpui):
+    """Largest endpoint and along-path distance between matching wires."""
+    worst_end, end_at, worst_path, path_at = 0.0, "-", 0.0, "-"
+    for wire, a in ref["wires"].items():
+        b = gpui["wires"].get(wire)
+        if not b or len(a) < 2:
+            return (float("inf"), f"{wire} missing"), (float("inf"), f"{wire} missing")
+        dist = lambda p, q: ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2) ** 0.5
+        end = max(dist(a[0], b[0]), dist(a[-1], b[-1]))
+        path = max(dist(p, q) for p, q in zip(resample(a), resample(b)))
+        if end > worst_end:
+            worst_end, end_at = end, wire
+        if path > worst_path:
+            worst_path, path_at = path, wire
+    if set(gpui["wires"]) - set(ref["wires"]):
+        extra = sorted(set(gpui["wires"]) - set(ref["wires"]))[0]
+        return (float("inf"), f"{extra} extra"), (float("inf"), f"{extra} extra")
+    return (worst_end, end_at), (worst_path, path_at)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--theme", default="scene", choices=["scene", "default"])
@@ -220,12 +289,15 @@ def main():
             (OUT / f"{args.theme}-{name}.json").write_text(
                 json.dumps({"reference": ref_geo, "gpui": gpui_geo}, indent=1))
             rows.append((name, max_offset(ref_geo, gpui_geo, "ports", 2),
-                         max_offset(ref_geo, gpui_geo, "nodes", 4), mean, bad))
+                         max_offset(ref_geo, gpui_geo, "nodes", 4),
+                         *wire_offsets(ref_geo, gpui_geo), mean, bad))
         browser.close()
     print(f"theme {args.theme}")
-    print(f"{'state':12} {'socket max px':>22} {'card max px':>22} {'mean|d|':>8} {'px>32':>7}")
-    for name, (port, port_at), (node, node_at), mean, bad in rows:
-        print(f"{name:12} {port:9.2f} {port_at:>12} {node:9.2f} {node_at:>12} {mean:8.2f} {bad:7.2%}")
+    print(f"{'state':12} {'socket max px':>18} {'card max px':>18} {'wire end px':>14}"
+          f" {'wire path px':>14} {'mean|d|':>8} {'px>32':>7}")
+    for name, *offsets, mean, bad in rows:
+        cells = " ".join(f"{v:9.2f} {at:>{8 if i < 2 else 4}}" for i, (v, at) in enumerate(offsets))
+        print(f"{name:12} {cells} {mean:8.2f} {bad:7.2%}")
 
 
 if __name__ == "__main__":
