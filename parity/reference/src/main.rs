@@ -109,7 +109,11 @@ fn App() -> impl IntoView {
             _ => {}
         },
     );
-    let nodes = NODES.iter().map(|node| {
+    // One `<For>` row per node, as rship's scenes surface renders them: each
+    // row owns its reactive scope, so every `Node`'s `NodeContext` reaches only
+    // its own anchors. Sibling components in one scope would all resolve the
+    // last node's context and register every port under it.
+    let node_view = |node: &'static FixtureNode| {
         let position = RwSignal::new(Position::new(node.x as f64, node.y as f64));
         let title = node.title;
         let inputs = node.inputs;
@@ -131,7 +135,7 @@ fn App() -> impl IntoView {
                 }).collect_view()
             />
         }
-    });
+    };
     view! {
         <div style="position:absolute; inset:0;">
             <NodeEditor<String, String, String, Kind>
@@ -139,7 +143,7 @@ fn App() -> impl IntoView {
                 connections=Signal::derive(move || connections.get())
                 on_event=on_event
             >
-                {nodes.collect_view()}
+                <For each=|| NODES.iter() key=|node| node.id children=node_view />
             </NodeEditor<String, String, String, Kind>>
         </div>
     }
