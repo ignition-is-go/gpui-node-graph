@@ -1,0 +1,232 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright==1.56.0", "pillow"]
+# ///
+"""Render the shared fixture in the real leptos-node-graph 0.2.2 crate and in
+the GPUI gallery, replay the same input on both in headless Chromium, and
+report geometry and pixel differences per interaction state.
+
+    (cd parity/gallery && trunk build)
+    (cd parity/reference && RUSTFLAGS=--cfg=parity_reference trunk build)
+    uv run parity/capture.py [--theme scene|default] [state ...]
+
+The reference build sets RUSTFLAGS so it does not inherit the repo's wasm
+thread flags. Nothing opens on a display. Writes parity/out/<theme>-<state>.png
+(reference | gpui | diff x4) and prints, per state, the largest socket-centre
+and node-card offsets between the two renderings and the pixel difference.
+"""
+
+import argparse
+import functools
+import glob
+import http.server
+import json
+import os
+import socketserver
+import threading
+from pathlib import Path
+
+from PIL import Image, ImageChops
+from playwright.sync_api import sync_playwright
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE / "out"
+W, H = 960, 400
+
+# Port id by label, from parity/fixture.rs (labels are unique in the fixture).
+PORTS = {
+    "Value": "src:a_value",
+    "Trigger": "src:b_trigger",
+    "A": "calc:a",
+    "B": "calc:b",
+    "Out": "calc:out",
+    "In": "sink:in",
+}
+NODES = ["src", "calc", "sink"]
+
+
+def header(g, node):
+    x, y, w, _ = g["nodes"][node]
+    return (x + w / 2, y + 12)
+
+
+def dot(g, port):
+    return g["ports"][port]
+
+
+# A state is a list of steps; each step is a function of the reference's idle
+# geometry so both renderings receive the same viewport coordinates.
+STATES = {
+    "idle": [],
+    "hover-node": [lambda g: ("move", *header(g, "calc"))],
+    "selected": [lambda g: ("click", *header(g, "calc"))],
+    "hover-port": [lambda g: ("move", *dot(g, "src:a_value"))],
+    "draft": [
+        lambda g: ("down", *dot(g, "src:b_trigger")),
+        lambda g: ("move", 520, 330),
+    ],
+    "dragging": [
+        lambda g: ("down", *header(g, "calc")),
+        lambda g: ("move", header(g, "calc")[0] + 40, header(g, "calc")[1] + 60),
+    ],
+    "dragged": [
+        lambda g: ("down", *header(g, "calc")),
+        lambda g: ("move", header(g, "calc")[0] + 40, header(g, "calc")[1] + 60),
+        lambda g: ("up",),
+    ],
+    "zoomed": [lambda g: ("move", 400, 200), lambda g: ("wheel", 0, -100)],
+}
+
+
+def serve(directory: Path) -> int:
+    class Isolated(http.server.SimpleHTTPRequestHandler):
+        def end_headers(self):
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+            self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+            super().end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    handler = functools.partial(Isolated, directory=str(directory))
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server.server_address[1]
+
+
+def replay(page, steps, geometry):
+    for step in steps:
+        kind, *args = step(geometry)
+        if kind == "move":
+            page.mouse.move(*args, steps=8)
+        elif kind == "click":
+            page.mouse.click(*args)
+        elif kind == "down":
+            page.mouse.move(*args)
+            page.mouse.down()
+        elif kind == "up":
+            page.mouse.up()
+        elif kind == "wheel":
+            page.mouse.wheel(*args)
+        page.wait_for_timeout(150)
+
+
+REFERENCE_GEOMETRY = """() => {
+  const center = (r) => [r.x + r.width / 2, r.y + r.height / 2];
+  const nodes = {}, ports = {}, headers = {};
+  const ids = %s;
+  document.querySelectorAll('[data-node]').forEach((el, i) => {
+    const r = el.getBoundingClientRect();
+    nodes[ids[i]] = [r.x, r.y, r.width, r.height];
+    const h = el.querySelector('[data-node-header]').getBoundingClientRect();
+    headers[ids[i]] = [h.x, h.y, h.width, h.height];
+  });
+  const labels = %s;
+  document.querySelectorAll('[data-anchor]').forEach((row) => {
+    const port = labels[row.textContent.trim()];
+    const d = row.querySelector('[data-anchor-dot]');
+    if (port && d) ports[port] = center(d.getBoundingClientRect());
+  });
+  return {nodes, ports, headers};
+}""" % (json.dumps(NODES), json.dumps(PORTS))
+
+
+def gpui_geometry(page):
+    parts = json.loads(page.evaluate("() => globalThis.__nodeGraphParts()"))
+    nodes, ports, headers = {}, {}, {}
+    for key, (x, y, w, h) in parts.items():
+        kind, _, ident = key.removeprefix("node-graph.").partition(":")
+        if kind == "node":
+            nodes[ident] = [x, y, w, h]
+        elif kind == "node-header":
+            headers[ident] = [x, y, w, h]
+        elif kind == "port":
+            ports[ident] = [x + w / 2, y + h / 2]
+    return {"nodes": nodes, "ports": ports, "headers": headers}
+
+
+def capture(browser, url, steps, geometry, gpui, name):
+    page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=1)
+    page.goto(url)
+    if gpui:
+        page.wait_for_selector("canvas")
+        page.wait_for_function("() => typeof globalThis.__nodeGraphParts === 'function'")
+        page.wait_for_timeout(1500)
+    else:
+        page.wait_for_selector("body[data-ready]")
+        page.wait_for_timeout(300)
+    page.mouse.move(W - 1, H - 1)
+    replay(page, steps, geometry)
+    page.wait_for_timeout(400 if gpui else 100)
+    shot = OUT / f"tmp-{name}.png"
+    page.screenshot(path=str(shot))
+    measured = gpui_geometry(page) if gpui else page.evaluate(REFERENCE_GEOMETRY)
+    page.close()
+    return Image.open(shot).convert("RGB"), measured
+
+
+def pixel_diff(ref, gpui):
+    diff = ImageChops.difference(ref, gpui)
+    r, g, b = diff.split()
+    peak = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    hist = diff.histogram()
+    mean = sum(i * hist[c * 256 + i] for c in range(3) for i in range(256)) / (W * H * 3)
+    bad = peak.point(lambda v: 255 if v > 32 else 0).histogram()[255] / (W * H)
+    return mean, bad, diff
+
+
+def max_offset(ref, gpui, key, width):
+    worst, where = 0.0, "-"
+    for ident, a in ref[key].items():
+        b = gpui[key].get(ident)
+        if b is None:
+            return float("inf"), f"{ident} missing"
+        delta = max(abs(p - q) for p, q in zip(a[:width], b[:width]))
+        if delta > worst:
+            worst, where = delta, ident
+    return worst, where
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--theme", default="scene", choices=["scene", "default"])
+    parser.add_argument("states", nargs="*")
+    args = parser.parse_args()
+    OUT.mkdir(exist_ok=True)
+    ref_port = serve(HERE / "reference" / "dist")
+    gpui_port = serve(HERE / "gallery" / "dist")
+    query = f"?theme={args.theme}"
+    rows = []
+    with sync_playwright() as p:
+        shells = sorted(glob.glob(os.path.expanduser(
+            "~/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell")))
+        browser = p.chromium.launch(
+            executable_path=os.environ.get("PARITY_CHROMIUM") or (shells[-1] if shells else None),
+            args=["--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+                  "--enable-unsafe-webgpu", "--enable-features=Vulkan"],
+        )
+        _, idle = capture(browser, f"http://127.0.0.1:{ref_port}/index.html{query}", [], None, False, "ref")
+        for name, steps in STATES.items():
+            if args.states and name not in args.states:
+                continue
+            ref_img, ref_geo = capture(browser, f"http://127.0.0.1:{ref_port}/index.html{query}", steps, idle, False, "ref")
+            gpui_img, gpui_geo = capture(browser, f"http://127.0.0.1:{gpui_port}/index.html{query}", steps, idle, True, "gpui")
+            mean, bad, diff = pixel_diff(ref_img, gpui_img)
+            sheet = Image.new("RGB", (W, H * 3))
+            sheet.paste(ref_img, (0, 0))
+            sheet.paste(gpui_img, (0, H))
+            sheet.paste(diff.point(lambda v: min(255, v * 4)), (0, H * 2))
+            sheet.save(OUT / f"{args.theme}-{name}.png")
+            (OUT / f"{args.theme}-{name}.json").write_text(
+                json.dumps({"reference": ref_geo, "gpui": gpui_geo}, indent=1))
+            rows.append((name, max_offset(ref_geo, gpui_geo, "ports", 2),
+                         max_offset(ref_geo, gpui_geo, "nodes", 4), mean, bad))
+        browser.close()
+    print(f"theme {args.theme}")
+    print(f"{'state':12} {'socket max px':>22} {'card max px':>22} {'mean|d|':>8} {'px>32':>7}")
+    for name, (port, port_at), (node, node_at), mean, bad in rows:
+        print(f"{name:12} {port:9.2f} {port_at:>12} {node:9.2f} {node_at:>12} {mean:8.2f} {bad:7.2%}")
+
+
+if __name__ == "__main__":
+    main()

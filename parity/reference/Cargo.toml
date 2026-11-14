@@ -1,0 +1,12 @@
+[package]
+name = "node-graph-parity-reference"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+leptos-node-graph = "=0.2.2"
+web-sys = { version = "0.3", features = ["Location"] }
