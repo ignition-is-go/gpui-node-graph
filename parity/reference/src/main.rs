@@ -5,8 +5,9 @@ use std::{collections::HashMap, marker::PhantomData};
 
 use leptos::prelude::*;
 use leptos_node_graph::{
-    AnchorLayout, AnchorStyle, ConnectionEntry, ConnectionStyle, EditorConfig, GraphEvent,
-    InputAnchor, Node, NodeEditor, NodeStyle, OutputAnchor, PortType, Position,
+    AnchorLayout, AnchorStyle, ConnectionEntry, ConnectionStyle, EditorConfig, EditorHandle,
+    GraphEvent, InputAnchor, Node, NodeEditor, NodeField, NodeStyle, OutputAnchor, PortType,
+    Position, ViewportTransform,
 };
 
 include!("../../fixture.rs");
@@ -79,6 +80,7 @@ fn App() -> impl IntoView {
         provide_scene_theme();
     }
     let nodes = fixture_nodes(&search);
+    let body = body_fixture(&search);
     let connections = RwSignal::new(
         fixture_connections(&search)
             .iter()
@@ -114,33 +116,71 @@ fn App() -> impl IntoView {
     // row owns its reactive scope, so every `Node`'s `NodeContext` reaches only
     // its own anchors. Sibling components in one scope would all resolve the
     // last node's context and register every port under it.
-    let node_view = |node: &'static FixtureNode| {
+    let node_view = move |node: &'static FixtureNode| {
         let position = RwSignal::new(Position::new(node.x as f64, node.y as f64));
         let title = node.title;
         let inputs = node.inputs;
         let outputs = node.outputs;
         let header: Children = Box::new(move || view! { {title} }.into_any());
-        view! {
-            <Node<String, String, String, Kind>
-                id=node.id.to_string()
-                position=position
-                header=header
-                accent_color=node.accent.map(|rgb| format!("#{rgb:06x}"))
-                inputs=move || inputs.iter().map(|(id, label)| view! {
+        let inputs = move || {
+            inputs
+                .iter()
+                .map(|(id, label)| view! {
                     <InputAnchor<String, String, String, Kind>
                         id=id.to_string() port_type=Kind label=label.to_string() _marker=Marker::default() />
-                }).collect_view()
-                outputs=move || outputs.iter().map(|(id, label)| view! {
+                })
+                .collect_view()
+        };
+        let outputs = move || {
+            outputs
+                .iter()
+                .map(|(id, label)| view! {
                     <OutputAnchor<String, String, String, Kind>
                         id=id.to_string() port_type=Kind label=label.to_string() _marker=Marker::default() />
-                }).collect_view()
-            />
+                })
+                .collect_view()
+        };
+        let accent = node.accent.map(|rgb| format!("#{rgb:06x}"));
+        if !body {
+            return view! {
+                <Node<String, String, String, Kind>
+                    id=node.id.to_string() position=position header=header accent_color=accent
+                    inputs=inputs outputs=outputs />
+            }
+            .into_any();
         }
+        let value_style = format!(
+            "font-size: {BODY_TEXT_SIZE}px; line-height: {BODY_LINE_HEIGHT}px; \
+                 color: #{BODY_TEXT_COLOR:06x};"
+        );
+        let body_view: Children = Box::new(move || {
+            view! {
+                <div data-body-row="">
+                    <NodeField label=BODY_FIELD.0>
+                        <span data-body-text="" style=value_style>{BODY_FIELD.1}</span>
+                    </NodeField>
+                </div>
+            }
+            .into_any()
+        });
+        view! {
+            <Node<String, String, String, Kind>
+                id=node.id.to_string() position=position header=header accent_color=accent
+                body=body_view inputs=inputs outputs=outputs />
+        }
+        .into_any()
     };
+    let handle = EditorHandle::new();
+    handle.viewport().set(ViewportTransform {
+        pan_x: 0.0,
+        pan_y: 0.0,
+        zoom: f64::from(fixture_zoom(&search)),
+    });
     view! {
         <div style="position:absolute; inset:0;">
             <NodeEditor<String, String, String, Kind>
                 config=EditorConfig::default()
+                handle=handle
                 connections=Signal::derive(move || connections.get())
                 on_event=on_event
             >

@@ -709,13 +709,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
         div()
             .flex()
             .items_center()
-            .gap(px(self.theme.node.field_gap))
+            .gap(graph_px(self.theme.node.field_gap))
             .child(
                 div()
-                    .min_w(px(self.theme.node.field_label_min_width))
-                    .text_size(px(self.theme.node.field_label_font_size))
+                    .min_w(graph_px(self.theme.node.field_label_min_width))
+                    .text_size(graph_px(self.theme.node.field_label_font_size))
+                    .line_height(graph_px(self.theme.node.field_label_font_size * 1.2))
                     .text_color(rgb(label_color.rgb).opacity(label_color.alpha))
-                    .child(label.into()),
+                    .child(SharedString::from(label.into().to_uppercase())),
             )
             .child(control)
             .into_any_element()
@@ -725,12 +726,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
     pub fn body_section(&self, child: impl IntoElement) -> AnyElement {
         let border = self.theme.node.body_border_bottom;
         div()
-            .py(px(self.theme.node.body_padding_y))
+            .py(graph_px(self.theme.node.body_padding_y))
             .when(
                 border.width > 0.0 && border.style != style::LineStyle::None,
                 |element| {
                     element
-                        .border_b(px(border.width))
+                        .border_b(graph_px(border.width))
                         .border_color(rgb(border.color.rgb).opacity(border.color.alpha))
                         .when(border.style == style::LineStyle::Dashed, |element| {
                             element.border_dashed()
@@ -864,6 +865,14 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
     }
 }
 
+/// Renders a node's card content as retained GPUI elements.
+///
+/// The element is laid out in graph space: inside it one rem is
+/// [`GRAPH_REM`] world pixels times the viewport zoom, so every length given
+/// through [`graph_px`] (or in rems) scales with zoom the way
+/// leptos-node-graph's CSS transform scales the whole card, padding, row
+/// heights and text included. A `gpui::px` length stays fixed on screen;
+/// author body content with `use gpui_node_graph::graph_px as px;`.
 pub trait NodeBodyRenderer<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>:
     'static
 {
@@ -1841,6 +1850,17 @@ impl gpui::RenderOnce for WorldSceneElement {
     }
 }
 
+/// World pixels per rem inside a retained node body at zoom 1.
+pub const GRAPH_REM: f32 = 16.0;
+
+/// A length of `value` world pixels for retained node body content. Inside a
+/// [`NodeBodyRenderer`] element it paints `value * zoom` screen pixels and
+/// lays out the same, so a body authored in it scales with the viewport.
+/// Outside a node body it is `value` pixels at the window's rem size of 16.
+pub fn graph_px(value: f32) -> gpui::Rems {
+    gpui::rems(value / GRAPH_REM)
+}
+
 struct NodeScaleElement {
     child: Option<AnyElement>,
     rem_size: Pixels,
@@ -1850,7 +1870,7 @@ impl NodeScaleElement {
     fn new(child: AnyElement, zoom: f32) -> Self {
         Self {
             child: Some(child),
-            rem_size: px(16.0 * zoom),
+            rem_size: px(GRAPH_REM * zoom),
         }
     }
 }
@@ -2012,18 +2032,59 @@ struct PortChrome<P> {
     label_color: gpui::Hsla,
 }
 
-/// A hollow socket's ring as one quad. GPUI snaps a border to whole device
-/// pixels, so 0.2.2's 1.5px (or 1px) CSS stroke would paint 1px, crisp. The
-/// browser antialiases that stroke across `floor(width) + 1` pixels at partial
-/// coverage, so paint that many pixels and dim the stroke by the ratio, which
-/// keeps the ring's ink.
-fn whole_pixel_ring(border: Pixels, stroke: gpui::Hsla, scale_factor: f32) -> (Pixels, gpui::Hsla) {
+/// A hollow socket's ring as one quad. 0.2.2 strokes an SVG circle of radius
+/// 9.5 in a 24-unit box, so the stroke's outer edge sits `2.5 / 24` of the dot
+/// in from the box edge, less half the stroke, and the browser antialiases it
+/// over every device pixel it touches. GPUI snaps a border to whole device
+/// pixels, so paint the uniform band, as wide and as opaque, that differs
+/// least from that coverage: a stroke on whole device pixels stays crisp, one
+/// that straddles them spreads at partial alpha, which keeps the ring's ink.
+/// `left` and `width` are the dot box's unsnapped screen left edge and width.
+fn whole_pixel_ring(
+    border: Pixels,
+    stroke: gpui::Hsla,
+    left: Pixels,
+    width: Pixels,
+    scale_factor: f32,
+) -> (Pixels, gpui::Hsla) {
     let device = f32::from(border) * scale_factor;
     if device <= 0.0 {
         return (border, stroke);
     }
-    let whole = device.floor() + 1.0;
-    (px(whole / scale_factor), stroke.opacity(device / whole))
+    let edge = (f32::from(left) + f32::from(width) * (2.5 / 24.0)) * scale_factor - device * 0.5;
+    let mut offset = edge - edge.floor();
+    if offset > 1.0 - 1e-3 {
+        offset = 0.0;
+    }
+    let touched = ((offset + device - 1e-3).ceil() as usize).max(1);
+    let coverage = |pixel: usize| {
+        let pixel = pixel as f32;
+        ((offset + device).min(pixel + 1.0) - offset.max(pixel)).max(0.0)
+    };
+    let mut best = (f32::INFINITY, touched);
+    for band in (device - 1e-3).ceil().max(1.0) as usize..=touched {
+        let alpha = (device / band as f32).min(1.0);
+        for first in 0..=touched - band {
+            let error: f32 = (0..touched)
+                .map(|pixel| {
+                    let painted = if (first..first + band).contains(&pixel) {
+                        alpha
+                    } else {
+                        0.0
+                    };
+                    (coverage(pixel) - painted).abs()
+                })
+                .sum();
+            if error < best.0 - 1e-4 {
+                best = (error, band);
+            }
+        }
+    }
+    let band = best.1 as f32;
+    (
+        px(band / scale_factor),
+        stroke.opacity((device / band).min(1.0)),
+    )
 }
 
 struct DotPaint {
@@ -2074,7 +2135,7 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                 })
                 .collect::<Vec<_>>()
         },
-        move |_, placed, window, cx| {
+        move |bounds, placed, window, cx| {
             let ports = paint_ports;
             let text_style = window.text_style();
             let line_height = window.pixel_snap(
@@ -2145,7 +2206,13 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                     let hidden_by: &[Bounds<Pixels>] =
                         if port.dragging { &placed.above } else { &[] };
                     let (border, stroke) = if paint.fill.is_transparent() {
-                        whole_pixel_ring(paint.border, paint.stroke, window.scale_factor())
+                        whole_pixel_ring(
+                            paint.border,
+                            paint.stroke,
+                            bounds.origin.x + port.dot.origin.x,
+                            port.dot.size.width,
+                            window.scale_factor(),
+                        )
                     } else {
                         (paint.border, paint.stroke)
                     };
@@ -7739,6 +7806,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 root = root.child(connection_layer).children(above_wire.drain(..));
             }
             let id = node.id.clone();
+            let authored_width = node.size.width;
             let model_size = self.resolved_node_size(&id).unwrap_or(node.size);
             if let Some(size) = self.resolved_node_size(&id) {
                 node.size = size;
@@ -8111,13 +8179,21 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let graph = cx.weak_entity();
             let measured_node = id.clone();
             let raw_body_element = body.element;
+            // The card's border box wraps the body, as in 0.2.2. A body fills a
+            // fixed-width card, so only an automatic-width card takes its width
+            // from the body; measuring a fixed one would feed the card's own
+            // width back to it, less its border, every frame.
+            let card_border = 2.0 * visible_border_width(theme.node.border);
+            let fixed_width = (!self.auto_width_nodes.contains(&id)).then_some(authored_width);
             let body_element = if has_custom_body {
                 MeasuredElement::new(
                     NodeScaleElement::new(raw_body_element, viewport.zoom),
                     move |bounds, cx| {
                         let measured = core::Size {
-                            width: f32::from(bounds.size.width) / viewport.zoom,
-                            height: f32::from(bounds.size.height) / viewport.zoom,
+                            width: fixed_width.unwrap_or(
+                                f32::from(bounds.size.width) / viewport.zoom + card_border,
+                            ),
+                            height: f32::from(bounds.size.height) / viewport.zoom + card_border,
                         };
                         if !measured.width.is_finite()
                             || !measured.height.is_finite()
@@ -8173,7 +8249,6 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let automatic_width = self.auto_width_nodes.contains(&id);
             let styled_automatic_width = theme.node.width;
             let node_cursor = resolved_node_cursor(&theme.node, dragging, self.resize.is_some());
-            let scale_factor = window.scale_factor();
             let card_opacity = if dragging {
                 theme.node.opacity_dragging
             } else {
@@ -8205,14 +8280,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .map(|shadow| (shadow.spread, shadow.color))
                 .chain(outline_ring)
                 .map(|(width, color)| {
-                    // Chromium floors border and outline widths of a device pixel or
-                    // more to whole device pixels; a 1.5px outline paints as 1px.
-                    let width = viewport.scale_length(width);
-                    let width = if width * scale_factor >= 1.0 {
-                        (width * scale_factor).floor() / scale_factor
-                    } else {
-                        width
-                    };
+                    // Chromium floors border and outline widths of a CSS pixel or
+                    // more to whole CSS pixels before the canvas transform and the
+                    // device scale apply: a 1.5px outline paints 1px at DPR 1,
+                    // 2 device pixels at DPR 2 and 2px under scale(2).
+                    let width =
+                        viewport.scale_length(if width >= 1.0 { width.floor() } else { width });
                     Ring {
                         width: px(width),
                         color: rgb(color.rgb).opacity(color.alpha),
@@ -10510,6 +10583,35 @@ fn paint_dashed_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_ring_is_crisp_only_where_the_browser_stroke_is() {
+        let stroke = gpui::Hsla::white();
+        // An 8px dot whose box starts on a whole CSS pixel, as in the parity
+        // gallery: (dpr, zoom, css stroke) -> (device pixels painted, alpha).
+        let cases = [
+            // 0.2.2's default 1.5px ring and the scenes theme's 1px ring
+            // straddle device pixels at DPR 1 and spread.
+            (1.0, 1.0, 1.5, 2.0, 0.75),
+            (1.0, 1.0, 1.0, 2.0, 0.5),
+            // A whole device stroke on (or within a sixth of) a pixel edge
+            // stays crisp.
+            (2.0, 1.0, 1.5, 3.0, 1.0),
+            (1.0, 4.0 / 3.0, 1.5, 2.0, 1.0),
+            (2.0, 1.0, 1.0, 2.0, 1.0),
+            (2.0, 0.5, 1.5, 2.0, 0.75),
+        ];
+        for (dpr, zoom, css, device, alpha) in cases {
+            let (border, color) =
+                whole_pixel_ring(px(css * zoom), stroke, px(40.0), px(8.0 * zoom), dpr);
+            let painted = f32::from(border) * dpr;
+            assert!(
+                (painted - device).abs() < 1e-3 && (color.a - alpha).abs() < 1e-3,
+                "dpr {dpr} zoom {zoom} stroke {css}: painted {painted}px at {}, want {device}px at {alpha}",
+                color.a
+            );
+        }
+    }
 
     #[test]
     fn coincident_rings_composite_into_one_band_per_width() {

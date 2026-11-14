@@ -64,6 +64,24 @@ pub const OVERLAP_NODES: &[FixtureNode] = &[
     },
 ];
 
+/// One card with consumer-authored body content between its header and ports:
+/// a labelled field row whose value is `BODY_FIELD.1`.
+pub const BODY_NODES: &[FixtureNode] = &[FixtureNode {
+    id: "gain",
+    title: "Gain",
+    x: 60.0,
+    y: 50.0,
+    accent: Some(0xf59e0b),
+    inputs: &[("gain:in", "Signal")],
+    outputs: &[("gain:out", "Result")],
+}];
+pub const BODY_FIELD: (&str, &str) = ("Level", "0.50");
+/// The body value's text size and line height, set on both sides so the row
+/// height does not depend on either toolkit's default font metrics.
+pub const BODY_TEXT_SIZE: f32 = 11.0;
+pub const BODY_LINE_HEIGHT: f32 = 16.0;
+pub const BODY_TEXT_COLOR: u32 = 0xe4e4e7;
+
 pub const CONNECTIONS: &[(&str, &str, &str)] = &[
     ("c1", "src:a_value", "calc:a"),
     ("c2", "calc:out", "sink:in"),
@@ -79,10 +97,30 @@ pub fn overlap_fixture(query: &str) -> bool {
     query.contains("overlap")
 }
 
+/// `body` swaps the graph for the one card with a custom body.
+pub fn body_fixture(query: &str) -> bool {
+    query.contains("body")
+}
+
+/// `zoom=<f>` opens the editor at that zoom with no pan.
+pub fn fixture_zoom(query: &str) -> f32 {
+    query
+        .split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("zoom="))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1.0)
+}
+
 pub fn fixture_nodes(query: &str) -> &'static [FixtureNode] {
-    if overlap_fixture(query) { OVERLAP_NODES } else { NODES }
+    if overlap_fixture(query) {
+        OVERLAP_NODES
+    } else if body_fixture(query) {
+        BODY_NODES
+    } else {
+        NODES
+    }
 }
 
 pub fn fixture_connections(query: &str) -> &'static [(&'static str, &'static str, &'static str)] {
-    if overlap_fixture(query) { &[] } else { CONNECTIONS }
+    if overlap_fixture(query) || body_fixture(query) { &[] } else { CONNECTIONS }
 }

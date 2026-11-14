@@ -36,8 +36,14 @@ and therefore cannot implement CSS-transform semantics.
 - `WorldNodeBodyRenderer` is the compositor-style node body path.
 - `NodeOverlayRenderer` remains a pane-space retained path for unscaled overlays.
 
-The legacy arbitrary retained `NodeBodyRenderer` remains available for compatibility,
-but it is not the pixel-parity rendering path. The demo uses the world renderer.
+The retained `NodeBodyRenderer` lays its element out in graph space instead: the
+editor sets the rem inside it to `GRAPH_REM * zoom` (16 world pixels per rem), so
+lengths authored with `graph_px` (or rems) scale with zoom as the CSS transform
+scales a Leptos card, text, padding and row heights included. A `gpui::px` length
+does not scale; a body file opts in with `use gpui_node_graph::graph_px as px;`.
+The parity gallery's `body` fixture renders one such card at zoom 1, 2 and 0.5
+and gates its field row and value text rects against 0.2.2 (`BODY_LIMIT`). The
+demo uses the world renderer.
 
 ## Required invariants
 

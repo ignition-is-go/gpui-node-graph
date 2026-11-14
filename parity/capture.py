@@ -13,10 +13,11 @@ arc-length steps along each.
 
     (cd parity/gallery && trunk build)
     (cd parity/reference && RUSTFLAGS=--cfg=parity_reference trunk build)
-    uv run parity/capture.py [--theme scene|default] [state ...]
+    uv run parity/capture.py [--theme scene|default] [--dpr 2] [state ...]
 
 The reference build sets RUSTFLAGS so it does not inherit the repo's wasm
-thread flags. Nothing opens on a display. Writes parity/out/<theme>-<state>.png
+thread flags. Nothing opens on a display. `--dpr` renders both pages at that
+device scale factor (parity/out/<theme>-dpr<n>-<state>.*). Writes parity/out/<theme>-<state>.png
 (reference | gpui | diff x4) and prints, per state, the largest socket-centre
 and node-card offsets, the wire endpoint and path offsets, and the pixel
 difference, plus the worst node card's mean |d| and the worst selection-ring
@@ -45,6 +46,9 @@ from playwright.sync_api import sync_playwright
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 W, H = 960, 400
+# Device pixels per CSS pixel for both pages (`--dpr`). Geometry stays in CSS
+# pixels; screenshots and every image box are in device pixels.
+DPR = 1
 
 # Port id by label, node ids in render order and connection ids, per fixture in
 # parity/fixture.rs (labels are unique within one). `overlap` is two cards
@@ -75,6 +79,16 @@ FIXTURES = {
         "connections": [],
     },
 }
+# The one card with a consumer-authored body, opened at zoom 1, 2 and 0.5. Its
+# field row and value text are compared as `body-row:<node>` and
+# `body-text:<node>` rects.
+for name, zoom in (("body", ""), ("body-zoom2", "&zoom=2"), ("body-zoom05", "&zoom=0.5")):
+    FIXTURES[name] = {
+        "query": "&body" + zoom,
+        "ports": {"Signal": "gain:in", "Result": "gain:out"},
+        "nodes": ["gain"],
+        "connections": [],
+    }
 SAMPLES = 64
 # Half-width of the square around a socket centre, inside the 8px dot and clear
 # of its label. In the overlap states the covered socket is gated on its ink: the
@@ -100,7 +114,10 @@ CARD_LIMIT = 6.0
 RING_INSET, RING_OUTSET = 2, 3
 RING_LIMIT = 4.0
 # Geometry is not expected to match here, so its cards are reported only.
-CARD_UNGATED = {"zoomed"}
+# The zoomed body states are gated on geometry (BODY_LIMIT) only: at zoom 0.5
+# Chromium antialiases the transformed 1px border and 1px accent stripe across
+# two rows, where GPUI snaps them to one.
+CARD_UNGATED = {"zoomed", "body-zoom2", "body-zoom05"}
 # GPUI draws an align/distribute toolbar above a selection of two or more cards;
 # 0.2.2 has none. Its shadow falls on the top ring edge, so these states leave
 # each card's top edge out of the ring band. The other three edges still gate
@@ -175,6 +192,12 @@ OVERLAP = [
     ], TOP_UPPER),
 ]
 STATES = {name: ("base", steps, None) for name, steps in BASE}
+STATES.update({name: (name, [], None) for name in ("body", "body-zoom2", "body-zoom05")})
+# Largest body row or text rect offset, in px, before a body state fails. The
+# text's width is left out: it is the two toolkits' glyph advances (21.4px in
+# Chromium, 23px in GPUI for "0.50" at 11px), not the zoom scaling under test.
+BODY_LIMIT = 1.0
+BODY_DIMS = {"body-row": (0, 1, 2, 3), "body-text": (0, 1, 3)}
 STATES.update({name: ("overlap", steps, top) for name, steps, top in OVERLAP})
 HIT_PORT = "ova:out"
 
@@ -261,7 +284,17 @@ REFERENCE_GEOMETRY = r"""() => {
       return card ? 'card:' + ids[[...document.querySelectorAll('[data-node]')].indexOf(card)] : 'other';
     }).filter((kind, i, all) => i === 0 || kind !== all[i - 1]);
   });
-  return {nodes, ports, headers, wires, hits};
+  const bodies = {};
+  document.querySelectorAll('[data-node]').forEach((el, i) => {
+    const row = el.querySelector('[data-body-row] > *');
+    const text = el.querySelector('[data-body-text]');
+    [['body-row', row], ['body-text', text]].forEach(([kind, part]) => {
+      if (!part) return;
+      const r = part.getBoundingClientRect();
+      bodies[kind + ':' + ids[i]] = [r.x, r.y, r.width, r.height];
+    });
+  });
+  return {nodes, ports, headers, wires, hits, bodies};
 }"""
 
 def reference_geometry(fixture):
@@ -271,24 +304,33 @@ def reference_geometry(fixture):
 
 def gpui_geometry(page):
     parts = json.loads(page.evaluate("() => globalThis.__nodeGraphParts()"))
-    nodes, ports, headers, points = {}, {}, {}, {}
+    nodes, ports, headers, points, bodies = {}, {}, {}, {}, {}
     for key, (x, y, w, h) in parts.items():
         kind, _, ident = key.removeprefix("node-graph.").partition(":")
         if kind == "node":
             nodes[ident] = [x, y, w, h]
         elif kind == "node-header":
             headers[ident] = [x, y, w, h]
+        elif kind in ("body-row", "body-text"):
+            bodies[f"{kind}:{ident}"] = [x, y, w, h]
         elif kind == "port":
             ports[ident] = [x + w / 2, y + h / 2]
         elif kind == "wire-point":
             wire, _, index = ident.rpartition(".")
             points.setdefault(wire, {})[int(index)] = [x, y]
     wires = {wire: [p for _, p in sorted(vs.items())] for wire, vs in points.items()}
-    return {"nodes": nodes, "ports": ports, "headers": headers, "wires": wires}
+    return {"nodes": nodes, "ports": ports, "headers": headers, "wires": wires, "bodies": bodies}
 
 
 def capture(browser, url, steps, geometry, gpui, name, fixture):
-    page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=1)
+    page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=DPR)
+    if gpui:
+        # Headless Chromium's emulated device scale factor leaves
+        # devicePixelContentBoxSize in CSS pixels, so GPUI would size its
+        # surface to the CSS box and draw the scene DPR times too large. Without
+        # it GPUI sizes the surface from contentRect * devicePixelRatio, as a
+        # real HiDPI display reports.
+        page.add_init_script("delete ResizeObserverEntry.prototype.devicePixelContentBoxSize")
     page.goto(url)
     if gpui:
         page.wait_for_selector("canvas")
@@ -312,8 +354,9 @@ def pixel_diff(ref, gpui):
     r, g, b = diff.split()
     peak = ImageChops.lighter(ImageChops.lighter(r, g), b)
     hist = diff.histogram()
-    mean = sum(i * hist[c * 256 + i] for c in range(3) for i in range(256)) / (W * H * 3)
-    bad = peak.point(lambda v: 255 if v > 32 else 0).histogram()[255] / (W * H)
+    area = ref.size[0] * ref.size[1]
+    mean = sum(i * hist[c * 256 + i] for c in range(3) for i in range(256)) / (area * 3)
+    bad = peak.point(lambda v: 255 if v > 32 else 0).histogram()[255] / area
     return mean, bad, diff
 
 
@@ -322,9 +365,12 @@ def card_diffs(ref_img, gpui_img, geometry):
     CARD_MARGIN so the selection ring and glow count. A fill or ring that one
     side has and the other lacks moves this; text antialiasing barely does."""
     out = {}
-    for node, (x, y, w, h) in geometry["nodes"].items():
-        box = (max(0, int(x - CARD_MARGIN)), max(0, int(y - CARD_MARGIN)),
-               min(W, int(x + w + CARD_MARGIN + 1)), min(H, int(y + h + CARD_MARGIN + 1)))
+    width, height = ref_img.size
+    for node, rect in geometry["nodes"].items():
+        x, y, w, h = (v * DPR for v in rect)
+        m = CARD_MARGIN * DPR
+        box = (max(0, int(x - m)), max(0, int(y - m)),
+               min(width, int(x + w + m + 1)), min(height, int(y + h + m + 1)))
         diff = ImageChops.difference(ref_img.crop(box), gpui_img.crop(box))
         hist = diff.histogram()
         area = (box[2] - box[0]) * (box[3] - box[1]) * 3
@@ -335,15 +381,17 @@ def card_diffs(ref_img, gpui_img, geometry):
 def ring_diffs(ref_img, gpui_img, geometry, skip_top=False):
     """Mean |difference| per node over the selection ring band only."""
     out = {}
-    for node, (x, y, w, h) in geometry["nodes"].items():
-        mask = Image.new("L", (W, H), 0)
+    inset, outset = RING_INSET * DPR, RING_OUTSET * DPR
+    for node, rect in geometry["nodes"].items():
+        x, y, w, h = (v * DPR for v in rect)
+        mask = Image.new("L", ref_img.size, 0)
         draw = ImageDraw.Draw(mask)
-        draw.rectangle((round(x) - RING_OUTSET, round(y) - RING_OUTSET,
-                        round(x + w) + RING_OUTSET - 1, round(y + h) + RING_OUTSET - 1), fill=255)
-        draw.rectangle((round(x) + RING_INSET, round(y) + RING_INSET,
-                        round(x + w) - RING_INSET - 1, round(y + h) - RING_INSET - 1), fill=0)
+        draw.rectangle((round(x) - outset, round(y) - outset,
+                        round(x + w) + outset - 1, round(y + h) + outset - 1), fill=255)
+        draw.rectangle((round(x) + inset, round(y) + inset,
+                        round(x + w) - inset - 1, round(y + h) - inset - 1), fill=0)
         if skip_top:
-            draw.rectangle((0, 0, W, round(y) + RING_INSET - 1), fill=0)
+            draw.rectangle((0, 0, ref_img.size[0], round(y) + inset - 1), fill=0)
         diff = ImageChops.difference(ref_img, gpui_img)
         out[node] = sum(ImageStat.Stat(diff, mask).mean) / 3
     return out
@@ -352,8 +400,8 @@ def ring_diffs(ref_img, gpui_img, geometry, skip_top=False):
 def socket_ink(img, port_xy):
     """Pixels in the box around a socket centre that differ from the box's
     commonest colour, which is the card fill under the dot."""
-    x, y = port_xy
-    box = img.crop((int(x - SOCKET_BOX), int(y - SOCKET_BOX), int(x + SOCKET_BOX), int(y + SOCKET_BOX)))
+    x, y, r = port_xy[0] * DPR, port_xy[1] * DPR, SOCKET_BOX * DPR
+    box = img.crop((int(x - r), int(y - r), int(x + r), int(y + r)))
     pixels = list(box.get_flattened_data())
     fill = Counter(pixels).most_common(1)[0][0]
     return sum(1 for px in pixels if max(abs(c - f) for c, f in zip(px, fill)) > 32)
@@ -365,7 +413,8 @@ def max_offset(ref, gpui, key, width):
         b = gpui[key].get(ident)
         if b is None:
             return float("inf"), f"{ident} missing"
-        delta = max(abs(p - q) for p, q in zip(a[:width], b[:width]))
+        dims = width(ident) if callable(width) else range(width)
+        delta = max(abs(a[i] - b[i]) for i in dims)
         if delta > worst:
             worst, where = delta, ident
     return worst, where
@@ -412,8 +461,12 @@ def wire_offsets(ref, gpui):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--theme", default="scene", choices=["scene", "default"])
+    parser.add_argument("--dpr", type=float, default=1)
     parser.add_argument("states", nargs="*")
     args = parser.parse_args()
+    global DPR
+    DPR = args.dpr
+    stem = args.theme if DPR == 1 else f"{args.theme}-dpr{args.dpr:g}"
     OUT.mkdir(exist_ok=True)
     ref_port = serve(HERE / "reference" / "dist")
     gpui_port = serve(Path(os.environ.get("PARITY_GALLERY_DIST") or HERE / "gallery" / "dist"))
@@ -439,12 +492,13 @@ def main():
             gpui_img, gpui_geo = capture(browser, f"http://127.0.0.1:{gpui_port}/index.html{query}",
                                          steps, idle, True, "gpui", fixture)
             mean, bad, diff = pixel_diff(ref_img, gpui_img)
-            sheet = Image.new("RGB", (W, H * 3))
+            iw, ih = ref_img.size
+            sheet = Image.new("RGB", (iw, ih * 3))
             sheet.paste(ref_img, (0, 0))
-            sheet.paste(gpui_img, (0, H))
-            sheet.paste(diff.point(lambda v: min(255, v * 4)), (0, H * 2))
-            sheet.save(OUT / f"{args.theme}-{name}.png")
-            (OUT / f"{args.theme}-{name}.json").write_text(
+            sheet.paste(gpui_img, (0, ih))
+            sheet.paste(diff.point(lambda v: min(255, v * 4)), (0, ih * 2))
+            sheet.save(OUT / f"{stem}-{name}.png")
+            (OUT / f"{stem}-{name}.json").write_text(
                 json.dumps({"reference": ref_geo, "gpui": gpui_geo}, indent=1))
             cards = card_diffs(ref_img, gpui_img, ref_geo)
             worst_card = max(cards.items(), key=lambda kv: kv[1])
@@ -457,15 +511,20 @@ def main():
                 hits.append((name, top, ref_geo["hits"][HIT_PORT]))
             rows.append((name, max_offset(ref_geo, gpui_geo, "ports", 2),
                          max_offset(ref_geo, gpui_geo, "nodes", 4),
+                         max_offset(ref_geo, gpui_geo, "bodies",
+                                    lambda ident: BODY_DIMS[ident.partition(":")[0]]),
                          *wire_offsets(ref_geo, gpui_geo), worst_card, worst_ring, ink,
                          mean, bad))
         browser.close()
-    print(f"theme {args.theme}")
-    print(f"{'state':20} {'socket max px':>18} {'card max px':>18} {'wire end px':>14}"
+    print(f"theme {args.theme} dpr {DPR:g}")
+    print(f"{'state':20} {'socket max px':>18} {'card max px':>18} {'body max px':>18} {'wire end px':>14}"
           f" {'wire path px':>14} {'card |d|':>13} {'ring |d|':>13} {'dot ink r/g':>13} {'mean|d|':>8} {'px>32':>7}")
     failed = []
     for name, *offsets, (card_at, card), (ring_at, ring), (ink_ref, ink_gpui), mean, bad in rows:
-        cells = " ".join(f"{v:9.2f} {at:>{8 if i < 2 else 4}}" for i, (v, at) in enumerate(offsets))
+        cells = " ".join(f"{v:9.2f} {at:>{8 if i < 3 else 4}}" for i, (v, at) in enumerate(offsets))
+        body, body_at = offsets[2]
+        if body > BODY_LIMIT:
+            failed.append(f"{name} body {body_at} {body:.2f} > {BODY_LIMIT}")
         gated = name not in CARD_UNGATED
         if gated and card > CARD_LIMIT:
             failed.append(f"{name} card {card_at} {card:.2f} > {CARD_LIMIT}")
