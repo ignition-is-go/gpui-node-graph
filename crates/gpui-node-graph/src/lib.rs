@@ -1860,6 +1860,15 @@ impl gpui::RenderOnce for WorldSceneElement {
 /// World pixels per rem inside a retained node body at zoom 1.
 pub const GRAPH_REM: f32 = 16.0;
 
+/// Snap a screen coordinate to a device pixel, a half pixel rounding up as
+/// Chromium's layout does. GPUI rounds a half toward zero, so at a scale of
+/// 1.5 a card at 153 would paint at device pixel 229 where the browser
+/// paints 230; positions that are already whole device pixels pass through
+/// GPUI's own snapping unchanged.
+fn snap_half_up(value: f32, dpr: f32) -> f32 {
+    (value * dpr + 0.5).floor() / dpr
+}
+
 /// A length of `value` world pixels for retained node body content. Inside a
 /// [`NodeBodyRenderer`] element it paints `value * zoom` screen pixels and
 /// lays out the same, so a body authored in it scales with the viewport.
@@ -2140,11 +2149,13 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
         move |bounds, window, _| {
             // Layout rounds each authored length, then the resulting edges.
             let place = |local: Bounds<Pixels>, window: &Window| {
-                let near = bounds.origin + local.origin.map(|length| window.pixel_snap(length));
-                let size = local.size.map(|length| window.pixel_snap(length));
+                let snap =
+                    |length: Pixels| px(snap_half_up(f32::from(length), window.scale_factor()));
+                let near = bounds.origin + local.origin.map(snap);
+                let size = local.size.map(snap);
                 Bounds::from_corners(
-                    near.map(|length| window.pixel_snap(length)),
-                    (near + point(size.width, size.height)).map(|length| window.pixel_snap(length)),
+                    near.map(snap),
+                    (near + point(size.width, size.height)).map(snap),
                 )
             };
             ports
@@ -2830,6 +2841,7 @@ pub struct NodeGraph<
     box_selection: Option<BoxSelection<N, C>>,
     focus_handle: Option<FocusHandle>,
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
+    theme: Option<Arc<NodeGraphTheme>>,
 }
 
 impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
@@ -2926,6 +2938,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             box_selection: None,
             focus_handle: None,
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
+            theme: None,
         })
     }
 
@@ -3070,6 +3083,19 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
                 enabled: has_broken,
             },
         ]
+    }
+
+    /// Render this editor with `theme` instead of the application-global
+    /// theme installed by [`set_node_graph_theme`].
+    pub fn with_theme(mut self, theme: impl Into<Arc<NodeGraphTheme>>) -> Self {
+        self.theme = Some(theme.into());
+        self
+    }
+
+    /// Replace this editor's theme; `None` falls back to the application-global theme.
+    pub fn set_theme(&mut self, theme: Option<Arc<NodeGraphTheme>>, cx: &mut Context<Self>) {
+        self.theme = theme;
+        cx.notify();
     }
 
     pub fn with_catalog(mut self, catalog: Vec<NodeCatalogItem<T>>) -> Self {
@@ -7094,7 +7120,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
         let focus_handle = self.focus_handle().clone();
         // Read exactly once for this root render, then share the same immutable aggregate.
-        let theme = Arc::clone(cx.node_graph_theme());
+        let theme = self
+            .theme
+            .clone()
+            .unwrap_or_else(|| Arc::clone(cx.node_graph_theme()));
         let tagger = part_tag::part_tagger(cx);
         self.refresh_default_render_geometry(&theme);
         let viewport = self.graph.viewport.sanitized();
@@ -8339,8 +8368,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 tagger,
                 div()
                     .absolute()
-                    .left(px(position.x))
-                    .top(px(position.y))
+                    .left(px(snap_half_up(position.x, dpr)))
+                    .top(px(snap_half_up(position.y, dpr)))
                     .when(!automatic_width, |element| {
                         element.w(px(viewport.scale_length(node.size.width)))
                     })
@@ -10777,6 +10806,54 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_editor_theme_overrides_the_global_theme_for_that_editor_only(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let global = Arc::new(NodeGraphTheme::default());
+        let local = Arc::new(NodeGraphTheme::light());
+        cx.update(|app| set_node_graph_theme(app, Arc::clone(&global)));
+        type Seen = Rc<RefCell<Vec<(&'static str, Arc<NodeGraphTheme>)>>>;
+        let seen: Seen = Rc::default();
+        let recorder = |label: &'static str, seen: &Rc<RefCell<Vec<_>>>| {
+            let seen = Rc::clone(seen);
+            move |context: WorldOverlayContext, _: &mut Window, _: &mut App| {
+                seen.borrow_mut().push((label, context.theme));
+                Vec::new()
+            }
+        };
+        let (themed, cx) = cx.add_window_view({
+            let local = Arc::clone(&local);
+            let record = recorder("themed", &seen);
+            move |_, _| {
+                NodeGraph::new_for_test(interactive_graph())
+                    .with_theme(local)
+                    .with_world_overlay_renderer(record)
+            }
+        });
+        let (_plain, cx) = cx.add_window_view({
+            let record = recorder("plain", &seen);
+            move |_, _| {
+                NodeGraph::new_for_test(interactive_graph()).with_world_overlay_renderer(record)
+            }
+        });
+        cx.run_until_parked();
+        let theme_of = |label| {
+            seen.borrow()
+                .iter()
+                .rev()
+                .find(|(seen_label, _)| *seen_label == label)
+                .map(|(_, theme)| Arc::clone(theme))
+                .expect("editor rendered")
+        };
+        assert!(Arc::ptr_eq(&theme_of("themed"), &local));
+        assert!(Arc::ptr_eq(&theme_of("plain"), &global));
+
+        themed.update(cx, |editor, cx| editor.set_theme(None, cx));
+        cx.run_until_parked();
+        assert!(Arc::ptr_eq(&theme_of("themed"), &global));
+    }
+
+    #[gpui::test]
     fn selection_alignment_moves_nodes_ports_and_distributes_box_gaps(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -11305,6 +11382,14 @@ mod tests {
         graph.nodes.get_mut("b").unwrap().position = core::Point::new(30.0, 0.0);
         graph.ports.get_mut("in").unwrap().position = core::Point::new(30.0, 25.0);
         graph
+    }
+
+    #[test]
+    fn a_half_device_pixel_snaps_up_as_in_chromium() {
+        assert_eq!(snap_half_up(153.0, 1.5), 230.0 / 1.5);
+        assert_eq!(snap_half_up(152.0, 1.5), 152.0);
+        assert_eq!(snap_half_up(153.25, 2.0), 153.5);
+        assert_eq!(snap_half_up(-1.0, 1.5), -1.0 / 1.5);
     }
 
     /// leptos-node-graph 0.2.2: the dot is `position: relative; z-index: 1`
