@@ -82,8 +82,9 @@ SAMPLES = 64
 # a card has its ring in one rendering and not the other, which the mean |d| of
 # the box cannot tell from antialiasing (a matching ring measures about 7).
 SOCKET_BOX = 5
-# Matching renderings measure 0.55 (ring antialiasing) to 1.0; one side missing, 0.
-INK_RATIO = 0.4
+# Matching renderings measure 0.8 (the press state's solid dot) to 1.0, and a ring
+# painted 1px thick instead of 0.2.2's 1.5px measured 0.55; one side missing, 0.
+INK_RATIO = 0.75
 CARD_MARGIN = 6
 # Largest mean |d| a node card may show before its state counts as styled
 # differently: matching states measure at most 4.74 (text antialiasing), a
@@ -100,6 +101,11 @@ RING_INSET, RING_OUTSET = 2, 3
 RING_LIMIT = 4.0
 # Geometry is not expected to match here, so its cards are reported only.
 CARD_UNGATED = {"zoomed"}
+# GPUI draws an align/distribute toolbar above a selection of two or more cards;
+# 0.2.2 has none. Its shadow falls on the top ring edge, so these states leave
+# each card's top edge out of the ring band. The other three edges still gate
+# the grabbed card's dimming, which lowers the ring's red by about 8%.
+TOOLBAR_STATES = {"overlap-multidrag"}
 
 
 def header(g, node):
@@ -141,20 +147,32 @@ BASE = [
 # the lower card puts its socket under the upper one, dragging the upper card
 # leaves it on top. `top` is what the reference's elementsFromPoint must answer
 # at that socket first, so a changed crate cannot silently move the premise.
+# `top` is the reference's top three elements there, in order, as `dot` or
+# `card:<id>`; a changed stacking order fails the gate even when the first
+# element still has the same kind. Only the card that was grabbed dims and
+# becomes a stacking context, however many cards are selected with it.
+TOP_LOWER = ["card:ovb", "dot", "card:ova"]
+TOP_UPPER = ["dot", "card:ovb", "card:ova"]
 OVERLAP = [
-    ("overlap", [], "dot"),
+    ("overlap", [], ["dot", "card:ovb", "card:ova"]),
     ("overlap-press", [
         lambda g: ("down", *dot(g, "ova:out")),
         lambda g: ("move", 700, 330),
-    ], "dot"),
+    ], ["dot", "card:ovb", "card:ova"]),
     ("overlap-drag-lower", [
         lambda g: ("down", *header(g, "ova")),
         lambda g: ("move", header(g, "ova")[0] + 3, header(g, "ova")[1] + 3),
-    ], "card"),
+    ], TOP_LOWER),
     ("overlap-drag-upper", [
         lambda g: ("down", *header(g, "ovb")),
         lambda g: ("move", header(g, "ovb")[0] + 3, header(g, "ovb")[1] + 3),
-    ], "dot"),
+    ], TOP_UPPER),
+    ("overlap-multidrag", [
+        lambda g: ("click", *header(g, "ova")),
+        lambda g: ("shift-click", *header(g, "ovb")),
+        lambda g: ("down", *header(g, "ovb")),
+        lambda g: ("move", header(g, "ovb")[0] + 3, header(g, "ovb")[1] + 3),
+    ], TOP_UPPER),
 ]
 STATES = {name: ("base", steps, None) for name, steps in BASE}
 STATES.update({name: ("overlap", steps, top) for name, steps, top in OVERLAP})
@@ -184,6 +202,10 @@ def replay(page, steps, geometry):
             page.mouse.move(*args, steps=8)
         elif kind == "click":
             page.mouse.click(*args)
+        elif kind == "shift-click":
+            page.keyboard.down("Shift")
+            page.mouse.click(*args)
+            page.keyboard.up("Shift")
         elif kind == "down":
             page.mouse.move(*args)
             page.mouse.down()
@@ -310,7 +332,7 @@ def card_diffs(ref_img, gpui_img, geometry):
     return out
 
 
-def ring_diffs(ref_img, gpui_img, geometry):
+def ring_diffs(ref_img, gpui_img, geometry, skip_top=False):
     """Mean |difference| per node over the selection ring band only."""
     out = {}
     for node, (x, y, w, h) in geometry["nodes"].items():
@@ -320,6 +342,8 @@ def ring_diffs(ref_img, gpui_img, geometry):
                         round(x + w) + RING_OUTSET - 1, round(y + h) + RING_OUTSET - 1), fill=255)
         draw.rectangle((round(x) + RING_INSET, round(y) + RING_INSET,
                         round(x + w) - RING_INSET - 1, round(y + h) - RING_INSET - 1), fill=0)
+        if skip_top:
+            draw.rectangle((0, 0, W, round(y) + RING_INSET - 1), fill=0)
         diff = ImageChops.difference(ref_img, gpui_img)
         out[node] = sum(ImageStat.Stat(diff, mask).mean) / 3
     return out
@@ -424,7 +448,7 @@ def main():
                 json.dumps({"reference": ref_geo, "gpui": gpui_geo}, indent=1))
             cards = card_diffs(ref_img, gpui_img, ref_geo)
             worst_card = max(cards.items(), key=lambda kv: kv[1])
-            worst_ring = max(ring_diffs(ref_img, gpui_img, ref_geo).items(), key=lambda kv: kv[1])
+            worst_ring = max(ring_diffs(ref_img, gpui_img, ref_geo, name in TOOLBAR_STATES).items(), key=lambda kv: kv[1])
             ink = (0, 0)
             if top:
                 ink = (socket_ink(ref_img, ref_geo["ports"][HIT_PORT]),
@@ -454,8 +478,8 @@ def main():
               f" {ink_ref:5d}/{ink_gpui:<5d} {mean:8.2f} {bad:7.2%}")
     for name, top, kinds in hits:
         print(f"reference elementsFromPoint at {HIT_PORT} in {name}: {' > '.join(kinds)}")
-        if kinds[0].split(':')[0] != top:
-            failed.append(f"{name} reference top is {kinds[0]}, expected {top}")
+        if kinds[:3] != top:
+            failed.append(f"{name} reference top is {' > '.join(kinds[:3])}, expected {' > '.join(top)}")
     if failed:
         raise SystemExit("card styling differs: " + ", ".join(failed))
 

@@ -2012,6 +2012,20 @@ struct PortChrome<P> {
     label_color: gpui::Hsla,
 }
 
+/// A hollow socket's ring as one quad. GPUI snaps a border to whole device
+/// pixels, so 0.2.2's 1.5px (or 1px) CSS stroke would paint 1px, crisp. The
+/// browser antialiases that stroke across `floor(width) + 1` pixels at partial
+/// coverage, so paint that many pixels and dim the stroke by the ratio, which
+/// keeps the ring's ink.
+fn whole_pixel_ring(border: Pixels, stroke: gpui::Hsla, scale_factor: f32) -> (Pixels, gpui::Hsla) {
+    let device = f32::from(border) * scale_factor;
+    if device <= 0.0 {
+        return (border, stroke);
+    }
+    let whole = device.floor() + 1.0;
+    (px(whole / scale_factor), stroke.opacity(device / whole))
+}
+
 struct DotPaint {
     stroke: gpui::Hsla,
     fill: gpui::Hsla,
@@ -2130,6 +2144,11 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                     let radius = dot.size.width.min(dot.size.height) * 0.5;
                     let hidden_by: &[Bounds<Pixels>] =
                         if port.dragging { &placed.above } else { &[] };
+                    let (border, stroke) = if paint.fill.is_transparent() {
+                        whole_pixel_ring(paint.border, paint.stroke, window.scale_factor())
+                    } else {
+                        (paint.border, paint.stroke)
+                    };
                     for visible in visible_pieces(*dot, hidden_by) {
                         window.with_content_mask(Some(ContentMask { bounds: visible }), |window| {
                             window.paint_drop_shadows(*dot, radius.into(), &paint.glow);
@@ -2137,8 +2156,8 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                                 *dot,
                                 radius,
                                 paint.fill,
-                                paint.border,
-                                paint.stroke,
+                                border,
+                                stroke,
                                 BorderStyle::Solid,
                             ));
                         });
@@ -4752,9 +4771,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
     }
 
     fn node_is_dragging(&self, node: &N) -> bool {
-        self.drag
-            .as_ref()
-            .is_some_and(|drag| drag.starts.iter().any(|(id, _)| id == node))
+        self.drag.as_ref().is_some_and(|drag| &drag.primary == node)
     }
 
     /// The port under `screen` within `radius`: nearest wins; a tie goes to the
@@ -8151,10 +8168,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let node_radius = theme.node.border_radius;
             let selected_outline = theme.node.outline_selected;
             let node_border = theme.node.border;
-            let dragging = self
-                .drag
-                .as_ref()
-                .is_some_and(|drag| drag.starts.iter().any(|(node_id, _)| node_id == &id));
+            let dragging = self.node_is_dragging(&id);
             let resizing = self.resize.as_ref().is_some_and(|resize| resize.id == id);
             let automatic_width = self.auto_width_nodes.contains(&id);
             let styled_automatic_width = theme.node.width;
@@ -11768,6 +11782,23 @@ mod tests {
             editor.graph.ports["out"].position,
             core::Point::new(50.0, 25.0)
         );
+    }
+
+    #[test]
+    fn only_the_grabbed_card_of_a_multi_drag_is_dragging() {
+        let mut editor = NodeGraph::new_for_test(interactive_graph());
+        editor.drag = Some(NodeDrag {
+            primary: String::from("b"),
+            offsets: Vec::new(),
+            starts: vec![
+                (String::from("a"), core::Point::new(0.0, 0.0)),
+                (String::from("b"), core::Point::new(100.0, 0.0)),
+            ],
+            moved: true,
+            alter_groups: false,
+        });
+        assert!(editor.node_is_dragging(&String::from("b")));
+        assert!(!editor.node_is_dragging(&String::from("a")));
     }
 
     #[test]

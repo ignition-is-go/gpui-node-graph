@@ -18,13 +18,19 @@ const COLUMNS: usize = 25;
 const ROWS: usize = 20;
 const PORTS_PER_SIDE: usize = 2;
 
-fn large_graph(zoom: f32) -> GraphState<String, String, String, Kind> {
+/// Cards are 160x100. The default pitch leaves gaps; the overlapping pitch
+/// stacks every card over its neighbours' sockets, so the card grid and the
+/// visible-piece clipping have work to do.
+const SPARSE_PITCH: (f32, f32) = (220.0, 140.0);
+const OVERLAPPING_PITCH: (f32, f32) = (110.0, 70.0);
+
+fn large_graph(zoom: f32, pitch: (f32, f32)) -> GraphState<String, String, String, Kind> {
     let mut graph = GraphState::default();
     for index in 0..COLUMNS * ROWS {
         let id = format!("n{index}");
         let position = Point::new(
-            (index % COLUMNS) as f32 * 220.0,
-            (index / COLUMNS) as f32 * 140.0,
+            (index % COLUMNS) as f32 * pitch.0,
+            (index / COLUMNS) as f32 * pitch.1,
         );
         graph.nodes.insert(
             id.clone(),
@@ -96,12 +102,12 @@ fn report(label: &str, mut samples: Vec<Duration>) {
     );
 }
 
-fn measure(cx: &mut gpui::TestAppContext, zoom: f32) {
+fn measure(cx: &mut gpui::TestAppContext, zoom: f32, pitch: (f32, f32)) {
     cx.update(|cx| {
         gpui_node_graph::init(cx);
         gpui_node_graph::set_node_graph_theme(cx, NodeGraphTheme::dark());
     });
-    let graph = large_graph(zoom);
+    let graph = large_graph(zoom, pitch);
     let (editor, cx) = cx.add_window_view(move |_, cx| NodeGraph::new(graph, cx));
     cx.run_until_parked();
     for _ in 0..5 {
@@ -129,11 +135,17 @@ fn measure(cx: &mut gpui::TestAppContext, zoom: f32) {
 #[gpui::test]
 #[ignore = "benchmark"]
 fn frame_cost_all_500_nodes_visible(cx: &mut gpui::TestAppContext) {
-    measure(cx, 0.2);
+    measure(cx, 0.2, SPARSE_PITCH);
 }
 
 #[gpui::test]
 #[ignore = "benchmark"]
 fn frame_cost_500_nodes_mostly_offscreen(cx: &mut gpui::TestAppContext) {
-    measure(cx, 1.0);
+    measure(cx, 1.0, SPARSE_PITCH);
+}
+
+#[gpui::test]
+#[ignore = "benchmark"]
+fn frame_cost_500_overlapping_nodes_visible(cx: &mut gpui::TestAppContext) {
+    measure(cx, 0.3, OVERLAPPING_PITCH);
 }
