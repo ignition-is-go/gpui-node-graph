@@ -2000,6 +2000,201 @@ impl IntoElement for MeasuredElement {
     }
 }
 
+/// A default-chrome port's socket and label row, in canvas coordinates.
+struct PortChrome<P> {
+    id: P,
+    dot: Bounds<Pixels>,
+    /// `None` when the default port scene draws a non-circular socket.
+    dot_paint: Option<DotPaint>,
+    row: Bounds<Pixels>,
+    /// Padding between the row's dot side and its label.
+    inset: Pixels,
+    align_end: bool,
+    label: SharedString,
+    label_color: gpui::Hsla,
+}
+
+struct DotPaint {
+    stroke: gpui::Hsla,
+    fill: gpui::Hsla,
+    border: Pixels,
+    glow: Vec<BoxShadow>,
+}
+
+/// Every default-chrome port socket and label as one element. With hundreds of
+/// nodes visible, a div per socket and per label row dominated the frame
+/// (layout, style refinement, listener registration). Geometry, hitboxes,
+/// cursors and listeners match what those divs did: each snaps its authored
+/// lengths and laid-out edges to device pixels as GPUI layout does, and a
+/// later port takes an event before an earlier one.
+fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>(
+    ports: Vec<PortChrome<P>>,
+    graph: WeakEntity<NodeGraph<T, N, P, C>>,
+    theme: Arc<NodeGraphTheme>,
+    font_size: Pixels,
+    draft_active: bool,
+) -> impl IntoElement {
+    let ports = Rc::new(ports);
+    let paint_ports = Rc::clone(&ports);
+    canvas(
+        move |bounds, window, _| {
+            // Layout rounds each authored length, then the resulting edges.
+            let place = |local: Bounds<Pixels>, window: &Window| {
+                let near = bounds.origin + local.origin.map(|length| window.pixel_snap(length));
+                let size = local.size.map(|length| window.pixel_snap(length));
+                Bounds::from_corners(
+                    near.map(|length| window.pixel_snap(length)),
+                    (near + point(size.width, size.height)).map(|length| window.pixel_snap(length)),
+                )
+            };
+            ports
+                .iter()
+                .map(|port| {
+                    let row = place(port.row, window);
+                    let dot = place(port.dot, window);
+                    (
+                        row,
+                        window.insert_hitbox(row, gpui::HitboxBehavior::Normal),
+                        dot,
+                        window.insert_hitbox(dot, gpui::HitboxBehavior::Normal),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+        move |_, placed, window, cx| {
+            let ports = paint_ports;
+            let text_style = window.text_style();
+            let line_height = window.pixel_snap(
+                text_style
+                    .line_height
+                    .to_pixels(font_size.into(), window.rem_size()),
+            );
+            let scale = window.scale_factor();
+            for (port, (row, row_hitbox, dot, dot_hitbox)) in ports.iter().zip(&placed) {
+                let inset = window.pixel_snap(port.inset);
+                let wrap_width = (text_style.white_space == gpui::WhiteSpace::Normal)
+                    .then(|| row.size.width - inset);
+                let mut run = text_style.to_run(port.label.len());
+                run.color = port.label_color;
+                if let Ok(lines) = window.text_system().shape_text(
+                    port.label.clone(),
+                    font_size,
+                    &[run],
+                    wrap_width,
+                    text_style.line_clamp,
+                ) {
+                    let mut size = gpui::Size::<Pixels>::default();
+                    for line in &lines {
+                        let line_size = line.size(line_height);
+                        size.height += line_size.height;
+                        size.width = size.width.max(line_size.width).ceil();
+                    }
+                    let size = size.map(|length| px((f32::from(length) * scale).ceil() / scale));
+                    let x = if port.align_end {
+                        row.right() - inset - size.width
+                    } else {
+                        row.left() + inset
+                    };
+                    let y = row.top() + (row.size.height - size.height) * 0.5;
+                    let text = Bounds::from_corners(
+                        point(window.pixel_snap(x), window.pixel_snap(y)),
+                        point(
+                            window.pixel_snap(x + size.width),
+                            window.pixel_snap(y + size.height),
+                        ),
+                    );
+                    let mut origin = text.origin;
+                    for line in &lines {
+                        let _ = line.paint(
+                            origin,
+                            line_height,
+                            text_style.text_align,
+                            Some(text),
+                            window,
+                            cx,
+                        );
+                        origin.y += line.size(line_height).height;
+                    }
+                }
+                if let Some(paint) = &port.dot_paint {
+                    let radius = dot.size.width.min(dot.size.height) * 0.5;
+                    window.paint_drop_shadows(*dot, radius.into(), &paint.glow);
+                    window.paint_quad(quad(
+                        *dot,
+                        radius,
+                        paint.fill,
+                        paint.border,
+                        paint.stroke,
+                        BorderStyle::Solid,
+                    ));
+                }
+                if draft_active {
+                    window.set_cursor_style(gpui::CursorStyle::Crosshair, row_hitbox);
+                }
+                window.set_cursor_style(gpui::CursorStyle::Crosshair, dot_hitbox);
+            }
+            let hits = Rc::new(
+                ports
+                    .iter()
+                    .zip(placed)
+                    .map(|(port, (_, row, _, dot))| (port.id.clone(), row, dot))
+                    .collect::<Vec<_>>(),
+            );
+            let down_hits = Rc::clone(&hits);
+            let down_graph = graph.clone();
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                for (id, row, dot) in down_hits.iter().rev() {
+                    let on_dot = dot.is_hovered(window);
+                    let on_row = row.is_hovered(window);
+                    let engage =
+                        event.button == MouseButton::Left && (on_dot || (on_row && draft_active));
+                    let menu = event.button == MouseButton::Right && (on_dot || on_row);
+                    if !engage && !menu {
+                        continue;
+                    }
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    let _ = down_graph.update(cx, |this, cx| {
+                        this.focus(window, cx);
+                        if menu {
+                            let local = this.local_screen(event.position);
+                            this.open_anchor_menu(id.clone(), local, cx);
+                        } else {
+                            this.engage_port(id, cx);
+                        }
+                    });
+                    return;
+                }
+            });
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                    return;
+                }
+                for (id, row, dot) in hits.iter().rev() {
+                    if !(dot.is_hovered(window) || (draft_active && row.is_hovered(window))) {
+                        continue;
+                    }
+                    cx.stop_propagation();
+                    let _ = graph.update(cx, |this, cx| {
+                        if this.draft.as_ref().is_some_and(|draft| &draft.origin != id) {
+                            this.finish_draft(id, cx);
+                        }
+                        // A port stops bubbling, so it must also end any node,
+                        // box, pan, or draft gesture the root owns.
+                        this.finish_left_gesture(true, &theme, cx);
+                    });
+                    return;
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// A ring from a node card's edge out to `width`: a centred zero-blur
 /// box-shadow or a solid outline.
 #[derive(Clone, Copy)]
@@ -8055,6 +8250,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         }
 
         let mut default_port_scene = world::WorldScene::new();
+        let mut port_chrome = Vec::new();
+        let mut port_probes = Vec::new();
         for port in self.graph.ports.values() {
             if body_anchored_nodes.contains(&port.node) || culled_nodes.contains(&port.node) {
                 continue;
@@ -8179,134 +8376,59 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let label_width =
                 80.0 + viewport.scale_length(theme.anchor.row_gap) + row_padding_x * 2.0;
             let row_height = viewport.scale_length(theme.anchor.row_height) + row_padding_y * 2.0;
-            let draft_active = self.draft.is_some();
-            let label_right_id = id.clone();
-            let label_down_id = id.clone();
-            let label_up_id = id.clone();
-            let label_up_theme = Arc::clone(&theme);
-            let label_element = div()
-                .absolute()
-                .left(px(label_x))
-                .top(px(position.y - row_height * 0.5))
-                .w(px(label_width))
-                .h(px(row_height))
-                .flex()
-                .items_center()
-                .when(port.direction == PortDirection::Input, |element| {
-                    element.pl(px(
-                        viewport.scale_length(theme.anchor.row_gap) + row_padding_x
-                    ))
-                })
-                .when(port.direction == PortDirection::Output, |element| {
-                    element
-                        .pr(px(
-                            viewport.scale_length(theme.anchor.row_gap) + row_padding_x
-                        ))
-                        .justify_end()
-                })
-                .text_size(px(viewport.scale_length(theme.anchor.label_font_size)))
-                .text_color(rgb(port_paint.label.rgb).opacity(port_paint.label.alpha))
-                .opacity(port_paint.opacity)
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        window.prevent_default();
-                        this.focus(window, cx);
-                        let local = this.local_screen(event.position);
-                        this.open_anchor_menu(label_right_id.clone(), local, cx);
-                    }),
-                )
-                .when(draft_active, |element| {
-                    element
-                        .cursor_crosshair()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                window.prevent_default();
-                                this.focus(window, cx);
-                                this.engage_port(&label_down_id, cx);
-                            }),
-                        )
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                                cx.stop_propagation();
-                                if this
-                                    .draft
-                                    .as_ref()
-                                    .is_some_and(|draft| draft.origin != label_up_id)
-                                {
-                                    this.finish_draft(&label_up_id, cx);
-                                }
-                                this.finish_left_gesture(true, &label_up_theme, cx);
-                            }),
-                        )
-                })
-                .child(port.label.clone());
-            let dot_up_theme = Arc::clone(&theme);
-            let dot_part = tagger.map(|_| part_tag::part_id("port", &id));
-            root = root.child(label_element).child(part_tag::tag(
-                tagger,
-                div()
-                    .absolute()
-                    .left(px(position.x - dot_radius))
-                    .top(px(position.y - dot_radius))
-                    .w(px(dot_size))
-                    .h(px(dot_size))
-                    .when(shape == style::DotShape::Circle, |element| {
-                        element
-                            .rounded_full()
-                            .shadow(compatible_glow)
-                            .border(px(viewport.scale_length(theme.anchor.dot_border_width)))
-                            .border_color(
-                                rgb(port_paint.stroke.rgb).opacity(port_paint.stroke.alpha),
-                            )
-                            .bg(rgb(port_paint.fill.rgb).opacity(port_paint.fill.alpha))
-                            .opacity(port_paint.opacity)
-                    })
-                    .cursor_crosshair()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener({
-                            let id = id.clone();
-                            move |this, event: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                window.prevent_default();
-                                this.focus(window, cx);
-                                let local = this.local_screen(event.position);
-                                this.open_anchor_menu(id.clone(), local, cx);
-                            }
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener({
-                            let id = id.clone();
-                            move |this, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                window.prevent_default();
-                                this.focus(window, cx);
-                                this.engage_port(&id, cx);
-                            }
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                            cx.stop_propagation();
-                            if this.draft.as_ref().is_some_and(|draft| draft.origin != id) {
-                                this.finish_draft(&id, cx);
-                            }
-                            // The port stops bubbling, so it must also terminate any
-                            // node, box, pan, or draft gesture owned by the root.
-                            this.finish_left_gesture(true, &dot_up_theme, cx);
-                        }),
-                    ),
-                || dot_part.unwrap_or_default(),
-            ));
+            if let Some(tagger) = tagger {
+                port_probes.push(tagger(
+                    div()
+                        .absolute()
+                        .left(px(position.x - dot_radius))
+                        .top(px(position.y - dot_radius))
+                        .w(px(dot_size))
+                        .h(px(dot_size))
+                        .into_any_element(),
+                    part_tag::part_id("port", &id),
+                ));
+            }
+            let color = |color: style::Color| -> gpui::Hsla {
+                rgb(color.rgb)
+                    .opacity(color.alpha * port_paint.opacity)
+                    .into()
+            };
+            port_chrome.push(PortChrome {
+                dot: Bounds::new(
+                    point(px(position.x - dot_radius), px(position.y - dot_radius)),
+                    gpui::size(px(dot_size), px(dot_size)),
+                ),
+                dot_paint: (shape == style::DotShape::Circle).then(|| DotPaint {
+                    stroke: color(port_paint.stroke),
+                    fill: color(port_paint.fill),
+                    border: px(viewport.scale_length(theme.anchor.dot_border_width)),
+                    glow: compatible_glow
+                        .into_iter()
+                        .map(|mut shadow| {
+                            shadow.color = shadow.color.opacity(port_paint.opacity);
+                            shadow
+                        })
+                        .collect(),
+                }),
+                row: Bounds::new(
+                    point(px(label_x), px(position.y - row_height * 0.5)),
+                    gpui::size(px(label_width), px(row_height)),
+                ),
+                inset: px(viewport.scale_length(theme.anchor.row_gap) + row_padding_x),
+                align_end: port.direction == PortDirection::Output,
+                label: port.label.clone().into(),
+                label_color: color(port_paint.label),
+                id,
+            });
         }
+        root = root.child(port_chrome_element(
+            port_chrome,
+            cx.weak_entity(),
+            Arc::clone(&theme),
+            px(viewport.scale_length(theme.anchor.label_font_size)),
+            self.draft.is_some(),
+        ));
+        root = root.children(port_probes);
 
         if tagger.is_some() {
             let pane = self.canvas_bounds.get().size;
@@ -10701,6 +10823,79 @@ mod tests {
             "node-graph.wire-point:wire.1",
         ] {
             assert!(parts.contains(id), "{id} missing from {parts:?}");
+        }
+    }
+
+    fn port_screen(
+        editor: &gpui::Entity<NodeGraph<Kind>>,
+        cx: &mut gpui::VisualTestContext,
+        port: &str,
+    ) -> gpui::Point<Pixels> {
+        editor.read_with(cx, |editor, _| {
+            let world = editor.resolved_port_position(&port.into()).unwrap();
+            let screen = editor.graph.viewport.world_to_screen(world);
+            editor.canvas_bounds.get().origin + point(px(screen.x), px(screen.y))
+        })
+    }
+
+    #[gpui::test]
+    fn port_sockets_and_labels_take_pointer_input(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let mut graph = interactive_graph();
+        graph.connections.clear();
+        graph.nodes.get_mut("b").unwrap().position = core::Point::new(300.0, 0.0);
+        graph.ports.get_mut("in").unwrap().position = core::Point::new(300.0, 25.0);
+        let (editor, cx) = cx.add_window_view(move |_, _| NodeGraph::new_for_test(graph));
+        let requested = Rc::new(RefCell::new(Vec::new()));
+        let observed = requested.clone();
+        let _subscription = cx.update(|_, app| {
+            app.subscribe(
+                &editor,
+                move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                    if let core::GraphEvent::ConnectionRequested { source, target } = event {
+                        observed.borrow_mut().push((source.clone(), target.clone()));
+                    }
+                },
+            )
+        });
+        cx.run_until_parked();
+        let out = port_screen(&editor, cx, "out");
+        let input = port_screen(&editor, cx, "in");
+        let input_label = input + point(px(30.0), px(0.0));
+        let none = gpui::Modifiers::default();
+
+        for (target, via) in [(input, "socket"), (input_label, "label")] {
+            cx.simulate_mouse_down(out, MouseButton::Left, none);
+            cx.simulate_mouse_move(target, MouseButton::Left, none);
+            cx.simulate_mouse_up(target, MouseButton::Left, none);
+            cx.run_until_parked();
+            assert_eq!(
+                requested.borrow_mut().drain(..).collect::<Vec<_>>(),
+                [("out".to_string(), "in".to_string())],
+                "releasing a draft on the input's {via} requests the connection"
+            );
+        }
+
+        editor.update(cx, |editor, _| {
+            editor.graph.connections.insert(
+                "wire".into(),
+                Connection {
+                    id: "wire".into(),
+                    source: "out".into(),
+                    target: "in".into(),
+                },
+            );
+        });
+        cx.run_until_parked();
+        for (target, via) in [(out, "socket"), (input_label, "label")] {
+            editor.update(cx, |editor, _| editor.anchor_menu = None);
+            cx.simulate_mouse_down(target, MouseButton::Right, none);
+            cx.simulate_mouse_up(target, MouseButton::Right, none);
+            let open = editor.read_with(cx, |editor, _| editor.anchor_menu_is_open());
+            assert!(
+                open,
+                "right-clicking a connected port's {via} opens its menu"
+            );
         }
     }
 
