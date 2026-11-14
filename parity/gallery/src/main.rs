@@ -5,8 +5,8 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, Pixels, SharedString, Window, WindowOptions,
+    AnyElement, App, AppContext, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, Pixels, SharedString, Window, WindowOptions,
 };
 use gpui_node_graph::{
     NodeCatalogItem, NodeGraph, NodeGraphTheme,
@@ -157,17 +157,18 @@ fn fixture(width: f32) -> GraphState<String, String, String, Kind> {
                 node_type: node.id.into(),
                 title: node.title.into(),
                 position,
-                size: Size {
-                    width,
-                    height: 0.0,
-                },
+                size: Size { width, height: 0.0 },
             },
         );
         let ports = node
             .inputs
             .iter()
             .map(|port| (port, PortDirection::Input))
-            .chain(node.outputs.iter().map(|port| (port, PortDirection::Output)));
+            .chain(
+                node.outputs
+                    .iter()
+                    .map(|port| (port, PortDirection::Output)),
+            );
         for ((id, label), direction) in ports {
             graph.ports.insert(
                 (*id).into(),

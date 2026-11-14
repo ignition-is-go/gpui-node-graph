@@ -93,20 +93,22 @@ fn App() -> impl IntoView {
             })
             .collect::<HashMap<_, _>>(),
     );
-    let on_event = Callback::new(move |event: GraphEvent<String, String, String>| match event {
-        GraphEvent::ConnectionRequested { source, target } => {
-            let id = format!("{source}->{target}");
-            connections.update(|map| {
-                map.insert(id.clone(), ConnectionEntry { id, source, target });
-            });
-        }
-        GraphEvent::ConnectionRemoved { id } => {
-            connections.update(|map| {
-                map.remove(&id);
-            });
-        }
-        _ => {}
-    });
+    let on_event = Callback::new(
+        move |event: GraphEvent<String, String, String>| match event {
+            GraphEvent::ConnectionRequested { source, target } => {
+                let id = format!("{source}->{target}");
+                connections.update(|map| {
+                    map.insert(id.clone(), ConnectionEntry { id, source, target });
+                });
+            }
+            GraphEvent::ConnectionRemoved { id } => {
+                connections.update(|map| {
+                    map.remove(&id);
+                });
+            }
+            _ => {}
+        },
+    );
     let nodes = NODES.iter().map(|node| {
         let position = RwSignal::new(Position::new(node.x as f64, node.y as f64));
         let title = node.title;
