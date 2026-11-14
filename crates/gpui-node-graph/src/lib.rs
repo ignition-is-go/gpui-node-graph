@@ -2000,6 +2000,75 @@ impl IntoElement for MeasuredElement {
     }
 }
 
+/// Paints its child as one scene layer, so every primitive inside shares a
+/// single draw order. GPUI otherwise searches its bounds tree once per quad and
+/// glyph to order it; for a card that is dozens of searches instead of one.
+/// Within a layer GPUI draws shadows, then quads, then paths, then glyphs, so
+/// only content whose primitives already stack in that order may use it.
+struct LayerElement {
+    child: Option<AnyElement>,
+    /// How far the child paints outside its bounds (shadows, rings).
+    outset: Pixels,
+}
+
+impl Element for LayerElement {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut child = self.child.take().expect("layer element laid out once");
+        let layout_id = child.request_layout(window, cx);
+        (layout_id, child)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.paint_layer(bounds.dilate(self.outset), |window| child.paint(window, cx));
+    }
+}
+
+impl IntoElement for LayerElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 impl<N, C> BoxSelection<N, C> {
     fn rect(&self) -> core::Rect {
         let x = self.start.x.min(self.current.x);
@@ -7603,7 +7672,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 );
             }
             let card_id = id.clone();
-            root = root.child(part_tag::tag(
+            let card = part_tag::tag(
                 tagger,
                 div()
                     .absolute()
@@ -7776,7 +7845,29 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         })
                     }),
                 || part_tag::part_id("node", &card_id),
-            ));
+            );
+            // Default chrome stacks as GPUI orders a layer (card shadow, quads,
+            // then glyphs); a custom body may not, so it keeps per-primitive order.
+            root = root.child(if has_custom_body {
+                card
+            } else {
+                let outset = theme
+                    .node
+                    .shadow
+                    .iter()
+                    .chain(&theme.node.shadow_selected)
+                    .map(|shadow| {
+                        shadow.offset_x.abs().max(shadow.offset_y.abs())
+                            + shadow.blur
+                            + shadow.spread.max(0.0)
+                    })
+                    .fold(theme.node.outline_selected.width, f32::max);
+                LayerElement {
+                    child: Some(card),
+                    outset: px(viewport.scale_length(outset)),
+                }
+                .into_any_element()
+            });
             if theme.node.resizable {
                 let resize_theme = Arc::clone(&theme);
                 root = root.child(
