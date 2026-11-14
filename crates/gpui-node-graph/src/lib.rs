@@ -1,12 +1,12 @@
 mod windows;
 
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, BoxShadow, Context, DispatchPhase, Element, ElementId,
-    ElementInputHandler, EntityInputHandler, FocusHandle, FontWeight, Global, GlobalElementId,
-    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Render, ScrollHandle, ScrollWheelEvent, ShapedLine,
-    SharedString, TextAlign, TextRun, UTF16Selection, WeakEntity, Window, canvas, div, point,
-    prelude::*, px, quad, rgb,
+    AnyElement, App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, DispatchPhase, Element,
+    ElementId, ElementInputHandler, EntityInputHandler, FocusHandle, FontWeight, Global,
+    GlobalElementId, InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollHandle, ScrollWheelEvent,
+    ShapedLine, SharedString, TextAlign, TextRun, UTF16Selection, WeakEntity, Window, canvas, div,
+    point, prelude::*, px, quad, rgb,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -309,11 +309,6 @@ impl NodeDrop {
 #[derive(Clone)]
 pub enum AnchorMenuAction {
     RemoveConnections,
-    /// Remove the single live connection associated with this generated menu row.
-    ///
-    /// This action is populated by the graph's built-in anchor menu. Consumer-built
-    /// menus should use [`AnchorMenuItem::action`] for custom behavior.
-    RemoveConnection,
     RemoveBrokenConnections,
     Custom(Rc<dyn Fn()>),
 }
@@ -322,7 +317,6 @@ impl std::fmt::Debug for AnchorMenuAction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RemoveConnections => formatter.write_str("RemoveConnections"),
-            Self::RemoveConnection => formatter.write_str("RemoveConnection"),
             Self::RemoveBrokenConnections => formatter.write_str("RemoveBrokenConnections"),
             Self::Custom(_) => formatter.write_str("Custom(..)"),
         }
@@ -362,11 +356,10 @@ impl<P: core::PortId> AnchorMenuBuilder<P> {
 }
 
 #[derive(Clone, Debug)]
-struct ActiveAnchorMenu<P, C> {
+struct ActiveAnchorMenu<P> {
     port: P,
     position: core::Point,
     items: Vec<AnchorMenuItem>,
-    connection_ids: Vec<Option<C>>,
 }
 
 /// Consumer-side bridge to a retained [`NodeGraph`] entity.
@@ -2003,6 +1996,11 @@ impl IntoElement for MeasuredElement {
 /// A default-chrome port's socket and label row, in canvas coordinates.
 struct PortChrome<P> {
     id: P,
+    /// The owning card is dragging: its opacity makes the card a stacking
+    /// context, so its socket sits under the cards stacked above it.
+    dragging: bool,
+    /// Cards stacked above the owner that reach this port's row or socket.
+    above: Vec<Bounds<Pixels>>,
     dot: Bounds<Pixels>,
     /// `None` when the default port scene draws a non-circular socket.
     dot_paint: Option<DotPaint>,
@@ -2052,12 +2050,13 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                 .map(|port| {
                     let row = place(port.row, window);
                     let dot = place(port.dot, window);
-                    (
+                    PlacedPort {
                         row,
-                        window.insert_hitbox(row, gpui::HitboxBehavior::Normal),
+                        row_hitbox: window.insert_hitbox(row, gpui::HitboxBehavior::Normal),
                         dot,
-                        window.insert_hitbox(dot, gpui::HitboxBehavior::Normal),
-                    )
+                        dot_hitbox: window.insert_hitbox(dot, gpui::HitboxBehavior::Normal),
+                        above: port.above.iter().map(|card| place(*card, window)).collect(),
+                    }
                 })
                 .collect::<Vec<_>>()
         },
@@ -2070,7 +2069,10 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                     .to_pixels(font_size.into(), window.rem_size()),
             );
             let scale = window.scale_factor();
-            for (port, (row, row_hitbox, dot, dot_hitbox)) in ports.iter().zip(&placed) {
+            // Labels belong to their card, so an upper card hides them; every
+            // socket paints over every label.
+            for (port, placed) in ports.iter().zip(&placed) {
+                let row = &placed.row;
                 let inset = window.pixel_snap(port.inset);
                 let wrap_width = (text_style.white_space == gpui::WhiteSpace::Normal)
                     .then(|| row.size.width - inset);
@@ -2103,30 +2105,44 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                             window.pixel_snap(y + size.height),
                         ),
                     );
-                    let mut origin = text.origin;
-                    for line in &lines {
-                        let _ = line.paint(
-                            origin,
-                            line_height,
-                            text_style.text_align,
-                            Some(text),
-                            window,
-                            cx,
-                        );
-                        origin.y += line.size(line_height).height;
+                    for visible in visible_pieces(*row, &placed.above) {
+                        window.with_content_mask(Some(ContentMask { bounds: visible }), |window| {
+                            let mut origin = text.origin;
+                            for line in &lines {
+                                let _ = line.paint(
+                                    origin,
+                                    line_height,
+                                    text_style.text_align,
+                                    Some(text),
+                                    window,
+                                    cx,
+                                );
+                                origin.y += line.size(line_height).height;
+                            }
+                        });
                     }
                 }
+            }
+            for (port, placed) in ports.iter().zip(&placed) {
+                let (dot, row_hitbox, dot_hitbox) =
+                    (&placed.dot, &placed.row_hitbox, &placed.dot_hitbox);
                 if let Some(paint) = &port.dot_paint {
                     let radius = dot.size.width.min(dot.size.height) * 0.5;
-                    window.paint_drop_shadows(*dot, radius.into(), &paint.glow);
-                    window.paint_quad(quad(
-                        *dot,
-                        radius,
-                        paint.fill,
-                        paint.border,
-                        paint.stroke,
-                        BorderStyle::Solid,
-                    ));
+                    let hidden_by: &[Bounds<Pixels>] =
+                        if port.dragging { &placed.above } else { &[] };
+                    for visible in visible_pieces(*dot, hidden_by) {
+                        window.with_content_mask(Some(ContentMask { bounds: visible }), |window| {
+                            window.paint_drop_shadows(*dot, radius.into(), &paint.glow);
+                            window.paint_quad(quad(
+                                *dot,
+                                radius,
+                                paint.fill,
+                                paint.border,
+                                paint.stroke,
+                                BorderStyle::Solid,
+                            ));
+                        });
+                    }
                 }
                 if draft_active {
                     window.set_cursor_style(gpui::CursorStyle::Crosshair, row_hitbox);
@@ -2137,7 +2153,7 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                 ports
                     .iter()
                     .zip(placed)
-                    .map(|(port, (_, row, _, dot))| (port.id.clone(), row, dot))
+                    .map(|(port, placed)| (port.id.clone(), port.dragging, placed))
                     .collect::<Vec<_>>(),
             );
             let down_hits = Rc::clone(&hits);
@@ -2146,70 +2162,116 @@ fn port_chrome_element<T: PortType, N: core::NodeId, P: core::PortId, C: core::C
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                for (id, row, dot) in down_hits.iter().rev() {
-                    let on_dot = dot.is_hovered(window);
-                    let on_row = row.is_hovered(window);
-                    let engage =
-                        event.button == MouseButton::Left && (on_dot || (on_row && draft_active));
-                    let menu = event.button == MouseButton::Right && (on_dot || on_row);
-                    if !engage && !menu {
-                        continue;
-                    }
-                    let local = down_graph
-                        .read_with(cx, |this, _| {
-                            let at = this.local_screen(event.position);
-                            this.port_covered_at(id, at)
-                        })
-                        .unwrap_or(false);
-                    if local {
-                        continue;
-                    }
-                    cx.stop_propagation();
-                    window.prevent_default();
-                    let _ = down_graph.update(cx, |this, cx| {
-                        this.focus(window, cx);
-                        if menu {
-                            let local = this.local_screen(event.position);
-                            this.open_anchor_menu(id.clone(), local, cx);
-                        } else {
-                            this.engage_port(id, cx);
-                        }
-                    });
+                let rows = match event.button {
+                    MouseButton::Left => draft_active,
+                    MouseButton::Right => true,
+                    _ => return,
+                };
+                let Some(id) = port_under(down_hits.as_slice(), event.position, rows, window)
+                else {
                     return;
-                }
+                };
+                cx.stop_propagation();
+                window.prevent_default();
+                let _ = down_graph.update(cx, |this, cx| {
+                    this.focus(window, cx);
+                    if event.button == MouseButton::Right {
+                        let local = this.local_screen(event.position);
+                        this.open_anchor_menu(id.clone(), local, cx);
+                    } else {
+                        this.engage_port(&id, cx);
+                    }
+                });
             });
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
                     return;
                 }
-                for (id, row, dot) in hits.iter().rev() {
-                    if !(dot.is_hovered(window) || (draft_active && row.is_hovered(window))) {
-                        continue;
-                    }
-                    let covered = graph
-                        .read_with(cx, |this, _| {
-                            this.port_covered_at(id, this.local_screen(event.position))
-                        })
-                        .unwrap_or(false);
-                    if covered {
-                        continue;
-                    }
-                    cx.stop_propagation();
-                    let _ = graph.update(cx, |this, cx| {
-                        if this.draft.as_ref().is_some_and(|draft| &draft.origin != id) {
-                            this.finish_draft(id, cx);
-                        }
-                        // A port stops bubbling, so it must also end any node,
-                        // box, pan, or draft gesture the root owns.
-                        this.finish_left_gesture(true, &theme, cx);
-                    });
+                let Some(id) = port_under(hits.as_slice(), event.position, draft_active, window)
+                else {
                     return;
-                }
+                };
+                cx.stop_propagation();
+                let _ = graph.update(cx, |this, cx| {
+                    if this.draft.as_ref().is_some_and(|draft| draft.origin != id) {
+                        this.finish_draft(&id, cx);
+                    }
+                    // A port stops bubbling, so it must also end any node,
+                    // box, pan, or draft gesture the root owns.
+                    this.finish_left_gesture(true, &theme, cx);
+                });
             });
         },
     )
     .absolute()
     .size_full()
+}
+
+/// A port's placed geometry and hitboxes for one frame.
+struct PlacedPort {
+    row: Bounds<Pixels>,
+    row_hitbox: gpui::Hitbox,
+    dot: Bounds<Pixels>,
+    dot_hitbox: gpui::Hitbox,
+    above: Vec<Bounds<Pixels>>,
+}
+
+/// The port that takes a pointer press at `at`, as a browser resolves it: a
+/// socket paints above every card, except a dragging card's sockets, which sit
+/// under the cards stacked above them; a label row sits inside its card, so an
+/// upper card covers it. `ports` runs bottom to top.
+fn port_under<P: Clone>(
+    ports: &[(P, bool, PlacedPort)],
+    at: gpui::Point<Pixels>,
+    rows: bool,
+    window: &Window,
+) -> Option<P> {
+    let covered = |placed: &PlacedPort| placed.above.iter().any(|card| card.contains(&at));
+    ports
+        .iter()
+        .rev()
+        .find(|(_, dragging, placed)| {
+            placed.dot_hitbox.is_hovered(window) && !(*dragging && covered(placed))
+        })
+        .or_else(|| {
+            ports.iter().rev().find(|(_, _, placed)| {
+                rows && placed.row_hitbox.is_hovered(window) && !covered(placed)
+            })
+        })
+        .map(|(id, _, _)| id.clone())
+}
+
+/// `area` less every rectangle in `hidden`, as the rectangles left over.
+fn visible_pieces(area: Bounds<Pixels>, hidden: &[Bounds<Pixels>]) -> Vec<Bounds<Pixels>> {
+    let mut pieces = vec![area];
+    for card in hidden {
+        pieces = pieces
+            .into_iter()
+            .flat_map(|piece| {
+                if !piece.intersects(card) {
+                    return vec![piece];
+                }
+                let cut = piece.intersect(card);
+                [
+                    (piece.origin, point(piece.right(), cut.top())),
+                    (point(piece.left(), cut.bottom()), piece.bottom_right()),
+                    (
+                        point(piece.left(), cut.top()),
+                        point(cut.left(), cut.bottom()),
+                    ),
+                    (
+                        point(cut.right(), cut.top()),
+                        point(piece.right(), cut.bottom()),
+                    ),
+                ]
+                .into_iter()
+                .map(|(from, to)| Bounds::from_corners(from, to))
+                .filter(|slab| slab.size.width > px(0.0) && slab.size.height > px(0.0))
+                .collect()
+            })
+            .collect();
+    }
+    pieces
 }
 
 /// Card rectangles bucketed by world-space cell, each tagged with its stacking
@@ -2295,6 +2357,34 @@ impl CardGrid {
                         .iter()
                         .any(|(above, card)| *above > z && card.contains(point))
                 })
+    }
+
+    /// The cards stacked above `z` that share a point with `area`.
+    fn above(&self, z: usize, area: Bounds<Pixels>) -> Vec<core::Rect> {
+        if !self.overlapping {
+            return Vec::new();
+        }
+        let area = core::Rect {
+            origin: core::Point::new(f32::from(area.origin.x), f32::from(area.origin.y)),
+            size: core::Size {
+                width: f32::from(area.size.width),
+                height: f32::from(area.size.height),
+            },
+        };
+        let mut found: Vec<(usize, core::Rect)> = Vec::new();
+        for x in Self::cell(area.origin.x)..=Self::cell(area.origin.x + area.size.width) {
+            for y in Self::cell(area.origin.y)..=Self::cell(area.origin.y + area.size.height) {
+                for (above, card) in self.cells.get(&(x, y)).into_iter().flatten() {
+                    if *above > z
+                        && touches(card, &area)
+                        && found.iter().all(|(seen, _)| seen != above)
+                    {
+                        found.push((*above, *card));
+                    }
+                }
+            }
+        }
+        found.into_iter().map(|(_, card)| card).collect()
     }
 }
 
@@ -2591,7 +2681,7 @@ pub struct NodeGraph<
     node_type_registry_error: Option<RegistryError>,
     catalog_menu: Option<CatalogMenu<P>>,
     anchor_menu_builder: Option<AnchorMenuBuilder<P>>,
-    anchor_menu: Option<ActiveAnchorMenu<P, C>>,
+    anchor_menu: Option<ActiveAnchorMenu<P>>,
     catalog_scroll_handle: ScrollHandle,
     node_body_renderer: Option<Box<dyn NodeBodyRenderer<T, N, P, C>>>,
     world_node_body_renderer: Option<Box<dyn WorldNodeBodyRenderer<T, N, P>>>,
@@ -2835,115 +2925,38 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         self.anchor_menu.is_some()
     }
 
+    /// The items a right-click on `port_id` offers. A builder set with
+    /// [`Self::with_anchor_menu_builder`] replaces the built-in items wholesale,
+    /// and an empty list from it opens nothing. Without one, leptos-node-graph
+    /// 0.2.2's two items, each enabled only when it has something to remove.
     pub fn anchor_menu_items(&self, port_id: &P) -> Vec<AnchorMenuItem> {
-        self.anchor_menu_entries(port_id)
-            .into_iter()
-            .map(|(item, _)| item)
-            .collect()
-    }
-
-    fn anchor_menu_entries(&self, port_id: &P) -> Vec<(AnchorMenuItem, Option<C>)> {
         let Some(port) = self.graph.ports.get(port_id) else {
             return Vec::new();
         };
         if let Some(builder) = &self.anchor_menu_builder {
-            return builder
-                .build(port_id, port.direction)
-                .into_iter()
-                .map(|item| (item, None))
-                .collect();
+            return builder.build(port_id, port.direction);
         }
-        let mut live = self
-            .graph
-            .connections
-            .values()
-            .filter(|connection| connection.source == *port_id || connection.target == *port_id)
-            .map(|connection| {
-                let far_port_id = if connection.source == *port_id {
-                    &connection.target
-                } else {
-                    &connection.source
-                };
-                let far_port = self.graph.ports.get(far_port_id);
-                let far_node = far_port.and_then(|far_port| self.graph.nodes.get(&far_port.node));
-                let node_label = far_node
-                    .map(|node| node.title.as_str())
-                    .filter(|title| !title.is_empty())
-                    .map_or_else(|| format!("{:?}", far_port_id), ToOwned::to_owned);
-                let anchor_label = far_port
-                    .map(|far_port| far_port.label.as_str())
-                    .filter(|label| !label.is_empty())
-                    .map_or_else(|| format!("{:?}", far_port_id), ToOwned::to_owned);
-                let relation = if port.direction == PortDirection::Input {
-                    "from"
-                } else {
-                    "to"
-                };
-                (
-                    format!("Disconnect {relation} {node_label} \u{2192} {anchor_label}"),
-                    connection.id.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        live.sort_by(|(left_label, left_id), (right_label, right_id)| {
-            left_label
-                .cmp(right_label)
-                .then_with(|| stable_hash(left_id).cmp(&stable_hash(right_id)))
-        });
         let has_broken = self
             .dangling_connections
             .iter()
             .any(|connection| connection.source == *port_id || connection.target == *port_id);
-        if live.is_empty() && !has_broken {
-            return ["Disconnect all", "Remove broken connections"]
-                .into_iter()
-                .zip([
-                    AnchorMenuAction::RemoveConnections,
-                    AnchorMenuAction::RemoveBrokenConnections,
-                ])
-                .map(|(label, action)| {
-                    (
-                        AnchorMenuItem {
-                            label: label.into(),
-                            action,
-                            enabled: false,
-                        },
-                        None,
-                    )
-                })
-                .collect();
-        }
-        let mut items = vec![(
+        let has_connections =
+            has_broken
+                || self.graph.connections.values().any(|connection| {
+                    connection.source == *port_id || connection.target == *port_id
+                });
+        vec![
             AnchorMenuItem {
-                label: "Disconnect all".into(),
+                label: "Remove connections".into(),
                 action: AnchorMenuAction::RemoveConnections,
-                enabled: true,
+                enabled: has_connections,
             },
-            None,
-        )];
-        if live.len() > 1 {
-            items.extend(live.into_iter().map(|(label, connection_id)| {
-                (
-                    AnchorMenuItem {
-                        label,
-                        action: AnchorMenuAction::RemoveConnection,
-                        enabled: true,
-                    },
-                    Some(connection_id),
-                )
-            }));
-        }
-        if has_broken {
-            items.push((
-                AnchorMenuItem {
-                    label: "Remove broken connections".into(),
-                    action: AnchorMenuAction::RemoveBrokenConnections,
-                    enabled: true,
-                },
-                None,
-            ));
-        }
-        items
+            AnchorMenuItem {
+                label: "Remove broken connections".into(),
+                action: AnchorMenuAction::RemoveBrokenConnections,
+                enabled: has_broken,
+            },
+        ]
     }
 
     pub fn with_catalog(mut self, catalog: Vec<NodeCatalogItem<T>>) -> Self {
@@ -4738,24 +4751,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         nodes
     }
 
-    /// True when a card stacked above `port`'s card holds the screen point, so
-    /// the port is hidden there as a Leptos socket inside its card would be.
-    fn port_covered_at(&self, port: &P, screen: core::Point) -> bool {
-        let Some(owner) = self.graph.ports.get(port).map(|port| &port.node) else {
-            return false;
-        };
-        let world = self.graph.viewport.screen_to_world(screen);
-        self.stack_order()
-            .into_iter()
-            .rev()
-            .take_while(|node| &node.id != owner)
-            .any(|node| {
-                core::Rect {
-                    origin: node.position,
-                    size: self.resolved_node_size(&node.id).unwrap_or(node.size),
-                }
-                .contains(world)
-            })
+    fn node_is_dragging(&self, node: &N) -> bool {
+        self.drag
+            .as_ref()
+            .is_some_and(|drag| drag.starts.iter().any(|(id, _)| id == node))
     }
 
     /// The port under `screen` within `radius`: nearest wins; a tie goes to the
@@ -4782,13 +4781,42 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             .map(|(z, node)| (&node.id, z))
             .collect();
         let z_of = |id: &P| self.graph.ports.get(id).and_then(|port| z.get(&port.node));
-        let top = self
-            .node_at_screen(screen)
-            .and_then(|node| z.get(&node).copied());
-        near.retain(|(id, _)| top.is_none_or(|top| z_of(id).is_none_or(|z| *z >= top)));
+        let world = self.graph.viewport.screen_to_world(screen);
+        let cards: Vec<(usize, core::Rect)> = self
+            .stack_order()
+            .into_iter()
+            .enumerate()
+            .map(|(z, node)| {
+                let size = self.resolved_node_size(&node.id).unwrap_or(node.size);
+                (
+                    z,
+                    core::Rect {
+                        origin: node.position,
+                        size,
+                    },
+                )
+            })
+            .collect();
+        // A socket is above every card unless its card is dragging: a dragged
+        // card's opacity makes it a stacking context holding its own sockets.
+        let dragging = |id: &P| {
+            self.graph
+                .ports
+                .get(id)
+                .is_some_and(|port| self.node_is_dragging(&port.node))
+        };
+        near.retain(|(id, _)| {
+            !dragging(id)
+                || z_of(id).is_none_or(|owner| {
+                    !cards
+                        .iter()
+                        .any(|(z, card)| z > owner && card.contains(world))
+                })
+        });
         near.into_iter()
             .min_by(|(left, ld), (right, rd)| {
                 ld.total_cmp(rd)
+                    .then_with(|| dragging(left).cmp(&dragging(right)))
                     .then_with(|| z_of(right).cmp(&z_of(left)))
                     .then_with(|| format!("{right:?}").cmp(&format!("{left:?}")))
             })
@@ -5734,13 +5762,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
 
     fn open_anchor_menu(&mut self, port_id: P, position: core::Point, cx: &mut Context<Self>) {
         self.commit_group_editor(cx);
-        let entries = self.anchor_menu_entries(&port_id);
-        let (items, connection_ids): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let items = self.anchor_menu_items(&port_id);
         self.anchor_menu = (!items.is_empty()).then_some(ActiveAnchorMenu {
             port: port_id,
             position,
             items,
-            connection_ids,
         });
         self.catalog_menu = None;
         cx.notify();
@@ -5755,20 +5781,12 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
             return;
         };
         let broken_only = matches!(&item.action, AnchorMenuAction::RemoveBrokenConnections);
-        let specific_connection = match item.action {
-            AnchorMenuAction::Custom(callback) => {
-                callback();
-                cx.notify();
-                return;
-            }
-            AnchorMenuAction::RemoveConnection => {
-                menu.connection_ids.get(index).and_then(Clone::clone)
-            }
-            AnchorMenuAction::RemoveConnections | AnchorMenuAction::RemoveBrokenConnections => None,
-        };
-        let mut strict_ids: Vec<C> = if let Some(id) = specific_connection {
-            vec![id]
-        } else if broken_only {
+        if let AnchorMenuAction::Custom(callback) = item.action {
+            callback();
+            cx.notify();
+            return;
+        }
+        let mut strict_ids: Vec<C> = if broken_only {
             Vec::new()
         } else {
             self.graph
@@ -7686,11 +7704,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
         let mut port_order: Vec<(usize, P)> = Vec::new();
         let mut card_grid = CardGrid::default();
         for (z, node) in nodes.iter().enumerate() {
+            let size = self.resolved_node_size(&node.id).unwrap_or(node.size);
             card_grid.insert(
                 z,
                 core::Rect {
-                    origin: node.position,
-                    size: self.resolved_node_size(&node.id).unwrap_or(node.size),
+                    origin: viewport.world_to_screen(node.position),
+                    size: core::Size {
+                        width: viewport.scale_length(size.width),
+                        height: viewport.scale_length(size.height),
+                    },
                 },
             );
         }
@@ -8469,10 +8491,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             let world_position = self
                 .resolved_port_position(&port.id)
                 .unwrap_or(port.position);
-            if card_grid.covers(*z, world_position) {
-                continue;
-            }
             let position = viewport.world_to_screen(world_position);
+            let owner_dragging = self.node_is_dragging(&port.node);
+            let hidden_shape = owner_dragging && card_grid.covers(*z, position);
             let connected = connected_ports.contains(&port.id);
             let is_source = self
                 .draft
@@ -8509,7 +8530,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 .dot_shape
                 .unwrap_or(theme.anchor.default_dot_shape);
             let world_dot_radius = theme.anchor.dot_size * 0.5;
-            if presentation.multi {
+            if presentation.multi && !hidden_shape {
                 let mut ghost_center = world_position;
                 let offset = theme.anchor.dot_size * (5.0 / 24.0);
                 ghost_center.x += if port.direction == PortDirection::Input {
@@ -8537,7 +8558,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     );
                 }
             }
-            if shape != style::DotShape::Circle {
+            if shape != style::DotShape::Circle && !hidden_shape {
                 push_dot_shape(
                     &mut default_port_scene,
                     world_position,
@@ -8605,11 +8626,28 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                     .opacity(color.alpha * port_paint.opacity)
                     .into()
             };
+            let row = Bounds::new(
+                point(px(label_x), px(position.y - row_height * 0.5)),
+                gpui::size(px(label_width), px(row_height)),
+            );
+            let dot = Bounds::new(
+                point(px(position.x - dot_radius), px(position.y - dot_radius)),
+                gpui::size(px(dot_size), px(dot_size)),
+            );
+            let above = card_grid
+                .above(*z, row.union(&dot))
+                .into_iter()
+                .map(|card| {
+                    Bounds::new(
+                        point(px(card.origin.x), px(card.origin.y)),
+                        gpui::size(px(card.size.width), px(card.size.height)),
+                    )
+                })
+                .collect();
             port_chrome.push(PortChrome {
-                dot: Bounds::new(
-                    point(px(position.x - dot_radius), px(position.y - dot_radius)),
-                    gpui::size(px(dot_size), px(dot_size)),
-                ),
+                dragging: owner_dragging,
+                above,
+                dot,
                 dot_paint: (shape == style::DotShape::Circle).then(|| DotPaint {
                     stroke: color(port_paint.stroke),
                     fill: color(port_paint.fill),
@@ -8622,10 +8660,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         })
                         .collect(),
                 }),
-                row: Bounds::new(
-                    point(px(label_x), px(position.y - row_height * 0.5)),
-                    gpui::size(px(label_width), px(row_height)),
-                ),
+                row,
                 inset: px(viewport.scale_length(theme.anchor.row_gap) + row_padding_x),
                 align_end: port.direction == PortDirection::Output,
                 label: port.label.clone().into(),
@@ -8633,6 +8668,9 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 id,
             });
         }
+        // Sockets of cards that are not dragging sit above every card, so they
+        // paint and hit-test after the dragged cards' own sockets.
+        port_chrome.sort_by_key(|port| !port.dragging);
         root = root.child(port_chrome_element(
             port_chrome,
             cx.weak_entity(),
@@ -11111,14 +11149,23 @@ mod tests {
         }
     }
 
-    #[gpui::test]
-    fn a_socket_under_an_upper_card_takes_no_press(cx: &mut gpui::TestAppContext) {
-        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+    fn overlapped_cards_graph() -> GraphState<String, String, String, Kind> {
         let mut graph = interactive_graph();
         graph.connections.clear();
         graph.nodes.get_mut("b").unwrap().position = core::Point::new(30.0, 0.0);
         graph.ports.get_mut("in").unwrap().position = core::Point::new(30.0, 25.0);
-        let (editor, cx) = cx.add_window_view(move |_, _| NodeGraph::new_for_test(graph));
+        graph
+    }
+
+    /// leptos-node-graph 0.2.2: the dot is `position: relative; z-index: 1`
+    /// inside a card with no stacking context, so a lower card's socket paints
+    /// above an upper card and takes the press (`elementsFromPoint` in
+    /// parity/capture.py records dot, card, card).
+    #[gpui::test]
+    fn a_socket_under_an_upper_card_still_takes_the_press(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (editor, cx) =
+            cx.add_window_view(move |_, _| NodeGraph::new_for_test(overlapped_cards_graph()));
         cx.run_until_parked();
         let none = gpui::Modifiers::default();
 
@@ -11126,27 +11173,44 @@ mod tests {
         cx.simulate_mouse_down(covered, MouseButton::Left, none);
         cx.run_until_parked();
         editor.read_with(cx, |editor, _| {
-            assert!(
-                editor.draft.is_none(),
-                "a socket covered by an upper card must not start a connection"
-            );
-            assert!(
-                editor.graph.selected_nodes.contains("b"),
-                "the press lands on the upper card"
-            );
-        });
-        cx.simulate_mouse_up(covered, MouseButton::Left, none);
-
-        let upper = port_screen(&editor, cx, "in");
-        cx.simulate_mouse_down(upper, MouseButton::Left, none);
-        cx.run_until_parked();
-        editor.read_with(cx, |editor, _| {
             assert_eq!(
                 editor.draft.as_ref().map(|draft| draft.origin.as_str()),
-                Some("in"),
-                "the upper card's own socket still engages"
+                Some("out"),
+                "the lower card's socket takes the press over the upper card"
             );
+            assert!(!editor.graph.selected_nodes.contains("b"));
         });
+    }
+
+    /// A dragged card has opacity below 1, which makes it a stacking context:
+    /// its sockets sit under the cards stacked above it, while a socket of a
+    /// card that is not dragging stays above them.
+    #[gpui::test]
+    fn a_dragging_card_keeps_its_sockets_under_the_cards_above_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
+        let (editor, cx) =
+            cx.add_window_view(move |_, _| NodeGraph::new_for_test(overlapped_cards_graph()));
+        cx.run_until_parked();
+        let covered = editor.read_with(cx, |editor, _| {
+            editor
+                .graph
+                .viewport
+                .world_to_screen(editor.resolved_port_position(&"out".into()).unwrap())
+        });
+        let socket_at = |editor: &NodeGraph<Kind>| editor.port_at_screen(covered, 6.0);
+
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(socket_at(editor).as_deref(), Some("out"), "idle");
+        });
+        for (dragged, expected) in [("a", None), ("b", Some("out"))] {
+            editor.update(cx, |editor, cx| {
+                editor.begin_node_drag(&dragged.into(), covered, false, false, cx);
+            });
+            editor.read_with(cx, |editor, _| {
+                assert_eq!(socket_at(editor).as_deref(), expected, "dragging {dragged}");
+            });
+            editor.update(cx, |editor, _| editor.drag = None);
+        }
     }
 
     fn overlapping_ports_graph() -> GraphState<String, String, String, Kind> {
@@ -11410,68 +11474,71 @@ mod tests {
     fn default_anchor_menu_tracks_live_and_broken_connections() {
         let mut editor = NodeGraph::new_for_test(interactive_graph());
         let items = editor.anchor_menu_items(&"out".into());
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "Disconnect all");
+        let state = |items: &[AnchorMenuItem]| {
+            items
+                .iter()
+                .map(|item| (item.label.clone(), item.enabled))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            state(&items),
+            [
+                ("Remove connections".to_string(), true),
+                ("Remove broken connections".to_string(), false)
+            ]
+        );
         editor.remove_port_to_tombstones(&"in".into()).unwrap();
         let items = editor.anchor_menu_items(&"out".into());
         assert_eq!(
-            items
-                .iter()
-                .map(|item| item.label.as_str())
-                .collect::<Vec<_>>(),
-            ["Disconnect all", "Remove broken connections"]
+            state(&items),
+            [
+                ("Remove connections".to_string(), true),
+                ("Remove broken connections".to_string(), true)
+            ]
         );
     }
 
-    #[test]
-    fn default_anchor_menu_names_each_far_endpoint_when_multiple_are_connected() {
+    /// 0.2.2 swallows the right click without opening a panel when a consumer
+    /// builder returns no items, so an app supplies its own menu logic this way.
+    #[gpui::test]
+    fn a_consumer_menu_builder_replaces_the_default_and_may_offer_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|app| set_node_graph_theme(app, NodeGraphTheme::default()));
         let mut graph = interactive_graph();
-        graph.nodes.insert(
-            "c".into(),
-            Node {
-                id: "c".into(),
-                node_type: "c".into(),
-                title: "Camera Cue".into(),
-                position: core::Point::new(100.0, 100.0),
-                size: core::Size {
-                    width: 50.0,
-                    height: 50.0,
-                },
-            },
-        );
-        graph.ports.insert(
-            "cue".into(),
-            Port {
-                id: "cue".into(),
-                node: "c".into(),
-                label: "Trigger".into(),
-                direction: PortDirection::Input,
-                kind: Kind,
-                position: core::Point::new(100.0, 125.0),
-            },
-        );
-        graph.connections.insert(
-            "wire-2".into(),
-            Connection {
-                id: "wire-2".into(),
-                source: "out".into(),
-                target: "cue".into(),
-            },
-        );
-
-        let editor = NodeGraph::new_for_test(graph);
-        let items = editor.anchor_menu_items(&"out".into());
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.label.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "Disconnect all",
-                "Disconnect to Camera Cue \u{2192} Trigger",
-                "Disconnect to b \u{2192} In",
-            ]
-        );
+        graph.connections.clear();
+        let (editor, cx) = cx.add_window_view(move |_, _| {
+            let mut editor = NodeGraph::new_for_test(graph);
+            editor.anchor_menu_builder = Some(AnchorMenuBuilder::new(|port: &String, _| {
+                if port == "out" {
+                    vec![AnchorMenuItem::action("Custom", || {})]
+                } else {
+                    Vec::new()
+                }
+            }));
+            editor
+        });
+        cx.run_until_parked();
+        let none = gpui::Modifiers::default();
+        for (port, opens) in [("out", true), ("in", false)] {
+            editor.update(cx, |editor, _| editor.anchor_menu = None);
+            let at = port_screen(&editor, cx, port);
+            cx.simulate_mouse_down(at, MouseButton::Right, none);
+            cx.simulate_mouse_up(at, MouseButton::Right, none);
+            let open = editor.read_with(cx, |editor, _| {
+                editor.anchor_menu.as_ref().map(|menu| {
+                    menu.items
+                        .iter()
+                        .map(|i| i.label.clone())
+                        .collect::<Vec<_>>()
+                })
+            });
+            assert_eq!(
+                open,
+                opens.then(|| vec!["Custom".to_string()]),
+                "right-clicking {port}"
+            );
+        }
     }
 
     #[test]

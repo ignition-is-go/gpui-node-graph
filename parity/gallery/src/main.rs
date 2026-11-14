@@ -146,9 +146,9 @@ fn scene_graph_theme() -> NodeGraphTheme {
     theme
 }
 
-fn fixture(width: f32) -> GraphState<String, String, String, Kind> {
+fn fixture(width: f32, query: &str) -> GraphState<String, String, String, Kind> {
     let mut graph = GraphState::default();
-    for node in NODES {
+    for node in fixture_nodes(query) {
         let position = Point::new(node.x, node.y);
         graph.nodes.insert(
             node.id.into(),
@@ -183,7 +183,7 @@ fn fixture(width: f32) -> GraphState<String, String, String, Kind> {
             );
         }
     }
-    for (id, source, target) in CONNECTIONS {
+    for (id, source, target) in fixture_connections(query) {
         graph.connections.insert(
             (*id).into(),
             Connection {
@@ -196,8 +196,8 @@ fn fixture(width: f32) -> GraphState<String, String, String, Kind> {
     graph
 }
 
-fn catalog() -> Vec<NodeCatalogItem<Kind>> {
-    NODES
+fn catalog(query: &str) -> Vec<NodeCatalogItem<Kind>> {
+    fixture_nodes(query)
         .iter()
         .map(|node| NodeCatalogItem {
             id: node.id.into(),
@@ -239,11 +239,12 @@ fn launch(cx: &mut App) {
     let mut theme = theme;
     // The reference page's background; the editor itself is transparent.
     theme.editor.background = Color::rgb(0x111111);
+    let query = query();
     let width = theme.node.width.unwrap_or(theme.node.min_width);
     gpui_node_graph::set_node_graph_theme(cx, theme);
     gpui_node_graph::set_part_tagger(cx, probe);
     cx.open_window(WindowOptions::default(), move |_, cx| {
-        cx.new(|cx| NodeGraph::new(fixture(width), cx).with_catalog(catalog()))
+        cx.new(|cx| NodeGraph::new(fixture(width, &query), cx).with_catalog(catalog(&query)))
     })
     .expect("parity window opens");
 }

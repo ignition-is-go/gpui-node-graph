@@ -20,8 +20,11 @@ thread flags. Nothing opens on a display. Writes parity/out/<theme>-<state>.png
 (reference | gpui | diff x4) and prints, per state, the largest socket-centre
 and node-card offsets, the wire endpoint and path offsets, and the pixel
 difference, plus the worst node card's mean |d| and the worst selection-ring
-band's mean |d|. Exits non-zero when, in a geometry-matched state, a card
-exceeds CARD_LIMIT or a ring band exceeds RING_LIMIT. PARITY_GALLERY_DIST
+band's mean |d|. The overlap states put the upper card over the lower card's
+output socket: the reference's elementsFromPoint there must name the expected
+top element, and the socket must be drawn, or hidden, as in the reference (see
+SOCKET_BOX). Exits non-zero when, in a geometry-matched state, a card exceeds
+CARD_LIMIT or a ring band exceeds RING_LIMIT, or an overlap socket disagrees. PARITY_GALLERY_DIST
 points it at another gallery build, such as a mutated one.
 """
 
@@ -33,6 +36,7 @@ import json
 import os
 import socketserver
 import threading
+from collections import Counter
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageStat
@@ -42,18 +46,44 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 W, H = 960, 400
 
-# Port id by label, from parity/fixture.rs (labels are unique in the fixture).
-PORTS = {
-    "Value": "src:a_value",
-    "Trigger": "src:b_trigger",
-    "A": "calc:a",
-    "B": "calc:b",
-    "Out": "calc:out",
-    "In": "sink:in",
+# Port id by label, node ids in render order and connection ids, per fixture in
+# parity/fixture.rs (labels are unique within one). `overlap` is two cards
+# whose upper one covers the lower one's output socket.
+FIXTURES = {
+    "base": {
+        "query": "",
+        "ports": {
+            "Value": "src:a_value",
+            "Trigger": "src:b_trigger",
+            "A": "calc:a",
+            "B": "calc:b",
+            "Out": "calc:out",
+            "In": "sink:in",
+        },
+        "nodes": ["src", "calc", "sink"],
+        "connections": ["c1", "c2"],
+    },
+    "overlap": {
+        "query": "&overlap",
+        "ports": {
+            "In A": "ova:in",
+            "Out A": "ova:out",
+            "In B": "ovb:in",
+            "Out B": "ovb:out",
+        },
+        "nodes": ["ova", "ovb"],
+        "connections": [],
+    },
 }
-NODES = ["src", "calc", "sink"]
-CONNECTIONS = ["c1", "c2"]
 SAMPLES = 64
+# Half-width of the square around a socket centre, inside the 8px dot and clear
+# of its label. In the overlap states the covered socket is gated on its ink: the
+# pixels there that differ from the card fill. A socket drawn on the wrong side of
+# a card has its ring in one rendering and not the other, which the mean |d| of
+# the box cannot tell from antialiasing (a matching ring measures about 7).
+SOCKET_BOX = 5
+# Matching renderings measure 0.55 (ring antialiasing) to 1.0; one side missing, 0.
+INK_RATIO = 0.4
 CARD_MARGIN = 6
 # Largest mean |d| a node card may show before its state counts as styled
 # differently: matching states measure at most 4.74 (text antialiasing), a
@@ -81,28 +111,54 @@ def dot(g, port):
     return g["ports"][port]
 
 
-# A state is a list of steps; each step is a function of the reference's idle
-# geometry so both renderings receive the same viewport coordinates.
-STATES = {
-    "idle": [],
-    "hover-node": [lambda g: ("move", *header(g, "calc"))],
-    "selected": [lambda g: ("click", *header(g, "calc"))],
-    "hover-port": [lambda g: ("move", *dot(g, "src:a_value"))],
-    "draft": [
+# A state is a fixture and a list of steps; each step is a function of the
+# reference's idle geometry so both renderings receive the same viewport
+# coordinates.
+BASE = [
+    ("idle", []),
+    ("hover-node", [lambda g: ("move", *header(g, "calc"))]),
+    ("selected", [lambda g: ("click", *header(g, "calc"))]),
+    ("hover-port", [lambda g: ("move", *dot(g, "src:a_value"))]),
+    ("draft", [
         lambda g: ("down", *dot(g, "src:b_trigger")),
         lambda g: ("move", 520, 330),
-    ],
-    "dragging": [
+    ]),
+    ("dragging", [
         lambda g: ("down", *header(g, "calc")),
         lambda g: ("move", header(g, "calc")[0] + 40, header(g, "calc")[1] + 60),
-    ],
-    "dragged": [
+    ]),
+    ("dragged", [
         lambda g: ("down", *header(g, "calc")),
         lambda g: ("move", header(g, "calc")[0] + 40, header(g, "calc")[1] + 60),
         lambda g: ("up",),
-    ],
-    "zoomed": [lambda g: ("move", 400, 200), lambda g: ("wheel", 0, -100)],
-}
+    ]),
+    ("zoomed", [lambda g: ("move", 400, 200), lambda g: ("wheel", 0, -100)]),
+]
+# The lower card's output socket lies under the upper card. In 0.2.2 the dot is
+# `position: relative; z-index: 1` in a card that is no stacking context, so at
+# rest it paints above the upper card and takes the press. A dragged card has
+# opacity < 1, which makes it a stacking context holding its own dot: dragging
+# the lower card puts its socket under the upper one, dragging the upper card
+# leaves it on top. `top` is what the reference's elementsFromPoint must answer
+# at that socket first, so a changed crate cannot silently move the premise.
+OVERLAP = [
+    ("overlap", [], "dot"),
+    ("overlap-press", [
+        lambda g: ("down", *dot(g, "ova:out")),
+        lambda g: ("move", 700, 330),
+    ], "dot"),
+    ("overlap-drag-lower", [
+        lambda g: ("down", *header(g, "ova")),
+        lambda g: ("move", header(g, "ova")[0] + 3, header(g, "ova")[1] + 3),
+    ], "card"),
+    ("overlap-drag-upper", [
+        lambda g: ("down", *header(g, "ovb")),
+        lambda g: ("move", header(g, "ovb")[0] + 3, header(g, "ovb")[1] + 3),
+    ], "dot"),
+]
+STATES = {name: ("base", steps, None) for name, steps in BASE}
+STATES.update({name: ("overlap", steps, top) for name, steps, top in OVERLAP})
+HIT_PORT = "ova:out"
 
 
 def serve(directory: Path) -> int:
@@ -173,8 +229,22 @@ REFERENCE_GEOMETRY = r"""() => {
       return [p.x, p.y];
     });
   });
-  return {nodes, ports, headers, wires};
-}""" % (json.dumps(NODES), json.dumps(PORTS), json.dumps(CONNECTIONS))
+  // What the browser gives the press at every socket centre, topmost first:
+  // the dot's own elements, then the owning card or whatever covers the dot.
+  const hits = {};
+  Object.entries(ports).forEach(([port, [x, y]]) => {
+    hits[port] = document.elementsFromPoint(x, y).map((el) => {
+      if (el.hasAttribute('data-anchor-dot') || el.closest('[data-anchor-dot]')) return 'dot';
+      const card = el.closest('[data-node]');
+      return card ? 'card:' + ids[[...document.querySelectorAll('[data-node]')].indexOf(card)] : 'other';
+    }).filter((kind, i, all) => i === 0 || kind !== all[i - 1]);
+  });
+  return {nodes, ports, headers, wires, hits};
+}"""
+
+def reference_geometry(fixture):
+    return REFERENCE_GEOMETRY % (json.dumps(fixture["nodes"]), json.dumps(fixture["ports"]),
+                                 json.dumps(fixture["connections"]))
 
 
 def gpui_geometry(page):
@@ -195,7 +265,7 @@ def gpui_geometry(page):
     return {"nodes": nodes, "ports": ports, "headers": headers, "wires": wires}
 
 
-def capture(browser, url, steps, geometry, gpui, name):
+def capture(browser, url, steps, geometry, gpui, name, fixture):
     page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=1)
     page.goto(url)
     if gpui:
@@ -210,7 +280,7 @@ def capture(browser, url, steps, geometry, gpui, name):
     page.wait_for_timeout(400 if gpui else 100)
     shot = OUT / f"tmp-{name}.png"
     page.screenshot(path=str(shot))
-    measured = gpui_geometry(page) if gpui else page.evaluate(REFERENCE_GEOMETRY)
+    measured = gpui_geometry(page) if gpui else page.evaluate(reference_geometry(FIXTURES[fixture]))
     page.close()
     return Image.open(shot).convert("RGB"), measured
 
@@ -253,6 +323,16 @@ def ring_diffs(ref_img, gpui_img, geometry):
         diff = ImageChops.difference(ref_img, gpui_img)
         out[node] = sum(ImageStat.Stat(diff, mask).mean) / 3
     return out
+
+
+def socket_ink(img, port_xy):
+    """Pixels in the box around a socket centre that differ from the box's
+    commonest colour, which is the card fill under the dot."""
+    x, y = port_xy
+    box = img.crop((int(x - SOCKET_BOX), int(y - SOCKET_BOX), int(x + SOCKET_BOX), int(y + SOCKET_BOX)))
+    pixels = list(box.get_flattened_data())
+    fill = Counter(pixels).most_common(1)[0][0]
+    return sum(1 for px in pixels if max(abs(c - f) for c, f in zip(px, fill)) > 32)
 
 
 def max_offset(ref, gpui, key, width):
@@ -313,8 +393,7 @@ def main():
     OUT.mkdir(exist_ok=True)
     ref_port = serve(HERE / "reference" / "dist")
     gpui_port = serve(Path(os.environ.get("PARITY_GALLERY_DIST") or HERE / "gallery" / "dist"))
-    query = f"?theme={args.theme}"
-    rows = []
+    rows, hits = [], []
     with sync_playwright() as p:
         shells = sorted(glob.glob(os.path.expanduser(
             "~/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell")))
@@ -323,12 +402,18 @@ def main():
             args=["--use-angle=swiftshader", "--enable-unsafe-swiftshader",
                   "--enable-unsafe-webgpu", "--enable-features=Vulkan"],
         )
-        _, idle = capture(browser, f"http://127.0.0.1:{ref_port}/index.html{query}", [], None, False, "ref")
-        for name, steps in STATES.items():
+        idles = {}
+        for name, (fixture, steps, top) in STATES.items():
             if args.states and name not in args.states:
                 continue
-            ref_img, ref_geo = capture(browser, f"http://127.0.0.1:{ref_port}/index.html{query}", steps, idle, False, "ref")
-            gpui_img, gpui_geo = capture(browser, f"http://127.0.0.1:{gpui_port}/index.html{query}", steps, idle, True, "gpui")
+            query = f"?theme={args.theme}{FIXTURES[fixture]['query']}"
+            ref_url = f"http://127.0.0.1:{ref_port}/index.html{query}"
+            if fixture not in idles:
+                _, idles[fixture] = capture(browser, ref_url, [], None, False, "ref", fixture)
+            idle = idles[fixture]
+            ref_img, ref_geo = capture(browser, ref_url, steps, idle, False, "ref", fixture)
+            gpui_img, gpui_geo = capture(browser, f"http://127.0.0.1:{gpui_port}/index.html{query}",
+                                         steps, idle, True, "gpui", fixture)
             mean, bad, diff = pixel_diff(ref_img, gpui_img)
             sheet = Image.new("RGB", (W, H * 3))
             sheet.paste(ref_img, (0, 0))
@@ -340,23 +425,37 @@ def main():
             cards = card_diffs(ref_img, gpui_img, ref_geo)
             worst_card = max(cards.items(), key=lambda kv: kv[1])
             worst_ring = max(ring_diffs(ref_img, gpui_img, ref_geo).items(), key=lambda kv: kv[1])
+            ink = (0, 0)
+            if top:
+                ink = (socket_ink(ref_img, ref_geo["ports"][HIT_PORT]),
+                       socket_ink(gpui_img, ref_geo["ports"][HIT_PORT]))
+            if top:
+                hits.append((name, top, ref_geo["hits"][HIT_PORT]))
             rows.append((name, max_offset(ref_geo, gpui_geo, "ports", 2),
                          max_offset(ref_geo, gpui_geo, "nodes", 4),
-                         *wire_offsets(ref_geo, gpui_geo), worst_card, worst_ring, mean, bad))
+                         *wire_offsets(ref_geo, gpui_geo), worst_card, worst_ring, ink,
+                         mean, bad))
         browser.close()
     print(f"theme {args.theme}")
-    print(f"{'state':12} {'socket max px':>18} {'card max px':>18} {'wire end px':>14}"
-          f" {'wire path px':>14} {'card |d|':>13} {'ring |d|':>13} {'mean|d|':>8} {'px>32':>7}")
+    print(f"{'state':20} {'socket max px':>18} {'card max px':>18} {'wire end px':>14}"
+          f" {'wire path px':>14} {'card |d|':>13} {'ring |d|':>13} {'dot ink r/g':>13} {'mean|d|':>8} {'px>32':>7}")
     failed = []
-    for name, *offsets, (card_at, card), (ring_at, ring), mean, bad in rows:
+    for name, *offsets, (card_at, card), (ring_at, ring), (ink_ref, ink_gpui), mean, bad in rows:
         cells = " ".join(f"{v:9.2f} {at:>{8 if i < 2 else 4}}" for i, (v, at) in enumerate(offsets))
         gated = name not in CARD_UNGATED
         if gated and card > CARD_LIMIT:
             failed.append(f"{name} card {card_at} {card:.2f} > {CARD_LIMIT}")
         if gated and ring > RING_LIMIT:
             failed.append(f"{name} ring {ring_at} {ring:.2f} > {RING_LIMIT}")
+        if STATES[name][2] and min(ink_ref, ink_gpui) < INK_RATIO * max(ink_ref, ink_gpui):
+            failed.append(f"{name} socket {HIT_PORT} ink {ink_ref} vs {ink_gpui}")
         mark = "" if gated else "~"
-        print(f"{name:12} {cells} {card:7.2f}{mark:1} {card_at:>5} {ring:7.2f}{mark:1} {ring_at:>5} {mean:8.2f} {bad:7.2%}")
+        print(f"{name:20} {cells} {card:7.2f}{mark:1} {card_at:>5} {ring:7.2f}{mark:1} {ring_at:>5}"
+              f" {ink_ref:5d}/{ink_gpui:<5d} {mean:8.2f} {bad:7.2%}")
+    for name, top, kinds in hits:
+        print(f"reference elementsFromPoint at {HIT_PORT} in {name}: {' > '.join(kinds)}")
+        if kinds[0].split(':')[0] != top:
+            failed.append(f"{name} reference top is {kinds[0]}, expected {top}")
     if failed:
         raise SystemExit("card styling differs: " + ", ".join(failed))
 

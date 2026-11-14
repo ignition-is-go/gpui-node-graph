@@ -78,8 +78,9 @@ fn App() -> impl IntoView {
     if scene_theme(&search) {
         provide_scene_theme();
     }
+    let nodes = fixture_nodes(&search);
     let connections = RwSignal::new(
-        CONNECTIONS
+        fixture_connections(&search)
             .iter()
             .map(|(id, source, target)| {
                 (
@@ -143,7 +144,7 @@ fn App() -> impl IntoView {
                 connections=Signal::derive(move || connections.get())
                 on_event=on_event
             >
-                <For each=|| NODES.iter() key=|node| node.id children=node_view />
+                <For each=move || nodes.iter() key=|node| node.id children=node_view />
             </NodeEditor<String, String, String, Kind>>
         </div>
     }
