@@ -6668,6 +6668,16 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
+    /// Actions bound to a bare character key yield to a focused node control, so the
+    /// keystroke reaches the editor's key handler and is forwarded to that control as typing.
+    fn perform_character_action(&mut self, action: EditorAction, cx: &mut Context<Self>) {
+        if self.last_world_control.is_some() {
+            cx.propagate();
+        } else {
+            self.perform_editor_action(action, cx);
+        }
+    }
+
     fn perform_editor_action(&mut self, action: EditorAction, cx: &mut Context<Self>) {
         match action {
             EditorAction::OpenCatalog => {
@@ -7564,10 +7574,10 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                 this.perform_editor_action(EditorAction::SelectAll, cx);
             }))
             .on_action(cx.listener(|this, _: &actions::CycleRouting, _, cx| {
-                this.perform_editor_action(EditorAction::CycleRouting, cx);
+                this.perform_character_action(EditorAction::CycleRouting, cx);
             }))
             .on_action(cx.listener(|this, _: &actions::FitView, _, cx| {
-                this.perform_editor_action(EditorAction::FitView, cx);
+                this.perform_character_action(EditorAction::FitView, cx);
             }))
             .on_action(cx.listener(|this, _: &actions::Cancel, _, cx| {
                 this.perform_editor_action(EditorAction::Cancel, cx);
@@ -11030,6 +11040,54 @@ mod tests {
         themed.update(cx, |editor, cx| editor.set_theme(None, cx));
         cx.run_until_parked();
         assert!(Arc::ptr_eq(&theme_of("themed"), &global));
+    }
+
+    #[gpui::test]
+    fn character_shortcuts_type_into_a_focused_node_control(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            set_node_graph_theme(app, NodeGraphTheme::default());
+            init(app);
+        });
+        let (editor, cx) = cx.add_window_view(|_, _| NodeGraph::new_for_test(interactive_graph()));
+        let typed: Rc<RefCell<Vec<String>>> = Rc::default();
+        let _subscription = cx.update({
+            let typed = Rc::clone(&typed);
+            |_, cx| {
+                cx.subscribe(
+                    &editor,
+                    move |_, event: &core::GraphEvent<String, String, String, Kind>, _| {
+                        if let core::GraphEvent::NodeControlKeyDown { key, .. } = event {
+                            typed.borrow_mut().push(key.clone());
+                        }
+                    },
+                )
+            }
+        });
+        cx.run_until_parked();
+        let routing = |cx: &mut gpui::VisualTestContext| {
+            editor.read_with(cx, |editor, _| format!("{:?}", editor.config.routing))
+        };
+        let initial = routing(cx);
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.focus(window, cx);
+            editor.focus_world_control("a".into(), "a:label", cx);
+        });
+        cx.simulate_keystrokes("r f");
+        assert_eq!(
+            routing(cx),
+            initial,
+            "r is typing while a control has focus"
+        );
+        assert_eq!(*typed.borrow(), ["r", "f"]);
+
+        editor.update(cx, |editor, cx| editor.blur_world_control(cx));
+        cx.simulate_keystrokes("r");
+        assert_ne!(
+            routing(cx),
+            initial,
+            "r cycles routing once the control blurs"
+        );
     }
 
     #[gpui::test]
