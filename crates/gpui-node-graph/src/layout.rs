@@ -14,9 +14,9 @@ use crate::{
 /// Measured node sections used to lay out the default port rows.
 ///
 /// Heights are border-box heights in world units. `ports_y_offset` is measured
-/// from the node's top edge to the ports section's top edge. It is kept
-/// separately because borders, consumer chrome, or an empty body can make it
-/// differ slightly from `header_height + body_height`.
+/// from the inside of the node's top border to the ports section's top edge,
+/// like the reference's `offsetTop`. It is kept separately because consumer
+/// chrome or an empty body can make it differ from `header_height + body_height`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeSectionMetrics {
     pub width: f32,
@@ -59,8 +59,12 @@ pub struct DefaultNodeLayout {
 ///
 /// In [`AnchorLayout::Columns`], inputs and outputs each have an independent row
 /// counter, so opposite directions share rows. In [`AnchorLayout::Stacked`], all
-/// input rows precede all output rows. This matches the reference registry's
-/// deterministic row-slot calculation.
+/// input rows precede all output rows.
+///
+/// Socket centres are where the reference measures its dots: inside the node
+/// border, past the row's horizontal padding, half a dot in, and in the middle
+/// of the row. The reference never reads `AnchorStyle::dot_inset`, so neither
+/// does this.
 pub fn layout_default_node(
     style: &NodeGraphTheme,
     metrics: NodeSectionMetrics,
@@ -72,7 +76,15 @@ pub fn layout_default_node(
     let ports_y = non_negative(metrics.ports_y_offset);
     let padding_y = non_negative(style.node.ports_padding_y);
     let row_height = non_negative(style.anchor.row_height);
-    let inset = non_negative(style.anchor.dot_inset).min(width);
+    let border = if style.node.border.style == crate::style::LineStyle::None {
+        0.0
+    } else {
+        non_negative(style.node.border.width)
+    };
+    let inset = (border
+        + non_negative(style.anchor.row_padding_x)
+        + non_negative(style.anchor.dot_size) * 0.5)
+        .min(width);
 
     let input_count = directions
         .iter()
@@ -84,7 +96,7 @@ pub fn layout_default_node(
         AnchorLayout::Stacked => input_count + output_count,
     };
     let ports_height = padding_y * 2.0 + row_height * rows as f32;
-    let first_y = ports_y + padding_y + row_height * 0.5;
+    let first_y = border + ports_y + padding_y + row_height * 0.5;
 
     let mut next_input = 0usize;
     let mut next_output = 0usize;
@@ -121,12 +133,12 @@ pub fn layout_default_node(
 
     let section_bottom = (header_height + body_height).max(ports_y + ports_height);
     DefaultNodeLayout {
-        header: rect(0.0, width, header_height),
-        body: rect(header_height, width, body_height),
-        ports: rect(ports_y, width, ports_height),
+        header: rect(border, width, header_height),
+        body: rect(border + header_height, width, body_height),
+        ports: rect(border + ports_y, width, ports_height),
         size: Size {
             width,
-            height: section_bottom,
+            height: section_bottom + border * 2.0,
         },
         port_offsets,
     }
@@ -165,22 +177,22 @@ mod tests {
             &directions,
         );
 
-        assert_eq!(layout.header, rect(0.0, 160.0, 28.0));
-        assert_eq!(layout.body, rect(28.0, 160.0, 30.0));
-        assert_eq!(layout.ports, rect(58.0, 160.0, 56.0));
+        assert_eq!(layout.header, rect(1.0, 160.0, 28.0));
+        assert_eq!(layout.body, rect(29.0, 160.0, 30.0));
+        assert_eq!(layout.ports, rect(59.0, 160.0, 56.0));
         assert_eq!(
             layout.port_offsets,
             vec![
-                Point::new(14.0, 74.0),
-                Point::new(146.0, 74.0),
-                Point::new(14.0, 98.0),
+                Point::new(15.0, 75.0),
+                Point::new(145.0, 75.0),
+                Point::new(15.0, 99.0),
             ]
         );
         assert_eq!(
             layout.size,
             Size {
                 width: 160.0,
-                height: 114.0
+                height: 116.0
             }
         );
     }
@@ -201,9 +213,9 @@ mod tests {
         assert_eq!(
             layout.port_offsets,
             vec![
-                Point::new(146.0, 122.0),
-                Point::new(14.0, 74.0),
-                Point::new(14.0, 98.0),
+                Point::new(145.0, 123.0),
+                Point::new(15.0, 75.0),
+                Point::new(15.0, 99.0),
             ]
         );
         assert_eq!(layout.ports.size.height, 80.0);
@@ -213,14 +225,14 @@ mod tests {
     fn explicit_ports_measurement_wins_and_invalid_style_is_safe() {
         let mut style = NodeGraphTheme::default();
         style.anchor.row_height = f32::NAN;
-        style.anchor.dot_inset = f32::INFINITY;
+        style.anchor.row_padding_x = f32::INFINITY;
         let layout = layout_default_node(
             &style,
             NodeSectionMetrics::contiguous(100.0, 20.0, 10.0).with_ports_y_offset(42.0),
             &[PortDirection::Output],
         );
-        assert_eq!(layout.ports.origin.y, 42.0);
-        assert_eq!(layout.port_offsets, vec![Point::new(100.0, 46.0)]);
+        assert_eq!(layout.ports.origin.y, 43.0);
+        assert_eq!(layout.port_offsets, vec![Point::new(95.0, 47.0)]);
         assert!(layout.size.width.is_finite());
         assert!(layout.size.height.is_finite());
     }

@@ -230,6 +230,8 @@ pub struct AnchorStyle {
     pub label_compatible_color: Color,
     pub row_height: f32,
     pub first_port_y: f32,
+    /// Mirrors the reference theme field, which the reference never reads.
+    /// Socket centres follow the node border, `row_padding_x` and `dot_size`.
     pub dot_inset: f32,
     pub row_padding_x: f32,
     pub row_padding_y: f32,

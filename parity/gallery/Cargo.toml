@@ -1,0 +1,14 @@
+[package]
+name = "node-graph-parity-gallery"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+gpui = { package = "gpui-unofficial", version = "=1.16.1" }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.16.1" }
+gpui-node-graph = { path = "../../crates/gpui-node-graph" }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
