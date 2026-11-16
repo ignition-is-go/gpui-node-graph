@@ -825,7 +825,8 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
         .into_any_element()
     }
 
-    /// Wrap a body control so graph shortcuts, zoom and drag gestures do not leak through it.
+    /// Wrap a body control so zoom and drag gestures do not leak through it. Keys need no
+    /// isolation: graph shortcuts run only while the editor itself holds focus.
     pub fn isolated_control(&self, child: impl IntoElement) -> AnyElement {
         div()
             .child(child)
@@ -844,7 +845,6 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId>
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_key_down(|_, _, cx| cx.stop_propagation())
             .into_any_element()
     }
 
@@ -6797,6 +6797,15 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A focused element inside the editor, such as a text field in a node body, owns its
+        // keys. Stopping them here would also stop the platform inserting their text.
+        if self
+            .focus_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_focused(window))
+        {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         let shift = event.keystroke.modifiers.shift;
@@ -8204,8 +8213,7 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
                         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                         .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                        .on_key_down(|_, _, cx| cx.stop_propagation());
+                        .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation());
                     port_slot_elements.push(slot);
                 }
             }
@@ -11145,6 +11153,49 @@ mod tests {
         editor.update_in(cx, |editor, window, cx| editor.focus(window, cx));
         cx.simulate_keystrokes("r");
         assert_ne!(routing(cx), initial, "r cycles routing on the editor");
+    }
+
+    #[gpui::test]
+    fn keys_in_an_isolated_body_field_stay_unhandled_for_text_input(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            set_node_graph_theme(app, NodeGraphTheme::default());
+            init(app);
+        });
+        let field: Rc<RefCell<Option<FocusHandle>>> = Rc::default();
+        let (editor, cx) = cx.add_window_view({
+            let field = Rc::clone(&field);
+            move |_, _| {
+                NodeGraph::new_for_test(interactive_graph()).with_node_body_renderer(
+                    move |context: NodeBodyContext<Kind, String, String, String>,
+                          _: &mut Window,
+                          cx: &mut App| {
+                        let handle = field
+                            .borrow_mut()
+                            .get_or_insert_with(|| cx.focus_handle())
+                            .clone();
+                        NodeBody::new(
+                            context.isolated_control(div().size(px(20.)).track_focus(&handle)),
+                        )
+                    },
+                )
+            }
+        });
+        cx.run_until_parked();
+        let handle = field.borrow().clone().expect("node body rendered");
+        cx.update(|window, cx| handle.focus(window, cx));
+
+        for key in ["x", "tab"] {
+            let consumed = cx.update(|window, cx| {
+                window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx)
+            });
+            assert!(!consumed, "{key} is left for the field's text input");
+        }
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.catalog_menu.is_none(),
+                "tab in the field opens no catalog"
+            );
+        });
     }
 
     #[gpui::test]
