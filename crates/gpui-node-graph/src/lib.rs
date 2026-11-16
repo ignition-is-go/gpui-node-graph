@@ -6668,10 +6668,20 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> NodeG
         true
     }
 
-    /// Actions bound to a bare character key yield to a focused node control, so the
-    /// keystroke reaches the editor's key handler and is forwarded to that control as typing.
-    fn perform_character_action(&mut self, action: EditorAction, cx: &mut Context<Self>) {
-        if self.last_world_control.is_some() {
+    /// Actions bound to a bare character key run only while the editor itself holds focus and
+    /// no node control takes typed keys. Otherwise the keystroke propagates, so it reaches a
+    /// focused text field in a node body or is forwarded to the focused node control.
+    fn perform_character_action(
+        &mut self,
+        action: EditorAction,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focused = self
+            .focus_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_focused(window));
+        if !editor_focused || self.last_world_control.is_some() {
             cx.propagate();
         } else {
             self.perform_editor_action(action, cx);
@@ -7573,11 +7583,11 @@ impl<T: PortType, N: core::NodeId, P: core::PortId, C: core::ConnectionId> Rende
             .on_action(cx.listener(|this, _: &actions::SelectAll, _, cx| {
                 this.perform_editor_action(EditorAction::SelectAll, cx);
             }))
-            .on_action(cx.listener(|this, _: &actions::CycleRouting, _, cx| {
-                this.perform_character_action(EditorAction::CycleRouting, cx);
+            .on_action(cx.listener(|this, _: &actions::CycleRouting, window, cx| {
+                this.perform_character_action(EditorAction::CycleRouting, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &actions::FitView, _, cx| {
-                this.perform_character_action(EditorAction::FitView, cx);
+            .on_action(cx.listener(|this, _: &actions::FitView, window, cx| {
+                this.perform_character_action(EditorAction::FitView, window, cx);
             }))
             .on_action(cx.listener(|this, _: &actions::Cancel, _, cx| {
                 this.perform_editor_action(EditorAction::Cancel, cx);
@@ -11088,6 +11098,53 @@ mod tests {
             initial,
             "r cycles routing once the control blurs"
         );
+    }
+
+    #[gpui::test]
+    fn character_shortcuts_reach_a_focused_field_in_a_node_body(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            set_node_graph_theme(app, NodeGraphTheme::default());
+            init(app);
+        });
+        let field: Rc<RefCell<Option<FocusHandle>>> = Rc::default();
+        let typed: Rc<RefCell<Vec<String>>> = Rc::default();
+        let (editor, cx) = cx.add_window_view({
+            let field = Rc::clone(&field);
+            let typed = Rc::clone(&typed);
+            move |_, _| {
+                NodeGraph::new_for_test(interactive_graph()).with_node_body_renderer(
+                    move |_: NodeBodyContext<Kind, String, String, String>,
+                          _: &mut Window,
+                          cx: &mut App| {
+                        let handle = field
+                            .borrow_mut()
+                            .get_or_insert_with(|| cx.focus_handle())
+                            .clone();
+                        let typed = Rc::clone(&typed);
+                        NodeBody::new(div().size(px(20.)).track_focus(&handle).on_key_down(
+                            move |event: &gpui::KeyDownEvent, _, _| {
+                                typed.borrow_mut().push(event.keystroke.key.clone());
+                            },
+                        ))
+                    },
+                )
+            }
+        });
+        cx.run_until_parked();
+        let routing = |cx: &mut gpui::VisualTestContext| {
+            editor.read_with(cx, |editor, _| format!("{:?}", editor.config.routing))
+        };
+        let initial = routing(cx);
+
+        let handle = field.borrow().clone().expect("node body rendered");
+        cx.update(|window, cx| handle.focus(window, cx));
+        cx.simulate_keystrokes("r f");
+        assert_eq!(routing(cx), initial, "r is typing in the body field");
+        assert_eq!(typed.borrow().len(), 2, "both keys reach the field");
+
+        editor.update_in(cx, |editor, window, cx| editor.focus(window, cx));
+        cx.simulate_keystrokes("r");
+        assert_ne!(routing(cx), initial, "r cycles routing on the editor");
     }
 
     #[gpui::test]
